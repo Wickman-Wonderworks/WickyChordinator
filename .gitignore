@@ -1,0 +1,10 @@
+# build output
+build/
+cmake-build-*/
+JuceLibraryCode/
+*.user
+
+# generated bundles / artefacts
+JUCE-Boilerplate_artefacts/
+DerivedData/
+.DS_Store
