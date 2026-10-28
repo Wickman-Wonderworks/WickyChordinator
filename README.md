@@ -48,11 +48,11 @@ cmake --build --preset debug
 
 With the release preset:
 
-| Format | Path |
-| --- | --- |
+| Format     | Path                                                                              |
+| ---------- | --------------------------------------------------------------------------------- |
 | Standalone | `build/release/JUCEBoilerplate_artefacts/Release/Standalone/JUCE Boilerplate.app` |
-| VST3 | `build/release/JUCEBoilerplate_artefacts/Release/VST3/JUCE Boilerplate.vst3` |
-| AU (macOS) | `build/release/JUCEBoilerplate_artefacts/Release/AU/JUCE Boilerplate.component` |
+| VST3       | `build/release/JUCEBoilerplate_artefacts/Release/VST3/JUCE Boilerplate.vst3`      |
+| AU (macOS) | `build/release/JUCEBoilerplate_artefacts/Release/AU/JUCE Boilerplate.component`   |
 
 Plain `-B build` builds put the same tree under `build/`. Multi-config
 generators (Xcode, Visual Studio) replace `Release` with the active config.
@@ -69,10 +69,10 @@ Defaults are `~/Library/Audio/Plug-Ins/{Components,VST3}` on macOS and
 
 ## Parameters
 
-| ID | Name | Range | Default |
-| --- | --- | --- | --- |
-| `gain` | Output Gain | -60 to +12 dB, 0.1 dB steps | 0 dB |
-| `bypass` | Bypass | on/off | off |
+| ID       | Name        | Range                       | Default |
+| -------- | ----------- | --------------------------- | ------- |
+| `gain`   | Output Gain | -60 to +12 dB, 0.1 dB steps | 0 dB    |
+| `bypass` | Bypass      | on/off                      | off     |
 
 The IDs in `Source/State/ParameterIDs.h` are the automation/preset contract.
 Do not rename them after release. Bypass is smoothed to unity gain, so toggling
@@ -122,13 +122,13 @@ forces C++20 for the Windows MIDI Services backend.
 Override these at configure time (or edit the defaults at the top of
 `CMakeLists.txt`):
 
-| Cache variable | Default |
-| --- | --- |
-| `BOILERPLATE_PRODUCT_NAME` | `JUCE Boilerplate` |
-| `BOILERPLATE_COMPANY_NAME` | `Boilerplate Audio` |
-| `BOILERPLATE_BUNDLE_ID` | `com.boilerplateaudio.juceboilerplate` |
-| `BOILERPLATE_PLUGIN_MANUFACTURER_CODE` | `Wckm` |
-| `BOILERPLATE_PLUGIN_CODE` | `Jbpl` |
+| Cache variable                         | Default                                |
+| -------------------------------------- | -------------------------------------- |
+| `BOILERPLATE_PRODUCT_NAME`             | `JUCE Boilerplate`                     |
+| `BOILERPLATE_COMPANY_NAME`             | `Boilerplate Audio`                    |
+| `BOILERPLATE_BUNDLE_ID`                | `com.boilerplateaudio.juceboilerplate` |
+| `BOILERPLATE_PLUGIN_MANUFACTURER_CODE` | `Wckm`                                 |
+| `BOILERPLATE_PLUGIN_CODE`              | `Jbpl`                                 |
 
 Plugin and manufacturer codes must stay stable for the life of a released
 product. Change them before the first release, not after.
