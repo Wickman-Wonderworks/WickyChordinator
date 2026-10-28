@@ -5,6 +5,12 @@ JuceLibraryCode/
 *.user
 
 # generated bundles / artefacts
+JUCEBoilerplate_artefacts/
 JUCE-Boilerplate_artefacts/
 DerivedData/
 .DS_Store
+
+# local tooling
+CMakeUserPresets.json
+compile_commands.json
+.cache/
