@@ -7,6 +7,9 @@ namespace boilerplate::parameters
     inline constexpr auto gain = "gain";
     inline constexpr auto bypass = "bypass";
 
-    // Bump this when the meaning or range of an existing AU parameter changes.
-    inline constexpr int versionHint = 1;
+    // AU ordering contracts: keep each released parameter's hint unchanged.
+    // New parameters must use a hint higher than every previously released hint.
+    // Hints do not migrate changes to an existing parameter's meaning or range.
+    inline constexpr int gainVersionHint = 1;
+    inline constexpr int bypassVersionHint = 1;
 }

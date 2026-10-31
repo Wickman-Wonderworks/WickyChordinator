@@ -19,14 +19,14 @@ namespace boilerplate::parameters
             });
 
         layout.add (std::make_unique<AudioParameterFloat> (
-            ParameterID { gain, versionHint },
+            ParameterID { gain, gainVersionHint },
             "Output Gain",
             NormalisableRange<float> { -60.0f, 12.0f, 0.1f },
             0.0f,
             gainAttributes));
 
         layout.add (std::make_unique<AudioParameterBool> (
-            ParameterID { bypass, versionHint },
+            ParameterID { bypass, bypassVersionHint },
             "Bypass",
             false));
 

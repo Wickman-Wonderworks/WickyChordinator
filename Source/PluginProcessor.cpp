@@ -5,15 +5,19 @@
 
 PluginProcessor::PluginProcessor()
     : AudioProcessor (BusesProperties()
+         #if ! JucePlugin_IsSynth
           .withInput ("Input", juce::AudioChannelSet::stereo(), true)
+         #endif
           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "Parameters", boilerplate::parameters::createLayout())
 {
     gainDbParameter = apvts.getRawParameterValue (boilerplate::parameters::gain);
     bypassParameter = apvts.getRawParameterValue (boilerplate::parameters::bypass);
+    bypassParameterObject = apvts.getParameter (boilerplate::parameters::bypass);
 
     jassert (gainDbParameter != nullptr);
     jassert (bypassParameter != nullptr);
+    jassert (bypassParameterObject != nullptr);
 }
 
 PluginProcessor::~PluginProcessor() = default;
@@ -46,7 +50,7 @@ double PluginProcessor::getTailLengthSeconds() const
 
 juce::AudioProcessorParameter* PluginProcessor::getBypassParameter() const
 {
-    return apvts.getParameter (boilerplate::parameters::bypass);
+    return bypassParameterObject;
 }
 
 //==============================================================================
@@ -82,7 +86,8 @@ void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     juce::ignoreUnused (samplesPerBlock);
 
     const auto initialGain = gainDbParameter != nullptr ? gainDbParameter->load() : 0.0f;
-    gainProcessor.prepare (sampleRate, initialGain);
+    const auto initiallyBypassed = bypassParameter != nullptr && bypassParameter->load() > 0.5f;
+    gainProcessor.prepare (sampleRate, initialGain, initiallyBypassed);
 }
 
 void PluginProcessor::releaseResources()
@@ -98,13 +103,16 @@ bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
         && outputChannels != juce::AudioChannelSet::stereo())
         return false;
 
+   #if JucePlugin_IsSynth
+    return layouts.inputBuses.isEmpty();
+   #else
     return outputChannels == layouts.getMainInputChannelSet();
+   #endif
 }
 
 void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                     juce::MidiBuffer& midiMessages)
 {
-    juce::ignoreUnused (midiMessages);
     juce::ScopedNoDenormals noDenormals;
 
     const auto totalNumInputChannels = getTotalNumInputChannels();
@@ -113,6 +121,13 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     // Outputs without a matching input may contain garbage; clear them.
     for (auto channel = totalNumInputChannels; channel < totalNumOutputChannels; ++channel)
         buffer.clear (channel, 0, buffer.getNumSamples());
+
+   #if JucePlugin_IsSynth
+    // Instrument extension point: render preallocated voices into the cleared
+    // output here, consuming MIDI at each event's samplePosition. Until a product
+    // adds its engine this scaffold intentionally outputs silence.
+   #endif
+    juce::ignoreUnused (midiMessages);
 
     const auto gainDecibels = gainDbParameter != nullptr ? gainDbParameter->load() : 0.0f;
     const auto bypassed = bypassParameter != nullptr && bypassParameter->load() > 0.5f;
@@ -155,8 +170,7 @@ void PluginProcessor::setStateInformation (const void* data, int sizeInBytes)
 }
 
 //==============================================================================
-// This creates the plugin instance. The host calls it, so it must have C linkage
-// and live outside any namespace.
+// JUCE's format wrappers call this global factory.
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new PluginProcessor();

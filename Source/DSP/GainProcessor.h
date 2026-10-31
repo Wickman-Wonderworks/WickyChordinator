@@ -17,7 +17,7 @@ namespace boilerplate::dsp
         static constexpr double rampSeconds = 0.02;
 
         /** Prepares the ramp for the current sample rate and snaps to the initial value. */
-        void prepare (double sampleRate, float initialGainDecibels);
+        void prepare (double sampleRate, float initialGainDecibels, bool initiallyBypassed);
 
         /** Restores unity gain and clears the ramp state. */
         void reset() noexcept;
@@ -28,6 +28,8 @@ namespace boilerplate::dsp
                       bool bypassed) noexcept;
 
     private:
+        float cachedGainDecibels = 0.0f;
+        float cachedLinearGain = 1.0f;
         juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> smoothedGain { 1.0f };
     };
 }
