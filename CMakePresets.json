@@ -21,6 +21,30 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "instrument-debug",
+      "inherits": "debug",
+      "displayName": "Instrument Debug",
+      "binaryDir": "${sourceDir}/build/instrument-debug",
+      "cacheVariables": {
+        "BOILERPLATE_IS_SYNTH": "ON",
+        "BOILERPLATE_PRODUCT_NAME": "JUCE Instrument",
+        "BOILERPLATE_BUNDLE_ID": "com.boilerplateaudio.juceinstrument",
+        "BOILERPLATE_PLUGIN_CODE": "Jbpi"
+      }
+    },
+    {
+      "name": "instrument-release",
+      "inherits": "release",
+      "displayName": "Instrument Release",
+      "binaryDir": "${sourceDir}/build/instrument-release",
+      "cacheVariables": {
+        "BOILERPLATE_IS_SYNTH": "ON",
+        "BOILERPLATE_PRODUCT_NAME": "JUCE Instrument",
+        "BOILERPLATE_BUNDLE_ID": "com.boilerplateaudio.juceinstrument",
+        "BOILERPLATE_PLUGIN_CODE": "Jbpi"
+      }
     }
   ],
   "buildPresets": [
@@ -35,6 +59,64 @@
       "configurePreset": "release",
       "configuration": "Release",
       "jobs": 6
+    },
+    {
+      "name": "instrument-debug",
+      "configurePreset": "instrument-debug",
+      "configuration": "Debug",
+      "jobs": 6
+    },
+    {
+      "name": "instrument-release",
+      "configurePreset": "instrument-release",
+      "configuration": "Release",
+      "jobs": 6
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "instrument-debug",
+      "configurePreset": "instrument-debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "instrument-release",
+      "configurePreset": "instrument-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
     }
   ]
 }

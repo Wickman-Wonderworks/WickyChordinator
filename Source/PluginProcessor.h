@@ -58,6 +58,7 @@ private:
     // Cached once after the APVTS is constructed; safe to read on the audio thread.
     std::atomic<float>* gainDbParameter = nullptr;
     std::atomic<float>* bypassParameter = nullptr;
+    juce::AudioProcessorParameter* bypassParameterObject = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginProcessor)
 };

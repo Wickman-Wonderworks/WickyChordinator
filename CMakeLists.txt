@@ -23,6 +23,8 @@ option(BOILERPLATE_ENABLE_LTO "Enable link-time optimisation (slow, memory-heavy
 option(BOILERPLATE_COPY_PLUGIN_AFTER_BUILD "Install plugins to the user plugin folders after building" OFF)
 option(BOILERPLATE_LIMIT_PARALLEL_JOBS "Cap parallel compile jobs to avoid OOM during JUCE module builds" ON)
 option(BOILERPLATE_WINDOWS_MIDI_SERVICES "Use Windows MIDI Services (Windows only; forces C++20)" OFF)
+option(BOILERPLATE_IS_SYNTH "Build an output-only instrument scaffold with MIDI input" OFF)
+option(BOILERPLATE_BUILD_TESTS "Build behavioral and editor lifecycle tests" OFF)
 set(BOILERPLATE_MAX_PARALLEL_JOBS 6 CACHE STRING "Maximum parallel compile jobs when limiting is enabled")
 
 if(BOILERPLATE_WINDOWS_MIDI_SERVICES)
@@ -98,6 +100,14 @@ if(APPLE)
     list(APPEND BOILERPLATE_PLUGIN_FORMATS AU)
 endif()
 
+if(BOILERPLATE_IS_SYNTH)
+    set(_boilerplate_vst3_categories Instrument Synth)
+    set(_boilerplate_needs_audio_input FALSE)
+else()
+    set(_boilerplate_vst3_categories Fx)
+    set(_boilerplate_needs_audio_input TRUE)
+endif()
+
 juce_add_plugin(JUCEBoilerplate
     COMPANY_NAME "${BOILERPLATE_COMPANY_NAME}"
     COMPANY_WEBSITE "${BOILERPLATE_COMPANY_WEBSITE}"
@@ -107,11 +117,13 @@ juce_add_plugin(JUCEBoilerplate
     PLUGIN_CODE ${BOILERPLATE_PLUGIN_CODE}
     PRODUCT_NAME "${BOILERPLATE_PRODUCT_NAME}"
     PLUGIN_NAME "${BOILERPLATE_PRODUCT_NAME}"
-    DESCRIPTION "Scalable JUCE 9 audio effect boilerplate"
+    DESCRIPTION "Scalable JUCE 9 audio plugin boilerplate"
     FORMATS ${BOILERPLATE_PLUGIN_FORMATS}
-    IS_SYNTH FALSE
-    NEEDS_MIDI_INPUT FALSE
+    IS_SYNTH ${BOILERPLATE_IS_SYNTH}
+    NEEDS_MIDI_INPUT ${BOILERPLATE_IS_SYNTH}
     NEEDS_MIDI_OUTPUT FALSE
+    MICROPHONE_PERMISSION_ENABLED ${_boilerplate_needs_audio_input}
+    MICROPHONE_PERMISSION_TEXT "Audio input is required to process incoming audio."
     IS_MIDI_EFFECT FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS FALSE
     COPY_PLUGIN_AFTER_BUILD ${BOILERPLATE_COPY_PLUGIN_AFTER_BUILD}
@@ -119,7 +131,7 @@ juce_add_plugin(JUCEBoilerplate
     NEEDS_CURL FALSE
     NEEDS_WINDOWS_MIDI_SERVICES ${BOILERPLATE_WINDOWS_MIDI_SERVICES}
     VST3_AUTO_MANIFEST TRUE
-    VST3_CATEGORIES Fx)
+    VST3_CATEGORIES ${_boilerplate_vst3_categories})
 
 target_sources(JUCEBoilerplate
     PRIVATE
@@ -167,4 +179,18 @@ target_link_libraries(JUCEBoilerplate
 
 if(BOILERPLATE_ENABLE_LTO)
     target_link_libraries(JUCEBoilerplate PUBLIC juce::juce_recommended_lto_flags)
+endif()
+
+if(BOILERPLATE_BUILD_TESTS)
+    enable_testing()
+    add_executable(BoilerplateTests Tests/BoilerplateTests.cpp)
+    target_link_libraries(BoilerplateTests PRIVATE JUCEBoilerplate)
+    # Reuse the shared code's module settings/headers without compiling JUCE again.
+    target_include_directories(BoilerplateTests PRIVATE
+        $<TARGET_PROPERTY:JUCEBoilerplate,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(BoilerplateTests PRIVATE
+        $<TARGET_PROPERTY:JUCEBoilerplate,COMPILE_DEFINITIONS>)
+    add_test(NAME audio-behavior COMMAND BoilerplateTests)
+    add_test(NAME editor-lifecycle COMMAND BoilerplateTests --editor)
+    set_tests_properties(audio-behavior editor-lifecycle PROPERTIES TIMEOUT 60)
 endif()

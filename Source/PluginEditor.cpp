@@ -30,7 +30,7 @@ namespace
 
 //==============================================================================
 PluginEditor::PluginEditor (PluginProcessor& owner)
-    : AudioProcessorEditor (&processor),
+    : AudioProcessorEditor (&owner),
       processorRef (owner),
       gainAttachment (processorRef.getValueTreeState(), boilerplate::parameters::gain, gainSlider),
       bypassAttachment (processorRef.getValueTreeState(), boilerplate::parameters::bypass, bypassButton)
@@ -102,10 +102,10 @@ void PluginEditor::paint (juce::Graphics& g)
 
     g.setFont (titleFont);
     g.setColour (juce::Colours::black.withAlpha (0.55f));
-    g.drawText ("JUCE BOILERPLATE", titleArea.translated (0, 1),
+    g.drawText (JucePlugin_Name, titleArea.translated (0, 1),
                 juce::Justification::centred, false);
     g.setColour (boilerplate::ui::palette::cream);
-    g.drawText ("JUCE BOILERPLATE", titleArea, juce::Justification::centred, false);
+    g.drawText (JucePlugin_Name, titleArea, juce::Justification::centred, false);
 
     const auto subtitleFont = juce::Font (juce::FontOptions (
         juce::jmax (8.5f, (float) getHeight() * 0.029f), juce::Font::plain))
