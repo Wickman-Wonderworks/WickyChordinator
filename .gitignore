@@ -5,6 +5,7 @@ JuceLibraryCode/
 *.user
 
 # generated bundles / artefacts
+wickychordinator_artefacts/
 JUCEBoilerplate_artefacts/
 JUCE-Boilerplate_artefacts/
 DerivedData/

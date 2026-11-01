@@ -2,16 +2,16 @@ cmake_minimum_required(VERSION 3.22)
 
 # The C language is required by JUCE 9: its vendored zlib/libpng/libjpeg/libflac
 # copies are now compiled as C rather than C++.
-project(JUCEBoilerplate VERSION 0.1.0 LANGUAGES C CXX)
+project("Wicky Chordinator" VERSION 0.1.0 LANGUAGES C CXX)
 
 #===============================================================================
 # Project identity. Override any of these with -D... when configuring.
 #===============================================================================
-set(BOILERPLATE_PRODUCT_NAME "JUCE Boilerplate" CACHE STRING "Plugin product name")
-set(BOILERPLATE_COMPANY_NAME "Boilerplate Audio" CACHE STRING "Company/manufacturer name")
-set(BOILERPLATE_COMPANY_WEBSITE "https://example.com" CACHE STRING "Company website")
-set(BOILERPLATE_COMPANY_EMAIL "dev@example.com" CACHE STRING "Company contact email")
-set(BOILERPLATE_BUNDLE_ID "com.boilerplateaudio.juceboilerplate" CACHE STRING "Bundle identifier")
+set(BOILERPLATE_PRODUCT_NAME "Wicky Chordinator" CACHE STRING "Plugin product name")
+set(BOILERPLATE_COMPANY_NAME "Wickman Wonderworks" CACHE STRING "Company/manufacturer name")
+set(BOILERPLATE_COMPANY_WEBSITE "https://wickmanwonderworks.com" CACHE STRING "Company website")
+set(BOILERPLATE_COMPANY_EMAIL "chadisatwork@gmail.com" CACHE STRING "Company contact email")
+set(BOILERPLATE_BUNDLE_ID "com.wickyaudio.wickychordinator" CACHE STRING "Bundle identifier")
 set(BOILERPLATE_PLUGIN_MANUFACTURER_CODE "Wckm" CACHE STRING "Four-character manufacturer code")
 set(BOILERPLATE_PLUGIN_CODE "Jbpl" CACHE STRING "Four-character plugin code")
 set(BOILERPLATE_JUCE_VERSION "9.0.4" CACHE STRING "JUCE git tag fetched when no local checkout is supplied")

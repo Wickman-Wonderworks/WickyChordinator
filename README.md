@@ -1,4 +1,4 @@
-# JUCE Boilerplate
+# Wicky Chordinator
 
 A JUCE 9 audio-effect and software-instrument starter with a decoupled `Source/`
 layout, APVTS-backed parameters, a realtime-safe DSP layer, and a resizable vector UI. One CMake
@@ -67,11 +67,11 @@ product identity. Freeze effect/instrument classification before releasing a pro
 
 ### Platform targets and Linux dependencies
 
-| Platform | Formats | Architecture / qualification |
-| --- | --- | --- |
-| macOS | AUv2, VST3, `.app` | Native build by default; arm64 + x86_64 universal option below |
-| Windows | VST3, `.exe` | x64 with Visual Studio 2022; qualify Windows 10/11 hosts before release |
-| Linux | VST3, executable | x86_64 Ubuntu 22.04 CI baseline; qualify other distributions separately |
+| Platform | Formats            | Architecture / qualification                                            |
+| -------- | ------------------ | ----------------------------------------------------------------------- |
+| macOS    | AUv2, VST3, `.app` | Native build by default; arm64 + x86_64 universal option below          |
+| Windows  | VST3, `.exe`       | x64 with Visual Studio 2022; qualify Windows 10/11 hosts before release |
+| Linux    | VST3, executable   | x86_64 Ubuntu 22.04 CI baseline; qualify other distributions separately |
 
 CI builds both product configurations in Debug and Release on `macos-latest`,
 `windows-2022`, and `ubuntu-22.04`. These build environments are not minimum runtime
