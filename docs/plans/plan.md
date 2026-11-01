@@ -10,6 +10,15 @@ Here is the exact code for my existing files:
 - Source/PluginProcessor.cpp (file exists)
 - Source/ChordSettingsPanel.h (create this file)
 
+## Key Features
+
+- Universal Compatibility: Effortlessly connect with your DAW and MIDI controller for a smooth and hassle-free setup.
+- Chord Generation: From simple triads to complex jazz chords, create stunning chord progressions with ease.
+- Smart Voicing: Intelligently selects the most pleasing chord voicings, ensuring your music always sounds professional.
+- Spread, Humanize and Strum: Add depth and realism to your chords with adjustable spread, humanization and strumming effects.
+- Strum Patterns: Choose from a variety of strum patterns to suit any genre or style, and bring your compositions to life.
+- Key Signature: Easily play in any key signature, the perfect companion for songwriters and composers.
+
 ### Feature Requirements to Inject:
 
 1. Parameter Layout: Add three discrete `juce::AudioParameterChoice` parameters to my APVTS layout:
@@ -24,15 +33,6 @@ Here is the exact code for my existing files:
 4. UI Control Binding: Implement a custom, lock-free `ButtonGroupAttachment` helper class at the top of `ChordSettingsPanel.h` that implements `juce::AudioProcessorValueTreeState::Listener`. Use it to safely connect my `juce::OwnedArray<juce::TextButton>` button groups to their respective choice parameters on the message thread without stalling the audio loop.
 
 Please provide the updated versions of these files, clearly highlighting the specific lines or blocks that were added or modified.
-
-## Key Features
-
-- Universal Compatibility: Effortlessly connect with your DAW and MIDI controller for a smooth and hassle-free setup.
-- Chord Generation: From simple triads to complex jazz chords, create stunning chord progressions with ease.
-- Smart Voicing: Intelligently selects the most pleasing chord voicings, ensuring your music always sounds professional.
-- Spread, Humanize and Strum: Add depth and realism to your chords with adjustable spread, humanization and strumming effects.
-- Strum Patterns: Choose from a variety of strum patterns to suit any genre or style, and bring your compositions to life.
-- Key Signature: Easily play in any key signature, the perfect companion for songwriters and composers.
 
 ### MIDI Settings
 
