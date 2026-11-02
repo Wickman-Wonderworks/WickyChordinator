@@ -4,8 +4,6 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
-#include "DSP/GainProcessor.h"
-
 class PluginProcessor final : public juce::AudioProcessor
 {
 public:
@@ -53,12 +51,21 @@ private:
     // Declared before the raw parameter pointers so that it outlives them.
     juce::AudioProcessorValueTreeState apvts;
 
-    boilerplate::dsp::GainProcessor gainProcessor;
-
     // Cached once after the APVTS is constructed; safe to read on the audio thread.
     std::atomic<float>* gainDbParameter = nullptr;
     std::atomic<float>* bypassParameter = nullptr;
     juce::AudioProcessorParameter* bypassParameterObject = nullptr;
+
+    // Chord Settings Matrix. Raw atomics only: no APVTS or String lookup is
+    // allowed on the audio thread.
+    std::atomic<float>* typeParam = nullptr;
+    std::atomic<float>* complexityParam = nullptr;
+    std::atomic<float>* voicingParam = nullptr;
+    std::atomic<float>* pitchOffsetParam = nullptr;
+
+    // Audio-thread scratch for the copy-then-swap MIDI pass. Preallocated in
+    // prepareToPlay so processBlock never has to grow it.
+    juce::MidiBuffer midiSwapBuffer;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginProcessor)
 };

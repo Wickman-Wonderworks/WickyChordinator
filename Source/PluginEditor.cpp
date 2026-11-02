@@ -4,8 +4,8 @@
 
 namespace
 {
-    constexpr int designWidth = 520;
-    constexpr int designHeight = 340;
+    constexpr int designWidth = 720;
+    constexpr int designHeight = 580;
 
     void drawScrew (juce::Graphics& g, juce::Point<float> centre, float radius)
     {
@@ -32,6 +32,7 @@ namespace
 PluginEditor::PluginEditor (PluginProcessor& owner)
     : AudioProcessorEditor (&owner),
       processorRef (owner),
+      chordPanel (processorRef.getValueTreeState()),
       gainAttachment (processorRef.getValueTreeState(), boilerplate::parameters::gain, gainSlider),
       bypassAttachment (processorRef.getValueTreeState(), boilerplate::parameters::bypass, bypassButton)
 {
@@ -44,17 +45,19 @@ PluginEditor::PluginEditor (PluginProcessor& owner)
                                     juce::MathConstants<float>::pi * 2.8f,
                                     true);
     gainSlider.setDoubleClickReturnValue (true, 0.0);
-    gainSlider.setName ("Output Gain");
-    gainSlider.setDescription ("Output gain in decibels");
+    gainSlider.setName ("MIDI Velocity Gain");
+    gainSlider.setDescription ("Scales the velocity of outgoing MIDI notes in decibels");
     addAndMakeVisible (gainSlider);
 
     bypassButton.setButtonText ("BYPASS");
     bypassButton.setName ("Bypass");
-    bypassButton.setDescription ("Bypasses the gain stage");
+    bypassButton.setDescription ("Passes MIDI through without velocity scaling");
     addAndMakeVisible (bypassButton);
 
+    addAndMakeVisible (chordPanel);
+
     setResizable (true, true);
-    setResizeLimits (420, 275, 1040, 680);
+    setResizeLimits (560, 450, 1200, 970);
 
     if (auto* constrainer = getConstrainer())
         constrainer->setFixedAspectRatio ((double) designWidth / (double) designHeight);
@@ -113,7 +116,8 @@ void PluginEditor::paint (juce::Graphics& g)
 
     g.setFont (subtitleFont);
     g.setColour (boilerplate::ui::palette::muted);
-    g.drawText ("JUCE 9  /  OUTPUT GAIN", header, juce::Justification::centred, false);
+    g.drawText ("JUCE 9  /  CHORD MATRIX  /  MIDI VELOCITY", header,
+                juce::Justification::centred, false);
 
     const auto divider = area.removeFromTop (scaled (1));
     g.setColour (boilerplate::ui::palette::line);
@@ -144,16 +148,23 @@ void PluginEditor::resized()
     area.removeFromBottom (scaled (24)); // footer drawn in paint()
     area.removeFromBottom (scaled (8));
 
-    bypassButton.setBounds (area.removeFromBottom (scaled (36))
-                                .withSizeKeepingCentre (scaled (150), scaled (36)));
-
+    const auto controlsHeight = juce::jmin (area.getHeight() / 3, scaled (132));
+    auto controls = area.removeFromBottom (controlsHeight);
     area.removeFromBottom (scaled (10));
 
-    const auto knobSize = juce::jmin (area.getWidth(), area.getHeight());
-    gainSlider.setBounds (area.withSizeKeepingCentre (knobSize, knobSize));
+    chordPanel.setBounds (area);
+
+    auto knobArea = controls.removeFromLeft (controls.getWidth() / 2);
+    const auto knobSize = juce::jmin (knobArea.getWidth(), knobArea.getHeight());
+    gainSlider.setBounds (knobArea.withSizeKeepingCentre (knobSize, knobSize));
+
+    bypassButton.setBounds (controls.withSizeKeepingCentre (scaled (150), scaled (36)));
 }
 
 int PluginEditor::scaled (int value) const noexcept
 {
-    return juce::roundToInt ((float) value * (float) getWidth() / (float) designWidth);
+    const auto widthScale = (float) getWidth() / (float) designWidth;
+    const auto heightScale = (float) getHeight() / (float) designHeight;
+
+    return juce::roundToInt ((float) value * juce::jmin (widthScale, heightScale));
 }

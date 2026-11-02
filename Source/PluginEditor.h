@@ -2,6 +2,7 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
+#include "ChordSettingsPanel.h"
 #include "UI/BoilerplateLookAndFeel.h"
 
 class PluginProcessor;
@@ -20,6 +21,10 @@ private:
 
     PluginProcessor& processorRef;
     boilerplate::ui::BoilerplateLookAndFeel lookAndFeel;
+
+    // Declaration order matters: the panel owns parameter attachments that
+    // must be destroyed before the controls they point at.
+    ChordSettingsPanel chordPanel;
 
     juce::Slider gainSlider;
     juce::ToggleButton bypassButton;

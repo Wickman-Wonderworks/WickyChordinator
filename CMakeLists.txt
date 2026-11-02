@@ -24,6 +24,11 @@ option(BOILERPLATE_COPY_PLUGIN_AFTER_BUILD "Install plugins to the user plugin f
 option(BOILERPLATE_LIMIT_PARALLEL_JOBS "Cap parallel compile jobs to avoid OOM during JUCE module builds" ON)
 option(BOILERPLATE_WINDOWS_MIDI_SERVICES "Use Windows MIDI Services (Windows only; forces C++20)" OFF)
 option(BOILERPLATE_IS_SYNTH "Build an output-only instrument scaffold with MIDI input" OFF)
+# A true AU MIDI effect (aumi) must declare no audio buses, which would remove
+# the gain/bypass audio path and break the current test contract. Keep this OFF
+# until the plugin is converted to a bus-free MIDI processor; the plugin still
+# accepts and emits MIDI as a music effect (aumf) in the meantime.
+option(BOILERPLATE_IS_MIDI_EFFECT "Build as a bus-free AU MIDI effect (AU MIDI FX slot)" OFF)
 option(BOILERPLATE_BUILD_TESTS "Build behavioral and editor lifecycle tests" OFF)
 set(BOILERPLATE_MAX_PARALLEL_JOBS 6 CACHE STRING "Maximum parallel compile jobs when limiting is enabled")
 
@@ -102,10 +107,10 @@ endif()
 
 if(BOILERPLATE_IS_SYNTH)
     set(_boilerplate_vst3_categories Instrument Synth)
-    set(_boilerplate_needs_audio_input FALSE)
+    set(_boilerplate_is_midi_effect FALSE)
 else()
     set(_boilerplate_vst3_categories Fx)
-    set(_boilerplate_needs_audio_input TRUE)
+    set(_boilerplate_is_midi_effect ${BOILERPLATE_IS_MIDI_EFFECT})
 endif()
 
 juce_add_plugin(JUCEBoilerplate
@@ -117,14 +122,14 @@ juce_add_plugin(JUCEBoilerplate
     PLUGIN_CODE ${BOILERPLATE_PLUGIN_CODE}
     PRODUCT_NAME "${BOILERPLATE_PRODUCT_NAME}"
     PLUGIN_NAME "${BOILERPLATE_PRODUCT_NAME}"
-    DESCRIPTION "Scalable JUCE 9 audio plugin boilerplate"
+    DESCRIPTION "MIDI chord progression generator"
     FORMATS ${BOILERPLATE_PLUGIN_FORMATS}
     IS_SYNTH ${BOILERPLATE_IS_SYNTH}
-    NEEDS_MIDI_INPUT ${BOILERPLATE_IS_SYNTH}
-    NEEDS_MIDI_OUTPUT FALSE
-    MICROPHONE_PERMISSION_ENABLED ${_boilerplate_needs_audio_input}
+    NEEDS_MIDI_INPUT TRUE
+    NEEDS_MIDI_OUTPUT TRUE
+    MICROPHONE_PERMISSION_ENABLED FALSE
     MICROPHONE_PERMISSION_TEXT "Audio input is required to process incoming audio."
-    IS_MIDI_EFFECT FALSE
+    IS_MIDI_EFFECT ${_boilerplate_is_midi_effect}
     EDITOR_WANTS_KEYBOARD_FOCUS FALSE
     COPY_PLUGIN_AFTER_BUILD ${BOILERPLATE_COPY_PLUGIN_AFTER_BUILD}
     NEEDS_WEB_BROWSER FALSE
@@ -139,6 +144,7 @@ target_sources(JUCEBoilerplate
         Source/PluginProcessor.h
         Source/PluginEditor.cpp
         Source/PluginEditor.h
+        Source/ChordSettingsPanel.h
         Source/DSP/GainProcessor.cpp
         Source/DSP/GainProcessor.h
         Source/State/ParameterIDs.h

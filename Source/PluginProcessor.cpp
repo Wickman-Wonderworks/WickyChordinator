@@ -15,9 +15,19 @@ PluginProcessor::PluginProcessor()
     bypassParameter = apvts.getRawParameterValue (boilerplate::parameters::bypass);
     bypassParameterObject = apvts.getParameter (boilerplate::parameters::bypass);
 
+    // Chord Settings Matrix: cache once, immediately after the APVTS exists.
+    typeParam = apvts.getRawParameterValue (boilerplate::parameters::chordType);
+    complexityParam = apvts.getRawParameterValue (boilerplate::parameters::complexity);
+    voicingParam = apvts.getRawParameterValue (boilerplate::parameters::voicing);
+    pitchOffsetParam = apvts.getRawParameterValue (boilerplate::parameters::pitchOffset);
+
     jassert (gainDbParameter != nullptr);
     jassert (bypassParameter != nullptr);
     jassert (bypassParameterObject != nullptr);
+    jassert (typeParam != nullptr);
+    jassert (complexityParam != nullptr);
+    jassert (voicingParam != nullptr);
+    jassert (pitchOffsetParam != nullptr);
 }
 
 PluginProcessor::~PluginProcessor() = default;
@@ -83,16 +93,17 @@ void PluginProcessor::changeProgramName (int index, const juce::String& newName)
 //==============================================================================
 void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    juce::ignoreUnused (samplesPerBlock);
+    juce::ignoreUnused (sampleRate);
 
-    const auto initialGain = gainDbParameter != nullptr ? gainDbParameter->load() : 0.0f;
-    const auto initiallyBypassed = bypassParameter != nullptr && bypassParameter->load() > 0.5f;
-    gainProcessor.prepare (sampleRate, initialGain, initiallyBypassed);
+    // The copy-then-swap pass reuses this buffer every block. Reserving here
+    // keeps the audio callback allocation-free in steady state.
+    midiSwapBuffer.clear();
+    midiSwapBuffer.ensureSize (static_cast<size_t> (juce::jmax (8192, samplesPerBlock * 32)));
 }
 
 void PluginProcessor::releaseResources()
 {
-    gainProcessor.reset();
+    midiSwapBuffer.clear();
 }
 
 bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -115,6 +126,22 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 {
     juce::ScopedNoDenormals noDenormals;
 
+    // Chord Settings Matrix. Relaxed ordering is enough for independent
+    // scalars: these values are consumed by the MIDI math below and do not
+    // synchronise any other memory.
+    const auto chordTypeIndex = juce::roundToInt (typeParam->load (std::memory_order_relaxed));
+    const auto complexityIndex = juce::roundToInt (complexityParam->load (std::memory_order_relaxed));
+    const auto voicingIndex = juce::roundToInt (voicingParam->load (std::memory_order_relaxed));
+    const auto pitchOffsetSemitones = juce::roundToInt (pitchOffsetParam->load (std::memory_order_relaxed));
+
+    const auto gainDecibels = gainDbParameter->load (std::memory_order_relaxed);
+    const auto bypassed = bypassParameter->load (std::memory_order_relaxed) > 0.5f;
+
+    // Chord generation extension point. The values above are ready for the
+    // note-to-chord mapping; reading them here keeps the realtime path and the
+    // parameter contract in place while that engine is built.
+    juce::ignoreUnused (chordTypeIndex, complexityIndex, voicingIndex, pitchOffsetSemitones);
+
     const auto totalNumInputChannels = getTotalNumInputChannels();
     const auto totalNumOutputChannels = getTotalNumOutputChannels();
 
@@ -127,12 +154,44 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     // output here, consuming MIDI at each event's samplePosition. Until a product
     // adds its engine this scaffold intentionally outputs silence.
    #endif
-    juce::ignoreUnused (midiMessages);
 
-    const auto gainDecibels = gainDbParameter != nullptr ? gainDbParameter->load() : 0.0f;
-    const auto bypassed = bypassParameter != nullptr && bypassParameter->load() > 0.5f;
+    // Output Gain now scales outgoing MIDI velocity rather than audio samples,
+    // so the audio buffer stays a transparent pass-through. Bypass forwards
+    // MIDI untouched, matching the old effect's "hear the input as played".
+    const auto velocityGain = bypassed
+        ? 1.0f
+        : juce::Decibels::decibelsToGain (gainDecibels, -60.0f);
 
-    gainProcessor.process (buffer, gainDecibels, bypassed);
+    // Copy-then-swap: the source buffer is never mutated while it is being
+    // iterated, so no iterator can be invalidated. Three-byte MIDI messages
+    // are stored inline by juce::MidiMessage, so this loop does not allocate.
+    midiSwapBuffer.clear();
+
+    for (const auto metadata : midiMessages)
+    {
+        const auto* data = metadata.data;
+        const auto isNoteOn = metadata.numBytes == 3
+                           && (data[0] & 0xf0) == 0x90
+                           && data[2] > 0;
+
+        if (isNoteOn)
+        {
+            const auto scaledVelocity = juce::jlimit (1, 127,
+                juce::roundToInt (static_cast<float> (data[2]) * velocityGain));
+
+            midiSwapBuffer.addEvent (
+                juce::MidiMessage::noteOn ((data[0] & 0x0f) + 1,
+                                           static_cast<int> (data[1]),
+                                           static_cast<juce::uint8> (scaledVelocity)),
+                metadata.samplePosition);
+        }
+        else
+        {
+            midiSwapBuffer.addEvent (data, metadata.numBytes, metadata.samplePosition);
+        }
+    }
+
+    midiMessages.swapWith (midiSwapBuffer);
 }
 
 //==============================================================================

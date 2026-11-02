@@ -1,4 +1,5 @@
 #include "PluginProcessor.h"
+#include "DSP/GainProcessor.h"
 #include "State/ParameterIDs.h"
 
 #include <cmath>
@@ -101,11 +102,76 @@ namespace
                 }
     }
 
+    int firstNoteOnVelocity (const juce::MidiBuffer& midi)
+    {
+        for (const auto metadata : midi)
+            if (metadata.numBytes == 3
+                && (metadata.data[0] & 0xf0) == 0x90
+                && metadata.data[2] > 0)
+                return metadata.data[2];
+
+        return -1;
+    }
+
+    void testMidiVelocityGain()
+    {
+        PluginProcessor processor;
+        processor.prepareToPlay (48000.0, 64);
+
+        auto processVelocity = [&] (float gainDb, bool bypassed, int velocity)
+        {
+            setParameter (processor, boilerplate::parameters::gain, gainDb);
+            setParameter (processor, boilerplate::parameters::bypass, bypassed ? 1.0f : 0.0f);
+
+            juce::AudioBuffer<float> buffer (2, 64);
+            fill (buffer, 0.25f);
+
+            juce::MidiBuffer midi;
+            midi.addEvent (juce::MidiMessage::noteOn (1, 60, static_cast<juce::uint8> (velocity)), 0);
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 1, 64), 1);
+            midi.addEvent (juce::MidiMessage::noteOff (1, 60), 2);
+
+            processor.processBlock (buffer, midi);
+
+            int eventCount = 0;
+            int controllerValue = -1;
+            bool sawNoteOff = false;
+
+            for (const auto metadata : midi)
+            {
+                ++eventCount;
+                const auto message = metadata.getMessage();
+
+                if (message.isNoteOff (false))
+                    sawNoteOff = true;
+                else if (message.isController())
+                    controllerValue = message.getControllerValue();
+            }
+
+            require (eventCount == 3, "MIDI events were lost");
+            require (sawNoteOff, "Note-off was lost");
+            require (controllerValue == 64, "Controller data changed");
+            expectSamples (buffer, 0.25f); // Audio stays a transparent pass-through.
+
+            return firstNoteOnVelocity (midi);
+        };
+
+        require (processVelocity (0.0f, false, 100) == 100, "0 dB changed velocity");
+        require (processVelocity (-6.0f, false, 100) == 50, "Velocity attenuation failed");
+        require (processVelocity (12.0f, false, 100) == 127, "Velocity boost did not clamp");
+        require (processVelocity (-60.0f, false, 100) == 1, "Full attenuation lost the note-on");
+        require (processVelocity (-24.0f, true, 100) == 100, "Bypass changed velocity");
+    }
+
     void testStateAndProcessing()
     {
         PluginProcessor source;
         setParameter (source, boilerplate::parameters::gain, -24.0f);
         setParameter (source, boilerplate::parameters::bypass, 1.0f);
+        setParameter (source, boilerplate::parameters::chordType, 2.0f);
+        setParameter (source, boilerplate::parameters::complexity, 6.0f);
+        setParameter (source, boilerplate::parameters::voicing, 2.0f);
+        setParameter (source, boilerplate::parameters::pitchOffset, 5.0f);
         juce::MemoryBlock state;
         source.getStateInformation (state);
         require (state.getSize() > 0, "Empty saved state");
@@ -117,10 +183,23 @@ namespace
                           + 24.0f) < 0.01f, "Gain recall failed");
         require (parameters.getRawParameterValue (boilerplate::parameters::bypass)->load() > 0.5f,
                  "Bypass recall failed");
+        require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::chordType)->load()
+                          - 2.0f) < 0.01f, "Chord type recall failed");
+        require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::complexity)->load()
+                          - 6.0f) < 0.01f, "Complexity recall failed");
+        require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::voicing)->load()
+                          - 2.0f) < 0.01f, "Voicing recall failed");
+        require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::pitchOffset)->load()
+                          - 5.0f) < 0.01f, "Pitch offset recall failed");
         require (restored.getBypassParameter() == parameters.getParameter (boilerplate::parameters::bypass),
                  "Wrong host bypass parameter");
         require (parameters.getParameter (boilerplate::parameters::gain)->getVersionHint() == 1
                  && restored.getBypassParameter()->getVersionHint() == 1, "Released AU hints changed");
+        require (parameters.getParameter (boilerplate::parameters::chordType)->getVersionHint() == 2
+                 && parameters.getParameter (boilerplate::parameters::complexity)->getVersionHint() == 3
+                 && parameters.getParameter (boilerplate::parameters::voicing)->getVersionHint() == 4
+                 && parameters.getParameter (boilerplate::parameters::pitchOffset)->getVersionHint() == 5,
+                 "Chord matrix AU hints changed");
 
         restored.setStateInformation (nullptr, 0);
         juce::MemoryBlock unrelated;
@@ -132,8 +211,8 @@ namespace
         require (parameters.getRawParameterValue (boilerplate::parameters::bypass)->load() > 0.5f,
                  "Unrelated state modified parameters");
 
-        require (restored.acceptsMidi() == (JucePlugin_IsSynth != 0), "Incorrect MIDI classification");
-        require (! restored.producesMidi(), "Unexpected MIDI output");
+        require (restored.acceptsMidi(), "Chord plugin must accept MIDI input");
+        require (restored.producesMidi(), "Chord plugin must produce MIDI output");
         require (restored.getBusCount (true) == (JucePlugin_IsSynth ? 0 : 1), "Incorrect input buses");
         require (restored.getBusCount (false) == 1, "Incorrect output buses");
 
@@ -203,6 +282,7 @@ int main (int argc, char** argv)
         else
         {
             testGain();
+            testMidiVelocityGain();
             testStateAndProcessing();
         }
         std::cout << "Passed\n";
