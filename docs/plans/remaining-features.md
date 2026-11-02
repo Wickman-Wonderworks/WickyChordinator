@@ -15,14 +15,14 @@ any audio-code change, apply `audio-dsp-review`, `audio-numerics-review`, then
 
 ### What already exists
 
-| Feature | Current implementation | Work still needed |
-| --- | --- | --- |
-| User presets | SAVE/LOAD `.wickychord`, default-folder discovery, mappings in state | Optional library management UX only |
-| Scale selection | Scale Root; Chromatic/Major/Natural Minor; session recall; presets preserve scale | Optional additional modes only |
-| Strum | Free-time Up/Down, sample-clock scheduler | Tempo sync and additional finite patterns |
-| MIDI settings | JUCE standard standalone input/output selector | Custom panel and verified routing lifecycle |
-| Virtual output | Can select existing output endpoints through JUCE | Application-created port and platform capability handling |
-| Logic MIDI FX | Default AU is `aumf`; MIDI-effect CMake switch exists | Separate bus-free product, zero-audio-bus processing, validation |
+| Feature         | Current implementation                                                            | Work still needed                                                |
+| --------------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| User presets    | SAVE/LOAD `.wickychord`, default-folder discovery, mappings in state              | Optional library management UX only                              |
+| Scale selection | Scale Root; Chromatic/Major/Natural Minor; session recall; presets preserve scale | Optional additional modes only                                   |
+| Strum           | Free-time Up/Down, sample-clock scheduler                                         | Tempo sync and additional finite patterns                        |
+| MIDI settings   | JUCE standard standalone input/output selector                                    | Custom panel and verified routing lifecycle                      |
+| Virtual output  | Can select existing output endpoints through JUCE                                 | Application-created port and platform capability handling        |
+| Logic MIDI FX   | Default AU is `aumf`; MIDI-effect CMake switch exists                             | Separate bus-free product, zero-audio-bus processing, validation |
 
 Evidence entry points: `Source/ChordSettingsPanel.h` (`PresetManager`,
 `GlobalSettingsPanel`), `Source/PluginEditor.cpp` (`chooseUserPreset`),
@@ -303,3 +303,5 @@ Update USER_GUIDE limitations only when each feature meets its acceptance gate.
 > platform validation. Do not begin the next unit or claim untested device/DAW
 > behavior works. If the pinned JUCE API cannot support the design, document the
 > concrete blocker and the smallest alternative rather than inventing an API.
+
+Ask me if you have any questions or need further guidance.
