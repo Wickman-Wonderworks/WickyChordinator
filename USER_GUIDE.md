@@ -29,11 +29,19 @@ Choose how much of the chord to play:
 `7b5`, `9#11`, and `13#11` are altered-dominant colours and use a flat seventh in every type.
 
 ### Voicing
-- **High** — the whole chord is voiced one octave above the played key.
-- **Root** — the chord starts at the played key.
-- **Low** — the whole chord is voiced one octave below the played key.
 
-Voicing and Pitch Offset are independent: voicing moves in octaves, pitch offset moves in semitones.
+**Voicing Style** in Global Settings selects how High / Root / Low work:
+
+- **Register (legacy)** — moves the whole chord up an octave, leaves it in root
+  position, or moves it down an octave.
+- **Inversions** — High raises the bass; Root keeps root position; Low lowers
+  the upper voice below the root, where the MIDI range permits.
+- **Random** — chooses one of the three positions for each trigger.
+- **Smart** — chooses a position/register to reduce movement from the previous
+  chord on that MIDI channel.
+
+New instances default to Inversions. Older saved sessions retain legacy register
+voicing. Pitch Offset remains an independent semitone transpose.
 
 ### Pitch Offset
 The `−` / `+` buttons transpose the chord from −12 to +12 semitones. This is useful for making a chord fit the key you are playing in, or for giving a single key a different version of the same chord.
@@ -46,13 +54,17 @@ The bottom row of the panel is the key map.
 
 1. Pick a note in the **KEY MAP** menu, e.g. `C4 (60)`.
 2. Set the matrix above to the chord you want for that note.
-3. Click **ASSIGN**. The key now has its own recipe.
+3. Choose **All octaves** for a pitch-class assignment (all Cs, for example),
+   or uncheck it to assign only the selected MIDI note. Click **ASSIGN**.
 4. Play that key. It uses its recipe; every other unassigned key still follows the current matrix.
 
 The status text shows what the selected key is using:
 
 - **GLOBAL (uses matrix)** — no override; the key follows the matrix above.
-- **CUSTOM …** — the key has its own saved Type/Complexity/Voicing/Pitch.
+- **CLASS …** — the selected pitch class has a saved recipe.
+- **NOTE …** — the selected exact MIDI note has a saved recipe.
+- **CLASS (inherited)** — the exact note uses its pitch-class recipe.
+- **[NOTE overrides]** — an exact-note assignment takes precedence over the class.
 
 ### Editing an existing key recipe
 
@@ -63,15 +75,21 @@ The status text shows what the selected key is using:
 
 ### Removing a key override
 
-Select the key and click **CLEAR**. The key returns to following the global matrix.
+Select the key and click **CLEAR**. With All octaves checked this clears the
+pitch-class layer; otherwise it clears only the exact-note layer. Exact-note
+assignments take precedence over pitch-class assignments, which take precedence
+over the global matrix. Clearing an exact override may reveal an inherited class.
 
 ### Example
+
+Uncheck **All octaves** for this example:
 
 - `C4` → Major / Triad / Root / 0 → **ASSIGN**
 - `G4` → Dominant / 13th / High / 0 → **ASSIGN**
 - `C5` stays **GLOBAL** and follows whatever the matrix currently shows.
 
-Each MIDI note has its own slot, so `C4` and `C5` are independent.
+Exact-note assignments make `C4` and `C5` independent. All-octave assignments
+share a recipe across the pitch class. **LOAD** edits whichever layer is selected.
 
 ## 4. Global interaction controls
 
@@ -93,9 +111,21 @@ At `Spread = 0%` both modes are identical.
 
 ### Humanize
 
-Randomizes the velocity of each chord tone inside a tight bracket. At `0%` every
-chord note uses the incoming velocity. Higher values add more velocity variation,
-which makes programmed chords feel less mechanical.
+Randomizes velocity by up to 15 MIDI velocity steps, scaled by the amount.
+With **Timing** enabled, it also adds up to 10 ms of random delay to each note-on.
+At `0%` there is no humanization. Older sessions retain velocity-only behavior
+until Timing is enabled. Velocity Gain still applies independently.
+
+### Scale Root and Scale Mode
+
+Scale Root transposes the result by 0–11 semitones. Modes are **Chromatic**,
+**Major**, and **Natural Minor**. Natural Minor lowers the C-major reference
+degrees E, A and B before root transposition; accidentals retain their chromatic
+position. This transforms the preset rather than detecting the key automatically.
+Green dots on the keyboard mark notes in the selected major/minor scale.
+
+Scale choices are saved in DAW sessions and remain unchanged when loading factory
+or user presets. Minor-mode NOW PLAYING shows output note names.
 
 ### Strum
 
@@ -134,10 +164,11 @@ The compact **Velocity** knob scales outgoing MIDI velocity.
 
 ### Presets
 
-The **PRESET** selector in the top bar loads a factory preset. The `<` and `>`
+The **PRESET** selector in the top bar loads a factory or saved user preset. The `<` and `>`
 buttons move through the bank without opening the menu. Loading a preset changes
 the chord matrix, global interaction controls, power state and velocity; it does
-not erase your per-key recipes.
+not erase your mappings when loading a factory preset. A user preset restores
+its saved exact-note and all-octave mappings. Both preserve the current scale.
 
 ### Chord readout
 
@@ -164,8 +195,14 @@ The chord matrix, the complete per-key map, the global interaction settings, pow
 state and velocity are saved with the plugin state and the DAW session. Reopening
 the session restores every custom key assignment and interaction setting.
 
-The top-bar preset selector is a factory preset browser. Saving your own named
-presets to a user library is not part of this build yet.
+Click top-bar **SAVE** to write a named `.wickychord` preset. Presets in the default
+user preset directory appear in the selector the next time the editor opens.
+Click top-bar **LOAD** to open a preset file from another folder. This differs
+from Key Map LOAD, which copies a selected mapping into the matrix.
+
+The default folder is `Wickman Wonderworks/Wicky Chordinator/Presets` under JUCE's
+user application-data directory (Application Support on macOS). User presets
+include both mapping layers. DAW session recall also restores the selected scale.
 
 ## 8. Troubleshooting
 
@@ -176,7 +213,8 @@ presets to a user library is not part of this build yet.
 - In a DAW, make sure the track is record/monitor-enabled so MIDI reaches the plugin.
 
 **A key does not follow the matrix**
-- It probably has a custom recipe. Select it in **KEY MAP**; the status will show **CUSTOM**. Click **CLEAR** to return it to the global matrix.
+- It probably has a custom recipe. Select it in **KEY MAP**; the status shows NOTE or CLASS. Clear the appropriate layer; an exact-note
+  override wins over an all-octave assignment.
 
 **A chord is in the wrong octave**
 - Check **Voicing** (High/Root/Low) and **Pitch Offset**.
@@ -186,20 +224,29 @@ presets to a user library is not part of this build yet.
 - Toggle **POWER** off and on, or toggle host **Bypass**, to force a release of generated notes.
 
 **Standalone MIDI routing**
-- Use the standalone's Options / Audio Settings to choose your MIDI input.
-- Feeding the standalone's generated MIDI into another app through a virtual MIDI port is not implemented in this build. Use the plugin inside a DAW for now.
+- Use the standalone's Options / Audio Settings to select MIDI inputs and an
+  existing MIDI output device or port. This is JUCE's standard settings UI.
+- This build does not create its own system-wide virtual MIDI output port.
+  Routing to an existing virtual port depends on the OS/backend and your setup;
+  creating a port and connecting to an existing port are separate capabilities.
 
 ## 9. Current limitations
 
 These parts of the larger design are not in this build yet:
 
-- User-preset saving and a user preset library (factory presets are included)
-- Tempo-synced strum and additional strum pattern models
-- Scale / key-signature selection
-- A custom MIDI input/output settings panel
-- A system-wide virtual MIDI output port
-- Dedicated Logic MIDI FX placement (requires the bus-free MIDI-effect build)
+- Tempo-synced strum and additional strum patterns beyond Up / Down
+- A custom standalone MIDI input/output settings panel (JUCE's standard panel exists)
+- An app-created system-wide virtual MIDI output port
+- Dedicated Logic MIDI FX placement through a validated bus-free AU MIDI effect
 
-The chord matrix, per-key recipes, spread/humanize/strum engine, note-off modes,
-factory presets, live chord readout, power switch, velocity gain, bypass, and
-session persistence are complete and active.
+User-preset save/load and basic library browsing, Scale Root/Mode, inversions,
+Smart/Random voicing, timing humanization, and all-octave assignments are already
+implemented. The library currently offers save/load and default-folder discovery;
+it does not provide tagging, search, or rename/delete controls.
+
+The `BOILERPLATE_IS_MIDI_EFFECT` CMake option is scaffolding, not a completed Logic
+MIDI FX configuration: the processor still declares audio buses. Do not enable it
+and assume Logic compatibility without completing bus negotiation and validation.
+
+See [the phased implementation plan](docs/plans/remaining-features.md) for the
+remaining work, task boundaries, and acceptance checks.
