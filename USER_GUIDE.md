@@ -127,16 +127,53 @@ Green dots on the keyboard mark notes in the selected major/minor scale.
 Scale choices are saved in DAW sessions and remain unchanged when loading factory
 or user presets. Minor-mode NOW PLAYING shows output note names.
 
-### Strum
+### Strum and Strum Timing
 
-Delays successive chord tones instead of firing them all at once. The step time
-is calculated from the current sample rate, so the groove stays consistent at
-`44.1`, `48`, and `96 kHz`. A `0%` setting keeps the original instant chord.
+Strum delays successive chord tones instead of firing them all at once.
+**Strum Timing** selects how the step is set:
+
+- **Free** — the **Strum** knob sets the step from `0%` (instant chord) to `100%`
+  (`60 ms` between tones). The step is calculated from the current sample rate, so
+  the feel stays consistent at `44.1`, `48`, and `96 kHz`.
+- **Sync** — the **Division** selector sets the full step as a musical value:
+  `1/8`, `1/16` or `1/32`, each with straight, dotted and triplet forms. The step
+  follows the host tempo. The Strum knob is disabled in Sync mode; its tooltip
+  explains why.
+
+**Fallback** is the tempo used when the host supplies no valid tempo. Its range is
+`20–300 BPM` and the default is `120 BPM`. The status line at the bottom of Global
+Settings shows `STRUM: HOST … BPM` when a host tempo is in use and
+`STRUM: FALLBACK … BPM (NO HOST TEMPO)` when it is not. The standalone has no DAW
+transport, so it normally uses the fallback rather than following a DAW clock.
+
+Changing tempo or timing affects the **next** chord you trigger. Tones that are
+already scheduled keep their absolute timing, so a tempo change never re-times a
+strum that is already in progress.
 
 ### Strum Mode
 
+Strum Mode is used by **Legacy Direction**. When another **Strum Pattern** is
+selected it is disabled, and its tooltip explains that the pattern supplies the
+order.
+
 - **Up** — low chord tones first, high tones last.
 - **Down** — high chord tones first, low tones last.
+
+### Strum Pattern
+
+Strum Pattern chooses the finite ordering of one chord. It is not a repeating
+arpeggiator or sequencer.
+
+- **Legacy Direction** — use the Up/Down Strum Mode above.
+- **Alternate** — first trigger Up, next trigger Down, then repeat. Each MIDI
+  channel keeps its own direction, so chords on different channels do not
+  interfere.
+- **Random** — shuffle all chord tones. Each tone appears exactly once per
+  trigger.
+- **Outside-In** — lowest, highest, second-lowest, second-highest, and so on.
+
+Strum Pattern applies in both Free and Sync timing modes. It affects the next
+chord you trigger; a chord that is already sounding keeps its scheduled order.
 
 ### Note Off Mode
 
@@ -191,9 +228,14 @@ key, so custom key recipes are reflected immediately.
 
 ## 7. Saving
 
-The chord matrix, the complete per-key map, the global interaction settings, power
-state and velocity are saved with the plugin state and the DAW session. Reopening
+The chord matrix, the complete per-key map, the global interaction settings,
+power state and velocity are saved with the plugin state and the DAW session.
+This includes Strum Timing, Division, Fallback BPM and Strum Pattern. Reopening
 the session restores every custom key assignment and interaction setting.
+
+Standalone MIDI routing preferences (selected input identifiers, output endpoint
+and Preserve/1–16 channel) are stored in the standalone application settings, not
+in `.wickychord` presets or DAW sessions.
 
 Click top-bar **SAVE** to write a named `.wickychord` preset. Presets in the default
 user preset directory appear in the selector the next time the editor opens.
@@ -223,9 +265,32 @@ include both mapping layers. DAW session recall also restores the selected scale
 - Stop the transport and start it again, or send All Notes Off from your DAW.
 - Toggle **POWER** off and on, or toggle host **Bypass**, to force a release of generated notes.
 
+**The Strum knob is disabled**
+- **Strum Timing** is set to **Sync**. The **Division** sets the full step in that
+  mode. Switch Strum Timing to **Free** to use the knob.
+
+**The Up/Down selector is disabled**
+- A non-legacy **Strum Pattern** supplies the order. Choose **Legacy Direction**
+  to use Up/Down.
+
+**Sync strum is faster or slower than expected**
+- Check the Global Settings status line. `STRUM: HOST … BPM` means the plugin is
+  following a host tempo. `STRUM: FALLBACK … BPM (NO HOST TEMPO)` means the host
+  supplied no tempo, so the **Fallback** value is in use. In the standalone there
+  is no DAW transport, so set Fallback to the tempo you want.
+
 **Standalone MIDI routing**
-- Use the standalone's Options / Audio Settings to select MIDI inputs and an
-  existing MIDI output device or port. This is JUCE's standard settings UI.
+- Use the window's **MIDI** button to enable/disable input devices, choose an
+  existing output endpoint, and select **Preserve** or a fixed output channel
+  (`1–16`). **Refresh** re-scans the available endpoints.
+- A selected endpoint that disappears is shown as disconnected. The plugin never
+  substitutes another endpoint automatically; choose a new one or reconnect it.
+- **Send Note Offs** releases held chord notes and panics the selected output.
+- Switching the output endpoint flushes the old endpoint before opening the new
+  one. Notes already sent to the old endpoint are released there; chord tones
+  the scheduler has not emitted yet are generated on the new endpoint.
+- **Audio Settings** in the Options menu keeps JUCE's audio device settings;
+  audio input remains muted.
 - This build does not create its own system-wide virtual MIDI output port.
   Routing to an existing virtual port depends on the OS/backend and your setup;
   creating a port and connecting to an existing port are separate capabilities.
@@ -234,15 +299,15 @@ include both mapping layers. DAW session recall also restores the selected scale
 
 These parts of the larger design are not in this build yet:
 
-- Tempo-synced strum and additional strum patterns beyond Up / Down
-- A custom standalone MIDI input/output settings panel (JUCE's standard panel exists)
 - An app-created system-wide virtual MIDI output port
 - Dedicated Logic MIDI FX placement through a validated bus-free AU MIDI effect
 
 User-preset save/load and basic library browsing, Scale Root/Mode, inversions,
-Smart/Random voicing, timing humanization, and all-octave assignments are already
-implemented. The library currently offers save/load and default-folder discovery;
-it does not provide tagging, search, or rename/delete controls.
+Smart/Random voicing, timing humanization, tempo-synced strum with fallback BPM,
+finite strum patterns (Alternate, Random, Outside-In), custom standalone MIDI
+routing, and all-octave assignments are already implemented. The library currently
+offers save/load and default-folder discovery; it does not provide tagging,
+search, or rename/delete controls.
 
 The `BOILERPLATE_IS_MIDI_EFFECT` CMake option is scaffolding, not a completed Logic
 MIDI FX configuration: the processor still declares audio buses. Do not enable it

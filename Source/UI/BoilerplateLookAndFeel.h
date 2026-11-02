@@ -55,6 +55,8 @@ namespace boilerplate::ui
 
         juce::Font getTextButtonFont (juce::TextButton&, int buttonHeight) override;
         juce::Font getLabelFont (juce::Label&) override;
+        juce::Font getComboBoxFont (juce::ComboBox&) override;
+        void positionComboBoxText (juce::ComboBox&, juce::Label&) override;
 
         juce::Typeface::Ptr getTypefaceForFont (const juce::Font&) override;
     };

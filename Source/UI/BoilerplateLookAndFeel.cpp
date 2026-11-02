@@ -275,10 +275,43 @@ namespace boilerplate::ui
             .withExtraKerningFactor (0.04f);
     }
 
-    juce::Font BoilerplateLookAndFeel::getLabelFont (juce::Label&)
+    juce::Font BoilerplateLookAndFeel::getLabelFont (juce::Label& label)
     {
+        if (auto* box = dynamic_cast<juce::ComboBox*> (label.getParentComponent()))
+            if (box->getProperties().contains ("compactSelector"))
+                return getComboBoxFont (*box);
+
         return fonts::oxanium (12.0f, 700.0f)
             .withExtraKerningFactor (0.06f);
+    }
+
+    juce::Font BoilerplateLookAndFeel::getComboBoxFont (juce::ComboBox& box)
+    {
+        if (box.getProperties().contains ("compactSelector"))
+            return fonts::oxanium (juce::jlimit (
+                                       10.0f, 11.5f,
+                                       static_cast<float> (box.getWidth()) * 0.11f),
+                                   700.0f)
+                .withExtraKerningFactor (0.02f);
+
+        return juce::LookAndFeel_V4::getComboBoxFont (box);
+    }
+
+    void BoilerplateLookAndFeel::positionComboBoxText (juce::ComboBox& box,
+                                                       juce::Label& label)
+    {
+        if (box.getProperties().contains ("compactSelector"))
+        {
+            // The stock layout reserves 30 px for the arrow. Compact selectors
+            // need more text room at the minimum editor width.
+            label.setBounds (2, 1, juce::jmax (0, box.getWidth() - 22),
+                             box.getHeight() - 2);
+            label.setMinimumHorizontalScale (0.70f);
+            label.setFont (getComboBoxFont (box));
+            return;
+        }
+
+        juce::LookAndFeel_V4::positionComboBoxText (box, label);
     }
 
     juce::Typeface::Ptr BoilerplateLookAndFeel::getTypefaceForFont (const juce::Font& font)

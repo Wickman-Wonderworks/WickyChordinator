@@ -156,7 +156,19 @@ if("Standalone" IN_LIST BOILERPLATE_PLUGIN_FORMATS)
 
     target_sources(JUCEBoilerplate_Standalone
         PRIVATE
-            Source/Standalone/StandaloneApp.cpp)
+            Source/Standalone/StandaloneApp.cpp
+            Source/Standalone/MidiRouting.cpp
+            Source/Standalone/MidiRouting.h
+            Source/Standalone/MidiRoutingPanel.cpp
+            Source/Standalone/MidiRoutingPanel.h)
+
+    target_include_directories(JUCEBoilerplate_Standalone PRIVATE Source)
+
+    target_link_libraries(JUCEBoilerplate_Standalone
+        PRIVATE
+            juce::juce_audio_devices
+            juce::juce_data_structures
+            juce::juce_gui_basics)
 endif()
 
 target_sources(JUCEBoilerplate
@@ -168,6 +180,8 @@ target_sources(JUCEBoilerplate
         Source/ChordSettingsPanel.h
         Source/DSP/GainProcessor.cpp
         Source/DSP/GainProcessor.h
+        Source/DSP/StrumOrder.h
+        Source/DSP/StrumTiming.h
         Source/State/ParameterIDs.h
         Source/State/ParameterLayout.cpp
         Source/State/ParameterLayout.h
@@ -213,8 +227,17 @@ endif()
 
 if(BOILERPLATE_BUILD_TESTS)
     enable_testing()
-    add_executable(BoilerplateTests Tests/BoilerplateTests.cpp)
-    target_link_libraries(BoilerplateTests PRIVATE JUCEBoilerplate WickyChordinatorAssets)
+    add_executable(BoilerplateTests
+        Tests/BoilerplateTests.cpp
+        Source/Standalone/MidiRouting.cpp
+        Source/Standalone/MidiRoutingPanel.cpp)
+    target_link_libraries(BoilerplateTests
+        PRIVATE
+            JUCEBoilerplate
+            WickyChordinatorAssets
+            juce::juce_audio_devices
+            juce::juce_data_structures
+            juce::juce_gui_basics)
     # Reuse the shared code's module settings/headers without compiling JUCE again.
     target_include_directories(BoilerplateTests PRIVATE
         $<TARGET_PROPERTY:JUCEBoilerplate,INCLUDE_DIRECTORIES>)

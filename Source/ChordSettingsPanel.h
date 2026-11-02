@@ -12,6 +12,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "PluginProcessor.h"
+#include "DSP/StrumOrder.h"
 #include "State/ParameterIDs.h"
 #include "UI/OxaniumFonts.h"
 
@@ -1044,13 +1045,22 @@ namespace wicky::ui
     {
     public:
         explicit GlobalSettingsPanel (PluginProcessor& processorToUse)
-            : state (processorToUse.getValueTreeState()),
+            : processor (processorToUse),
+              state (processorToUse.getValueTreeState()),
               spreadAttachment (state, boilerplate::parameters::spread, spreadSlider),
               humanizeAttachment (state, boilerplate::parameters::humanize, humanizeSlider),
               strumAttachment (state, boilerplate::parameters::strum, strumSlider),
+              fallbackBpmAttachment (state, boilerplate::parameters::strumFallbackBpm,
+                                     fallbackBpmSlider),
               spreadModeAttachment (state, boilerplate::parameters::spreadMode, spreadModeSelector),
               noteOffAttachment (state, boilerplate::parameters::noteOffMode, noteOffSelector),
               strumModeAttachment (state, boilerplate::parameters::strumMode, strumModeSelector),
+              strumTimingAttachment (state, boilerplate::parameters::strumTimingMode,
+                                     strumTimingSelector),
+              strumDivisionAttachment (state, boilerplate::parameters::strumDivision,
+                                       strumDivisionSelector),
+              strumPatternAttachment (state, boilerplate::parameters::strumPattern,
+                                      strumPatternSelector),
               voicingStyleAttachment (state, boilerplate::parameters::voicingStyle, voicingStyleSelector),
               scaleRootAttachment (state, boilerplate::parameters::scaleRoot, scaleRootSelector),
               scaleModeAttachment (state, boilerplate::parameters::scaleMode, scaleModeSelector),
@@ -1060,14 +1070,20 @@ namespace wicky::ui
             humanizeTimingButton.setTooltip ("Include up to 10 ms of random note-on delay");
             addAndMakeVisible (humanizeTimingButton);
             setName ("Global Settings");
-            setDescription ("Spread, humanize, strum and their mode selectors");
+            setDescription ("Spread, humanize, strum timing and their mode selectors");
 
             configureRotary (spreadSlider, spreadLabel, "Spread",
                              "Opens the chord voicing across the keyboard");
             configureRotary (humanizeSlider, humanizeLabel, "Humanize",
                              "Randomizes velocity and, when Timing is enabled, note-on timing");
             configureRotary (strumSlider, strumLabel, "Strum",
-                             "Delays successive chord tones for a strummed feel");
+                             "Free mode: delays successive chord tones for a strummed feel");
+            configureRotary (fallbackBpmSlider, fallbackBpmLabel, "Fallback",
+                             "Tempo used when the host supplies no valid tempo");
+            fallbackBpmSlider.setName ("Fallback BPM");
+            fallbackBpmSlider.setDoubleClickReturnValue (
+                true, static_cast<double> (boilerplate::parameters::strumFallbackBpmDefault));
+            fallbackBpmSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 18);
 
             configureSelector (spreadModeSelector, spreadModeLabel,
                                boilerplate::parameters::spreadMode, "Spread Mode");
@@ -1075,12 +1091,98 @@ namespace wicky::ui
                                boilerplate::parameters::noteOffMode, "Note Off");
             configureSelector (strumModeSelector, strumModeLabel,
                                boilerplate::parameters::strumMode, "Strum Mode");
+            configureSelector (strumTimingSelector, strumTimingLabel,
+                               boilerplate::parameters::strumTimingMode, "Strum Timing");
+            configureSelector (strumDivisionSelector, strumDivisionLabel,
+                               boilerplate::parameters::strumDivision, "Division");
+            configureSelector (strumPatternSelector, strumPatternLabel,
+                               boilerplate::parameters::strumPattern, "Strum Pattern");
             configureSelector (voicingStyleSelector, voicingStyleLabel,
                                boilerplate::parameters::voicingStyle, "Voicing");
             configureSelector (scaleRootSelector, scaleRootLabel,
                                boilerplate::parameters::scaleRoot, "Scale Root");
             configureSelector (scaleModeSelector, scaleModeLabel,
                                boilerplate::parameters::scaleMode, "Scale Mode");
+
+            timingStatusLabel.setName ("Timing Status");
+            timingStatusLabel.setFont (boilerplate::ui::fonts::oxanium (9.5f, 700.0f)
+                                           .withExtraKerningFactor (0.08f));
+            timingStatusLabel.setJustificationType (juce::Justification::centred);
+            timingStatusLabel.setInterceptsMouseClicks (false, false);
+            addAndMakeVisible (timingStatusLabel);
+
+            strumTimingRaw = state.getRawParameterValue (
+                boilerplate::parameters::strumTimingMode);
+            strumFallbackRaw = state.getRawParameterValue (
+                boilerplate::parameters::strumFallbackBpm);
+            strumPatternRaw = state.getRawParameterValue (
+                boilerplate::parameters::strumPattern);
+            jassert (strumTimingRaw != nullptr && strumFallbackRaw != nullptr
+                     && strumPatternRaw != nullptr);
+
+            refreshTimingControls();
+        }
+
+        /**
+            Refreshes the mode-dependent state and the host/fallback readout.
+
+            PluginEditor's timer calls this on the message thread. It is also
+            public so editor tests can exercise the same path without a running
+            timer.
+        */
+        void refreshTimingControls()
+        {
+            const auto sync = strumTimingRaw != nullptr
+                && juce::roundToInt (strumTimingRaw->load (std::memory_order_relaxed)) == 1;
+
+            strumSlider.setEnabled (! sync);
+            strumLabel.setEnabled (! sync);
+
+            const auto* tooltip = sync
+                ? "Sync mode: the division sets the full step. Switch Strum Timing to Free to use this knob."
+                : "Free mode: delays successive chord tones for a strummed feel.";
+
+            if (strumSlider.getTooltip() != tooltip)
+                strumSlider.setTooltip (tooltip);
+
+            const auto fallbackBpm = strumFallbackRaw != nullptr
+                ? juce::roundToInt (strumFallbackRaw->load (std::memory_order_relaxed))
+                : boilerplate::parameters::strumFallbackBpmDefault;
+
+            const auto patternIndex = strumPatternRaw != nullptr
+                ? juce::roundToInt (strumPatternRaw->load (std::memory_order_relaxed))
+                : boilerplate::dsp::strum::defaultPatternIndex;
+            const auto legacyDirection = patternIndex
+                == boilerplate::dsp::strum::legacyDirectionPattern;
+
+            strumModeSelector.setEnabled (legacyDirection);
+            strumModeLabel.setEnabled (legacyDirection);
+
+            const auto* modeTooltip = legacyDirection
+                ? "Choose whether chord tones play low-to-high or high-to-low."
+                : "Ignored while Strum Pattern supplies its own ordering. Choose Legacy Direction to use Up/Down.";
+
+            if (strumModeSelector.getTooltip() != modeTooltip)
+                strumModeSelector.setTooltip (modeTooltip);
+
+            if (! sync)
+            {
+                setTimingStatus ("STRUM: FREE", miami::textMuted);
+            }
+            else if (processor.isUsingHostTempo())
+            {
+                setTimingStatus ("STRUM: HOST "
+                                     + juce::String (processor.getEffectiveStrumTempo(), 1)
+                                     + " BPM",
+                                 miami::brightMint);
+            }
+            else
+            {
+                setTimingStatus ("STRUM: FALLBACK "
+                                     + juce::String (fallbackBpm)
+                                     + " BPM (NO HOST TEMPO)",
+                                 miami::highlighterYellow);
+            }
         }
 
         void paint (juce::Graphics& g) override
@@ -1129,38 +1231,74 @@ namespace wicky::ui
             auto knobBlock = area.removeFromTop (juce::jlimit (66, 105, area.getHeight() / 3));
             area.removeFromTop (8);
 
-            const auto knobWidth = knobBlock.getWidth() / 3;
+            const auto knobWidth = knobBlock.getWidth() / 4;
 
             auto spreadCell = knobBlock.removeFromLeft (knobWidth);
             auto humanizeCell = knobBlock.removeFromLeft (knobWidth);
-            auto strumCell = knobBlock;
+            auto strumCell = knobBlock.removeFromLeft (knobWidth);
+            auto fallbackCell = knobBlock;
 
             spreadLabel.setBounds (spreadCell.removeFromTop (18));
             humanizeLabel.setBounds (humanizeCell.removeFromTop (18));
             strumLabel.setBounds (strumCell.removeFromTop (18));
+            fallbackBpmLabel.setBounds (fallbackCell.removeFromTop (18));
 
             spreadSlider.setBounds (spreadCell);
             humanizeTimingButton.setBounds (getWidth() - 95, 4, 90, 22);
             humanizeSlider.setBounds (humanizeCell);
             strumSlider.setBounds (strumCell);
+            fallbackBpmSlider.setBounds (fallbackCell);
 
-            const auto selectorHeight = juce::jmax (18, area.getHeight() / 6);
-            auto placeSelector = [&] (juce::Label& label, juce::ComboBox& box)
+            timingStatusLabel.setBounds (area.removeFromBottom (16));
+            area.removeFromBottom (2);
+
+            constexpr int rowCount = 3;
+            constexpr int columnCount = 3;
+            constexpr int columnGap = 6;
+            const auto rowHeight = juce::jlimit (20, 40, area.getHeight() / rowCount);
+            const auto gridHeight = rowHeight * rowCount;
+
+            if (area.getHeight() > gridHeight)
+                area.removeFromTop ((area.getHeight() - gridHeight) / 2);
+
+            const auto columnWidth = (area.getWidth() - columnGap * (columnCount - 1))
+                                   / columnCount;
+
+            auto columnOne = area.removeFromLeft (columnWidth);
+            area.removeFromLeft (columnGap);
+            auto columnTwo = area.removeFromLeft (columnWidth);
+            area.removeFromLeft (columnGap);
+            auto columnThree = area;
+
+            auto placeSelector = [&] (juce::Rectangle<int>& column,
+                                      juce::Label& label, juce::ComboBox& box)
             {
-                auto row = area.removeFromTop (selectorHeight);
-                label.setBounds (row.removeFromLeft (juce::jmin (110, row.getWidth() / 2)));
-                box.setBounds (row.reduced (2, 3));
+                auto cell = column.removeFromTop (rowHeight);
+                label.setBounds (cell.removeFromTop (12));
+                box.setBounds (cell.reduced (2, 0));
             };
 
-            placeSelector (spreadModeLabel, spreadModeSelector);
-            placeSelector (noteOffLabel, noteOffSelector);
-            placeSelector (strumModeLabel, strumModeSelector);
-            placeSelector (voicingStyleLabel, voicingStyleSelector);
-            placeSelector (scaleRootLabel, scaleRootSelector);
-            placeSelector (scaleModeLabel, scaleModeSelector);
+            placeSelector (columnOne, spreadModeLabel, spreadModeSelector);
+            placeSelector (columnOne, strumTimingLabel, strumTimingSelector);
+            placeSelector (columnOne, voicingStyleLabel, voicingStyleSelector);
+            placeSelector (columnTwo, noteOffLabel, noteOffSelector);
+            placeSelector (columnTwo, strumDivisionLabel, strumDivisionSelector);
+            placeSelector (columnTwo, scaleRootLabel, scaleRootSelector);
+            placeSelector (columnThree, strumModeLabel, strumModeSelector);
+            placeSelector (columnThree, strumPatternLabel, strumPatternSelector);
+            placeSelector (columnThree, scaleModeLabel, scaleModeSelector);
         }
 
     private:
+        void setTimingStatus (const juce::String& text, juce::Colour colour)
+        {
+            if (timingStatusLabel.getText() != text)
+                timingStatusLabel.setText (text, juce::dontSendNotification);
+
+            if (timingStatusLabel.findColour (juce::Label::textColourId) != colour)
+                timingStatusLabel.setColour (juce::Label::textColourId, colour);
+        }
+
         void configureRotary (juce::Slider& slider, juce::Label& label,
                               const juce::String& text,
                               const juce::String& description)
@@ -1214,6 +1352,7 @@ namespace wicky::ui
             box.setColour (juce::ComboBox::arrowColourId, miami::highlighterYellow);
             box.setColour (juce::ComboBox::focusedOutlineColourId, miami::brightMint);
             box.setName (labelText);
+            box.getProperties().set ("compactSelector", true);
             addAndMakeVisible (box);
 
             label.setText (labelText.toUpperCase(), juce::dontSendNotification);
@@ -1225,15 +1364,20 @@ namespace wicky::ui
             addAndMakeVisible (label);
         }
 
+        PluginProcessor& processor;
         juce::AudioProcessorValueTreeState& state;
 
         juce::Slider spreadSlider;
         juce::Slider humanizeSlider;
         juce::Slider strumSlider;
+        juce::Slider fallbackBpmSlider;
 
         juce::ComboBox spreadModeSelector;
         juce::ComboBox noteOffSelector;
         juce::ComboBox strumModeSelector;
+        juce::ComboBox strumTimingSelector;
+        juce::ComboBox strumDivisionSelector;
+        juce::ComboBox strumPatternSelector;
         juce::ComboBox voicingStyleSelector, scaleRootSelector, scaleModeSelector;
         juce::Label voicingStyleLabel, scaleRootLabel, scaleModeLabel;
         juce::ToggleButton humanizeTimingButton;
@@ -1241,21 +1385,35 @@ namespace wicky::ui
         juce::Label spreadLabel;
         juce::Label humanizeLabel;
         juce::Label strumLabel;
+        juce::Label fallbackBpmLabel;
         juce::Label spreadModeLabel;
         juce::Label noteOffLabel;
         juce::Label strumModeLabel;
+        juce::Label strumTimingLabel;
+        juce::Label strumDivisionLabel;
+        juce::Label strumPatternLabel;
+        juce::Label timingStatusLabel;
 
         // Declared after the controls so the attachments are destroyed first.
         juce::AudioProcessorValueTreeState::SliderAttachment spreadAttachment;
         juce::AudioProcessorValueTreeState::SliderAttachment humanizeAttachment;
         juce::AudioProcessorValueTreeState::SliderAttachment strumAttachment;
+        juce::AudioProcessorValueTreeState::SliderAttachment fallbackBpmAttachment;
         juce::AudioProcessorValueTreeState::ComboBoxAttachment spreadModeAttachment;
         juce::AudioProcessorValueTreeState::ComboBoxAttachment noteOffAttachment;
         juce::AudioProcessorValueTreeState::ComboBoxAttachment strumModeAttachment;
+        juce::AudioProcessorValueTreeState::ComboBoxAttachment strumTimingAttachment;
+        juce::AudioProcessorValueTreeState::ComboBoxAttachment strumDivisionAttachment;
+        juce::AudioProcessorValueTreeState::ComboBoxAttachment strumPatternAttachment;
         juce::AudioProcessorValueTreeState::ComboBoxAttachment voicingStyleAttachment;
         juce::AudioProcessorValueTreeState::ComboBoxAttachment scaleRootAttachment;
         juce::AudioProcessorValueTreeState::ComboBoxAttachment scaleModeAttachment;
         juce::AudioProcessorValueTreeState::ButtonAttachment humanizeTimingAttachment;
+
+        // Cached for the 24 Hz timing-status refresh.
+        std::atomic<float>* strumTimingRaw = nullptr;
+        std::atomic<float>* strumFallbackRaw = nullptr;
+        std::atomic<float>* strumPatternRaw = nullptr;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GlobalSettingsPanel)
     };

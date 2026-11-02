@@ -2,7 +2,8 @@
 
 A JUCE 9 MIDI chord generator for macOS, Windows and Linux. Incoming notes become
 chords, with per-note or all-octave assignments, inversions, voice leading,
-spread, velocity/timing humanization, strumming and staggered releases.
+spread, velocity/timing humanization, free or tempo-synced strumming and
+staggered releases.
 Audio passes through unchanged in the default configuration; the Velocity knob
 scales generated MIDI velocities. Route MIDI output to an instrument to hear it.
 The standalone does not contain a synthesizer.
@@ -65,9 +66,14 @@ Artifacts are under `build/release/JUCEBoilerplate_artefacts/Release/`:
 
 `-DBOILERPLATE_COPY_PLUGIN_AFTER_BUILD=ON` installs plugins in JUCE's default
 locations. Windows' system VST3 directory may require administrator privileges.
-For standalone, open the audio/MIDI settings and select MIDI inputs and an output;
-audio input remains muted. macOS AU is a music effect, not a bus-free MIDI FX
-(`aumi`) plugin; hosts differ in how they expose and route its MIDI output.
+In standalone, use the window's **MIDI** button for input toggles, the output
+endpoint, Preserve/1–16 channel routing, connection status and Send Note Offs.
+The **Options** menu keeps the JUCE audio settings (audio input remains muted) and
+state save/load. Standalone MIDI routing preferences are stored in the application
+settings, not in plugin presets or DAW sessions. The standalone has no DAW
+transport, so Sync strum timing uses the Fallback BPM control. macOS AU is a music
+effect, not a bus-free MIDI FX (`aumi`) plugin; hosts differ in how they expose and
+route its MIDI output.
 
 ## Playing and mapping
 
@@ -99,7 +105,16 @@ factory or user presets.
 Spread opens the upper voices by up to two octaves. Humanize varies velocity by
 up to 15 MIDI steps; **Timing** additionally delays individual note-ons by up to
 10 ms, scaled by the Humanize amount. This optional delay is an expressive effect,
-not compensated audio latency. Strum spaces notes by up to 60 ms each. Simultaneous
+not compensated audio latency. Strum has two timing modes: **Free** spaces notes
+by up to 60 ms each with the Strum knob, while **Sync** uses the selected musical
+division of the host tempo. If the host supplies no valid tempo (including the
+standalone), the Fallback BPM value is used; the Global Settings status line says
+whether the host tempo or fallback is active. **Strum Pattern** selects the finite
+order of one chord: **Legacy Direction** follows Up/Down, **Alternate** alternates
+Up and Down on successive triggers per MIDI channel, **Random** shuffles the chord
+tones, and **Outside-In** plays lowest, highest, second-lowest, second-highest,
+and so on. Non-legacy patterns override Up/Down. Tempo or pattern changes affect
+future chords; tones already scheduled keep their absolute timing. Simultaneous
 release cancels future tones; staggered release delays the releases of tones that
 have sounded. Power OFF and host bypass flush generated notes immediately, then
 pass raw MIDI through. CC120/123 flush the addressed channel only.
@@ -126,16 +141,21 @@ DAW session state always includes the complete configuration.
 | `spread_mode` | Dense, Sparse | Dense |
 | `note_off_mode` | Simultaneous, Staggered | Simultaneous |
 | `strum_mode` | Up, Down | Up |
+| `strum_timing_mode` | Free, Sync | Free |
+| `strum_division` | 1/8, 1/16, 1/32 plus dotted and triplet forms (9 choices) | 1/16 |
+| `strum_fallback_bpm` | 20–300 BPM | 120 BPM |
+| `strum_pattern` | Legacy Direction, Alternate, Random, Outside-In | Legacy Direction |
 | `voicing_style` | Register, Inversions, Random, Smart | Inversions |
 | `humanize_timing` | Boolean | on |
 | `scale_root` | C through B | C |
 | `scale_mode` | Chromatic, Major, Natural Minor | Chromatic |
 
-Existing IDs, ranges, choice orders, AU version hints 1–12, and plugin codes are
-preserved. New parameters use hints 13–16. States lacking the new parameters
-explicitly restore legacy register voicing, velocity-only humanization and C
-chromatic scale, preserving their prior sound. Old exact-note mappings remain
-exact-note mappings. New state uses schema version 2.
+Existing IDs, ranges, choice orders, AU version hints 1–16, and plugin codes are
+preserved. New parameters use hints 17–20. States lacking the new parameters
+explicitly restore legacy register voicing, velocity-only humanization, C
+chromatic scale, Free / 1/16 / 120 BPM strum timing and Legacy Direction
+ordering, preserving their prior sound. Old exact-note mappings remain exact-note
+mappings. New state uses schema version 2.
 
 ## Architecture and realtime limits
 
@@ -163,7 +183,9 @@ arbitrary supplied MidiBuffer. Ordinary MIDI and SysEx share the output byte lim
 Tests cover state migration/recall, legacy gain utility behavior, chord balance,
 layouts, editor lifecycle, sample offsets, short/cross-block strums, bypass with
 pending releases, multi-channel display, bounded output, inversions, scale,
-humanize timing and user presets. They do not open an audio device.
+humanize timing, user presets, tempo-synced timelines, host tempo/fallback
+behavior, the timing controls, all finite strum patterns, standalone routing
+settings/remapping and safe route switching. They do not open an audio device.
 
 After installing the default AU, validate using:
 
