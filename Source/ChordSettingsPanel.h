@@ -4,6 +4,8 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_utils/juce_audio_utils.h>
@@ -317,716 +319,1019 @@ namespace wicky::ui
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ButtonGroupAttachment)
     };
-}
-
-//==============================================================================
-/**
-    The chord-specific control surface: Type, Complexity, Voicing, the per-key
-    Pitch Offset, the key-map controls, and the virtual MIDI keyboard.
-
-    The panel owns no DSP; it only writes APVTS parameters through the
-    attachments. Keyboard notes cross to the audio thread through the
-    processor's lock-free FIFO.
-*/
-class ChordSettingsPanel final : public juce::Component,
-                                 private juce::Timer,
-                                 private juce::MidiKeyboardState::Listener
-{
-public:
-    explicit ChordSettingsPanel (PluginProcessor& processorToUse)
-        : processor (processorToUse),
-          state (processorToUse.getValueTreeState()),
-          chordKeyboard (processorToUse.getKeyboardState()),
-          pitchParameter (state.getParameter (boilerplate::parameters::pitchOffset)),
-          pitchRawParameter (state.getRawParameterValue (boilerplate::parameters::pitchOffset))
-    {
-        setName ("Chord Settings");
-        setDescription ("Chord type, complexity, voicing, per-key mapping and pitch offset");
-
-        jassert (pitchParameter != nullptr);
-        jassert (pitchRawParameter != nullptr);
-
-        createButtonGroup (typeButtons, boilerplate::parameters::chordType, 1001);
-        createButtonGroup (complexityButtons, boilerplate::parameters::complexity, 1002);
-        createButtonGroup (voicingButtons, boilerplate::parameters::voicing, 1003);
-
-        // Declared after the button arrays, so the attachments are destroyed
-        // before the buttons they point at.
-        typeAttachment = std::make_unique<wicky::ui::ButtonGroupAttachment> (
-            state, boilerplate::parameters::chordType, typeButtons);
-        complexityAttachment = std::make_unique<wicky::ui::ButtonGroupAttachment> (
-            state, boilerplate::parameters::complexity, complexityButtons);
-        voicingAttachment = std::make_unique<wicky::ui::ButtonGroupAttachment> (
-            state, boilerplate::parameters::voicing, voicingButtons);
-
-        configurePitchControls();
-        configureKeyMap();
-        configureKeyboard();
-
-        processor.getKeyboardState().addListener (this);
-
-        updatePitchLabel();
-        updateKeyMapStatus();
-        updateActiveNotes();
-        startTimerHz (24);
-    }
-
-    ~ChordSettingsPanel() override
-    {
-        stopTimer();
-
-        // Send note-offs for anything still held when the editor closes so the
-        // processor cannot be left with an orphaned chord.
-        processor.getKeyboardState().allNotesOff (1);
-        processor.getKeyboardState().removeListener (this);
-    }
 
     //==========================================================================
-    void paint (juce::Graphics& g) override
+    /**
+        Factory/built-in preset store, backed by the APVTS ValueTree itself.
+
+        Presets are complete parameter ValueTrees, not ad-hoc structs, so a
+        preset captures exactly what the plugin's native state serialization
+        captures. The per-key recipe map lives in the processor and is therefore
+        never destroyed by loading a global preset.
+    */
+    class PresetManager final
     {
-        auto bounds = getLocalBounds().toFloat().reduced (0.5f);
-
-        if (bounds.getWidth() <= 0.0f || bounds.getHeight() <= 0.0f)
-            return;
-
-        g.setColour (wicky::ui::miami::midnightArcade);
-        g.fillRoundedRectangle (bounds, 8.0f);
-
-        g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.90f));
-        g.drawRoundedRectangle (bounds, 8.0f, 1.5f);
-
-        auto header = bounds.removeFromTop (static_cast<float> (headerHeight));
-
-        juce::Path headerShape;
-        headerShape.addRoundedRectangle (header.getX(), header.getY(),
-                                         header.getWidth(), header.getHeight(),
-                                         8.0f, 8.0f, true, true, false, false);
-
-        g.setGradientFill (juce::ColourGradient (
-            wicky::ui::miami::radicalBlue, header.getX(), header.getY(),
-            wicky::ui::miami::fluorescentPink, header.getRight(), header.getY(),
-            false));
-        g.fillPath (headerShape);
-
-        // Cyberpunk yellow rule under the header, then a toxic-green cap on
-        // the right for the "live" state.
-        g.setColour (wicky::ui::miami::highlighterYellow);
-        g.fillRect (header.getX() + 14.0f, header.getBottom() - 2.0f,
-                    juce::jmin (150.0f, header.getWidth() - 28.0f), 2.0f);
-
-        g.setColour (juce::Colours::white);
-        const auto titleSize = juce::jlimit (13.0f, 18.0f,
-                                             static_cast<float> (headerHeight) * 0.46f);
-        g.setFont (boilerplate::ui::fonts::oxanium (titleSize, 700.0f)
-                       .withExtraKerningFactor (0.12f));
-        g.drawText ("CHORD MATRIX", header.reduced (14.0f, 0.0f),
-                    juce::Justification::centredLeft, false);
-
-        g.setColour (anyInputActive
-                         ? wicky::ui::miami::brightMint
-                         : juce::Colours::white.withAlpha (0.62f));
-        g.setFont (boilerplate::ui::fonts::oxanium (10.0f, 700.0f)
-                       .withExtraKerningFactor (0.16f));
-        g.drawText (anyInputActive ? "LIVE" : "IDLE", header.reduced (14.0f, 0.0f),
-                    juce::Justification::centredRight, false);
-
-        if (gridArea.isEmpty())
-            return;
-
-        const auto top = gridArea.getY();
-        const auto height = gridArea.getHeight();
-
-        g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.32f));
-        g.fillRect (typeColumn.getRight() + columnGap / 2, top, 1, height);
-        g.fillRect (complexityColumn.getRight() + columnGap / 2, top, 1, height);
-
-        drawGroupTitle (g, "TYPE", typeTitle);
-        drawGroupTitle (g, "COMPLEXITY", complexityTitle);
-        drawGroupTitle (g, "VOICING", voicingTitle);
-        drawGroupTitle (g, "PITCH OFFSET", pitchTitle);
-
-        g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.60f));
-        g.drawRoundedRectangle (voicingBox.toFloat(), 6.0f, 1.0f);
-
-        if (! keyMapArea.isEmpty())
+    public:
+        explicit PresetManager (juce::AudioProcessorValueTreeState& stateToUse)
+            : state (stateToUse)
         {
-            g.setColour (wicky::ui::miami::fluorescentPink.withAlpha (0.35f));
-            g.fillRect (keyMapArea.getX(), keyMapArea.getY() - 4,
-                        keyMapArea.getWidth(), 1);
-        }
-    }
+            using namespace boilerplate::parameters;
 
-    void paintOverChildren (juce::Graphics& g) override
-    {
-        if (keyboardArea.isEmpty())
-            return;
+            // Build the factory baseline from each parameter's real default,
+            // not from the live session. The editor can be created after a DAW
+            // has restored a session, and preset names must stay deterministic.
+            defaultState = state.copyState();
+            defaultState.removeAllChildren (nullptr);
 
-        g.setColour (wicky::ui::miami::fluorescentPink.withAlpha (0.90f));
-        g.drawRoundedRectangle (keyboardArea.toFloat().expanded (1.0f), 4.0f, 1.5f);
-
-        g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.45f));
-        g.fillRect (keyboardArea.getX(), keyboardArea.getY() - 4,
-                    keyboardArea.getWidth(), 1);
-    }
-
-    void resized() override
-    {
-        headerHeight = juce::jlimit (28, 38, getHeight() / 10);
-
-        auto area = getLocalBounds();
-
-        area.removeFromTop (headerHeight);
-        area.reduce (10, 8);
-
-        if (area.getWidth() <= 0 || area.getHeight() <= 0)
-            return;
-
-        // Keyboard first, then the key-map toolbar, then the control grid.
-        const auto keyboardHeight = juce::jlimit (54, 76, area.getHeight() / 5);
-        keyboardArea = area.removeFromBottom (keyboardHeight);
-        area.removeFromBottom (6);
-
-        const auto keyMapHeight = juce::jlimit (24, 30, area.getHeight() / 12);
-        keyMapArea = area.removeFromBottom (keyMapHeight);
-        area.removeFromBottom (8);
-
-        gridArea = area;
-
-        columnGap = juce::jmax (8, area.getWidth() / 56);
-
-        const auto contentWidth = juce::jmax (0, area.getWidth() - columnGap * 2);
-        const auto typeWidth = juce::roundToInt (static_cast<float> (contentWidth) * 0.235f);
-        const auto complexityWidth = juce::roundToInt (static_cast<float> (contentWidth) * 0.455f);
-
-        typeColumn = area.removeFromLeft (typeWidth);
-        area.removeFromLeft (columnGap);
-        complexityColumn = area.removeFromLeft (complexityWidth);
-        area.removeFromLeft (columnGap);
-        voicingColumn = area;
-
-        const auto titleHeight = juce::jlimit (16, 22, gridArea.getHeight() / 12);
-
-        // ---------------------------------------------------------------------
-        // Type column: four strictly exclusive radio buttons.
-        // ---------------------------------------------------------------------
-        auto typeContent = typeColumn;
-        typeTitle = typeContent.removeFromTop (titleHeight);
-        typeContent.reduce (6, 4);
-
-        if (! typeContent.isEmpty())
-        {
-            juce::FlexBox typeFlex;
-            typeFlex.flexDirection = juce::FlexBox::Direction::column;
-            typeFlex.justifyContent = juce::FlexBox::JustifyContent::spaceAround;
-
-            for (auto* button : typeButtons)
-                typeFlex.items.add (juce::FlexItem (*button)
-                                        .withFlex (1.0f)
-                                        .withMargin (juce::FlexItem::Margin (3, 0, 3, 0)));
-
-            typeFlex.performLayout (typeContent);
-        }
-
-        // ---------------------------------------------------------------------
-        // Complexity: 2 columns x 6 rows. The eleventh choice spans the whole
-        // final row, which uses the otherwise-empty twelfth cell and keeps the
-        // block symmetrical.
-        // ---------------------------------------------------------------------
-        auto complexityContent = complexityColumn;
-        complexityTitle = complexityContent.removeFromTop (titleHeight);
-        complexityContent.reduce (3, 4);
-
-        if (! complexityContent.isEmpty() && complexityButtons.size() > 0)
-        {
-            juce::Grid complexityGrid;
-            complexityGrid.justifyContent = juce::Grid::JustifyContent::stretch;
-            complexityGrid.alignItems = juce::Grid::AlignItems::stretch;
-
-            using Track = juce::Grid::TrackInfo;
-            complexityGrid.templateColumns = { Track (juce::Grid::Fr (1)),
-                                               Track (juce::Grid::Fr (1)) };
-            complexityGrid.templateRows = { Track (juce::Grid::Fr (1)),
-                                            Track (juce::Grid::Fr (1)),
-                                            Track (juce::Grid::Fr (1)),
-                                            Track (juce::Grid::Fr (1)),
-                                            Track (juce::Grid::Fr (1)),
-                                            Track (juce::Grid::Fr (1)) };
-            complexityGrid.setGap (juce::Grid::Px (5));
-
-            const auto count = complexityButtons.size();
-
-            for (int i = 0; i < count; ++i)
+            for (int i = 0; i < defaultState.getNumProperties(); ++i)
             {
-                auto item = juce::GridItem (*complexityButtons[i]);
+                const auto propertyName = defaultState.getPropertyName (i);
 
-                if (count == 11 && i == 10)
-                    item.withArea (6, 1, 7, 3); // row 6, columns 1-2
-                else
-                    item.withArea (i / 2 + 1, (i % 2) + 1);
-
-                complexityGrid.items.add (item);
+                if (auto* parameter = state.getParameter (propertyName.toString()))
+                    defaultState.setProperty (
+                        propertyName,
+                        static_cast<float> (parameter->convertFrom0to1 (
+                            parameter->getDefaultValue())),
+                        nullptr);
             }
 
-            complexityGrid.performLayout (complexityContent);
+            addPreset ("Init", {});
+
+            addPreset ("Neon Pop",
+                { { chordType, 0.0f }, { complexity, 0.0f }, { voicing, 1.0f },
+                  { pitchOffset, 0.0f }, { spread, 32.0f }, { spreadMode, 0.0f },
+                  { humanize, 18.0f }, { strum, 22.0f }, { strumMode, 0.0f },
+                  { noteOffMode, 0.0f }, { power, 1.0f }, { bypass, 0.0f },
+                  { gain, 0.0f } });
+
+            addPreset ("Jazz 13ths",
+                { { chordType, 2.0f }, { complexity, 7.0f }, { voicing, 1.0f },
+                  { pitchOffset, 0.0f }, { spread, 46.0f }, { spreadMode, 1.0f },
+                  { humanize, 28.0f }, { strum, 8.0f }, { strumMode, 0.0f },
+                  { noteOffMode, 1.0f }, { power, 1.0f }, { bypass, 0.0f },
+                  { gain, -2.0f } });
+
+            addPreset ("Lo-Fi Keys",
+                { { chordType, 1.0f }, { complexity, 2.0f }, { voicing, 2.0f },
+                  { pitchOffset, 0.0f }, { spread, 24.0f }, { spreadMode, 0.0f },
+                  { humanize, 48.0f }, { strum, 30.0f }, { strumMode, 1.0f },
+                  { noteOffMode, 1.0f }, { power, 1.0f }, { bypass, 0.0f },
+                  { gain, -5.0f } });
+
+            addPreset ("Wide Dream",
+                { { chordType, 0.0f }, { complexity, 4.0f }, { voicing, 0.0f },
+                  { pitchOffset, 0.0f }, { spread, 82.0f }, { spreadMode, 1.0f },
+                  { humanize, 22.0f }, { strum, 54.0f }, { strumMode, 1.0f },
+                  { noteOffMode, 0.0f }, { power, 1.0f }, { bypass, 0.0f },
+                  { gain, -3.0f } });
+
+            addPreset ("Stab Matrix",
+                { { chordType, 2.0f }, { complexity, 4.0f }, { voicing, 0.0f },
+                  { pitchOffset, 0.0f }, { spread, 12.0f }, { spreadMode, 0.0f },
+                  { humanize, 8.0f }, { strum, 0.0f }, { strumMode, 0.0f },
+                  { noteOffMode, 0.0f }, { power, 1.0f }, { bypass, 0.0f },
+                  { gain, 2.0f } });
+
+            addPreset ("Dim Tension",
+                { { chordType, 3.0f }, { complexity, 1.0f }, { voicing, 1.0f },
+                  { pitchOffset, 0.0f }, { spread, 58.0f }, { spreadMode, 1.0f },
+                  { humanize, 35.0f }, { strum, 40.0f }, { strumMode, 0.0f },
+                  { noteOffMode, 1.0f }, { power, 1.0f }, { bypass, 0.0f },
+                  { gain, -4.0f } });
         }
 
-        // ---------------------------------------------------------------------
-        // Voicing + Pitch Offset column.
-        // ---------------------------------------------------------------------
-        auto voicingContent = voicingColumn;
-        voicingTitle = voicingContent.removeFromTop (titleHeight);
-        voicingContent.reduce (6, 4);
-
-        const auto pitchHeight = juce::jlimit (44, 62, voicingContent.getHeight() / 4);
-        auto pitchBlock = voicingContent.removeFromBottom (pitchHeight);
-        voicingContent.removeFromBottom (6);
-
-        voicingBox = voicingContent;
-
-        if (! voicingBox.isEmpty())
+        int getNumPresets() const noexcept
         {
-            juce::FlexBox voicingFlex;
-            voicingFlex.flexDirection = juce::FlexBox::Direction::column;
-            voicingFlex.justifyContent = juce::FlexBox::JustifyContent::spaceAround;
-
-            for (auto* button : voicingButtons)
-                voicingFlex.items.add (juce::FlexItem (*button)
-                                           .withFlex (1.0f)
-                                           .withMargin (juce::FlexItem::Margin (3, 0, 3, 0)));
-
-            voicingFlex.performLayout (voicingBox.reduced (8, 6));
+            return static_cast<int> (presets.size());
         }
 
-        pitchTitle = pitchBlock.removeFromTop (juce::jmin (16, pitchBlock.getHeight()));
-
-        auto row = pitchBlock.withSizeKeepingCentre (
-            juce::jmin (pitchBlock.getWidth(), 180),
-            juce::jmin (pitchBlock.getHeight(), 28));
-
-        const auto buttonWidth = juce::jmin (36, juce::jmax (22, row.getWidth() / 4));
-        pitchDecButton.setBounds (row.removeFromLeft (buttonWidth));
-        row.removeFromLeft (6);
-        pitchIncButton.setBounds (row.removeFromRight (buttonWidth));
-        row.removeFromRight (6);
-        pitchValueLabel.setBounds (row);
-
-        // ---------------------------------------------------------------------
-        // Key-map toolbar.
-        // ---------------------------------------------------------------------
-        auto keyRow = keyMapArea.withSizeKeepingCentre (
-            keyMapArea.getWidth(), juce::jmin (24, keyMapArea.getHeight()));
-
-        keyMapTitle.setBounds (keyRow.removeFromLeft (juce::jmin (54, keyRow.getWidth())));
-        keySelector.setBounds (keyRow.removeFromLeft (juce::jmin (128, keyRow.getWidth())));
-
-        clearKeyButton.setBounds (keyRow.removeFromRight (juce::jmin (52, keyRow.getWidth())));
-        keyRow.removeFromRight (6);
-        assignKeyButton.setBounds (keyRow.removeFromRight (juce::jmin (60, keyRow.getWidth())));
-        keyRow.removeFromRight (6);
-        loadKeyButton.setBounds (keyRow.removeFromRight (juce::jmin (46, keyRow.getWidth())));
-        keyRow.removeFromRight (10);
-        keyStatusLabel.setBounds (keyRow);
-
-        // ---------------------------------------------------------------------
-        // Virtual keyboard: exactly 22 white keys (C3..C6) across the width.
-        // ---------------------------------------------------------------------
-        chordKeyboard.setBounds (keyboardArea);
-
-        if (keyboardArea.getWidth() > 0)
-            chordKeyboard.setKeyWidth (juce::jmax (12.0f,
-                static_cast<float> (keyboardArea.getWidth()) / 22.0f));
-    }
-
-private:
-    //==========================================================================
-    void createButtonGroup (juce::OwnedArray<juce::TextButton>& group,
-                            const juce::String& parameterID,
-                            int radioGroupId)
-    {
-        const auto* choice = dynamic_cast<juce::AudioParameterChoice*> (
-            state.getParameter (parameterID));
-
-        jassert (choice != nullptr);
-
-        if (choice == nullptr)
-            return;
-
-        for (const auto& label : choice->choices)
+        juce::String getName (int index) const
         {
-            auto* button = group.add (std::make_unique<juce::TextButton> (label));
+            if (juce::isPositiveAndBelow (index, getNumPresets()))
+                return presets[static_cast<size_t> (index)].name;
 
-            // Radio groups are unique per column: TYPE, COMPLEXITY and VOICING
-            // can never interfere with one another.
-            button->setClickingTogglesState (true);
-            button->setRadioGroupId (radioGroupId, juce::dontSendNotification);
-            button->setColour (juce::TextButton::buttonColourId,
-                               wicky::ui::miami::controlFace);
-            button->setColour (juce::TextButton::buttonOnColourId,
-                               wicky::ui::miami::radicalBlue);
-            button->setColour (juce::TextButton::textColourOffId,
-                               wicky::ui::miami::fluorescentPink);
-            button->setColour (juce::TextButton::textColourOnId,
-                               juce::Colours::white);
-            button->setMouseCursor (juce::MouseCursor::PointingHandCursor);
-            button->setName (label);
-
-            addAndMakeVisible (button);
-        }
-    }
-
-    void configurePitchControls()
-    {
-        for (auto* button : { &pitchDecButton, &pitchIncButton })
-        {
-            button->setColour (juce::TextButton::buttonColourId,
-                               wicky::ui::miami::controlFace);
-            button->setColour (juce::TextButton::textColourOffId,
-                               wicky::ui::miami::fluorescentPink);
-            button->setMouseCursor (juce::MouseCursor::PointingHandCursor);
-            addAndMakeVisible (button);
+            return {};
         }
 
-        pitchDecButton.setButtonText ("-");
-        pitchIncButton.setButtonText ("+");
-        pitchDecButton.setName ("Decrease pitch offset");
-        pitchIncButton.setName ("Increase pitch offset");
+        int getCurrentIndex() const noexcept { return currentIndex; }
 
-        pitchDecButton.onClick = [this] { nudgePitch (-1); };
-        pitchIncButton.onClick = [this] { nudgePitch (1); };
-
-        pitchValueLabel.setJustificationType (juce::Justification::centred);
-        pitchValueLabel.setColour (juce::Label::textColourId, wicky::ui::miami::brightMint);
-        pitchValueLabel.setFont (boilerplate::ui::fonts::oxanium (15.0f, 700.0f));
-        pitchValueLabel.setInterceptsMouseClicks (false, false);
-        pitchValueLabel.setText ("0", juce::dontSendNotification);
-        addAndMakeVisible (pitchValueLabel);
-    }
-
-    void configureKeyMap()
-    {
-        keyMapTitle.setText ("KEY MAP", juce::dontSendNotification);
-        keyMapTitle.setFont (boilerplate::ui::fonts::oxanium (10.0f, 700.0f)
-                                 .withExtraKerningFactor (0.12f));
-        keyMapTitle.setColour (juce::Label::textColourId, wicky::ui::miami::highlighterYellow);
-        keyMapTitle.setColour (juce::Label::backgroundColourId, juce::Colours::transparentBlack);
-        keyMapTitle.setJustificationType (juce::Justification::centredLeft);
-        keyMapTitle.setInterceptsMouseClicks (false, false);
-        addAndMakeVisible (keyMapTitle);
-
-        for (int note = 0; note < 128; ++note)
-            keySelector.addItem (juce::MidiMessage::getMidiNoteName (note, true, true, 4)
-                                     + "  (" + juce::String (note) + ")",
-                                 note + 1);
-
-        keySelector.setSelectedId (61, juce::dontSendNotification); // C4 = note 60
-        keySelector.setColour (juce::ComboBox::backgroundColourId,
-                               wicky::ui::miami::controlFace);
-        keySelector.setColour (juce::ComboBox::textColourId,
-                               wicky::ui::miami::fluorescentPink);
-        keySelector.setColour (juce::ComboBox::outlineColourId,
-                               wicky::ui::miami::radicalBlue.withAlpha (0.65f));
-        keySelector.setColour (juce::ComboBox::arrowColourId,
-                               wicky::ui::miami::highlighterYellow);
-        keySelector.setColour (juce::ComboBox::focusedOutlineColourId,
-                               wicky::ui::miami::brightMint);
-        keySelector.setName ("Key map note");
-        keySelector.setDescription ("Choose the MIDI note whose chord recipe you want to edit");
-        keySelector.onChange = [this]
+        bool loadPreset (int index)
         {
-            selectedKey = juce::jlimit (0, 127, keySelector.getSelectedId() - 1);
-            chordKeyboard.setSelectedNote (selectedKey);
-            updateKeyMapStatus();
+            if (! juce::isPositiveAndBelow (index, getNumPresets()))
+                return false;
+
+            currentIndex = index;
+
+            const auto presetState =
+                presets[static_cast<size_t> (index)].state.createCopy();
+
+            // Keep the native APVTS ValueTree authoritative...
+            state.replaceState (presetState.createCopy());
+
+            // ...and push every stored parameter value through the normal
+            // gesture-safe API. replaceState alone updates the tree, but some
+            // JUCE versions do not copy those values back into the parameters.
+            for (int property = 0; property < presetState.getNumProperties(); ++property)
+            {
+                const auto propertyName = presetState.getPropertyName (property);
+                auto* parameter = state.getParameter (propertyName.toString());
+
+                if (parameter == nullptr)
+                    continue;
+
+                const auto value = static_cast<float> (
+                    static_cast<double> (presetState.getProperty (propertyName)));
+
+                parameter->setValueNotifyingHost (parameter->convertTo0to1 (value));
+            }
+
+            return true;
+        }
+
+        bool loadNext()
+        {
+            if (getNumPresets() == 0)
+                return false;
+
+            return loadPreset ((currentIndex + 1) % getNumPresets());
+        }
+
+        bool loadPrevious()
+        {
+            if (getNumPresets() == 0)
+                return false;
+
+            return loadPreset ((currentIndex + getNumPresets() - 1) % getNumPresets());
+        }
+
+    private:
+        struct Preset
+        {
+            juce::String name;
+            juce::ValueTree state;
         };
-        addAndMakeVisible (keySelector);
 
-        keyStatusLabel.setFont (boilerplate::ui::fonts::oxanium (10.5f, 700.0f));
-        keyStatusLabel.setMinimumHorizontalScale (0.65f);
-        keyStatusLabel.setJustificationType (juce::Justification::centredLeft);
-        keyStatusLabel.setInterceptsMouseClicks (false, false);
-        keyStatusLabel.setColour (juce::Label::backgroundColourId, juce::Colours::transparentBlack);
-        addAndMakeVisible (keyStatusLabel);
-
-        styleSmallButton (loadKeyButton, "LOAD", false);
-        styleSmallButton (assignKeyButton, "ASSIGN", true);
-        styleSmallButton (clearKeyButton, "CLEAR", false);
-
-        loadKeyButton.setName ("Load key recipe into the matrix");
-        assignKeyButton.setName ("Assign the matrix to the selected key");
-        clearKeyButton.setName ("Clear the selected key override");
-
-        loadKeyButton.onClick = [this] { loadSelectedKeyRecipe(); };
-        assignKeyButton.onClick = [this] { assignSelectedKeyRecipe(); };
-        clearKeyButton.onClick = [this] { clearSelectedKeyRecipe(); };
-
-        addAndMakeVisible (loadKeyButton);
-        addAndMakeVisible (assignKeyButton);
-        addAndMakeVisible (clearKeyButton);
-    }
-
-    void configureKeyboard()
-    {
-        chordKeyboard.setName ("Virtual keyboard");
-        chordKeyboard.setDescription (
-            "Play chords and select the key whose custom recipe is being edited");
-
-        chordKeyboard.onNoteSelected = [this] (int note)
+        void addPreset (juce::String name,
+                        std::initializer_list<std::pair<const char*, float>> values)
         {
-            selectedKey = juce::jlimit (0, 127, note);
+            auto tree = defaultState.createCopy();
+
+            for (const auto& value : values)
+                tree.setProperty (juce::Identifier (value.first), value.second, nullptr);
+
+            presets.push_back ({ std::move (name), std::move (tree) });
+        }
+
+        juce::AudioProcessorValueTreeState& state;
+        juce::ValueTree defaultState;
+        std::vector<Preset> presets;
+        int currentIndex = 0;
+
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PresetManager)
+    };
+
+    //==========================================================================
+    /**
+        Left column: the mutually exclusive Type, Complexity and Voicing radio
+        groups plus the per-chord Pitch Offset stepper. No DSP lives here; all
+        writes go through APVTS attachments on the message thread.
+    */
+    class ChordSettingsPanel final : public juce::Component,
+                                     private juce::Timer
+    {
+    public:
+        explicit ChordSettingsPanel (PluginProcessor& processorToUse)
+            : state (processorToUse.getValueTreeState()),
+              pitchParameter (state.getParameter (boilerplate::parameters::pitchOffset)),
+              pitchRawParameter (state.getRawParameterValue (boilerplate::parameters::pitchOffset))
+        {
+            setName ("Chord Settings");
+            setDescription ("Chord type, complexity, voicing and pitch offset");
+
+            jassert (pitchParameter != nullptr);
+            jassert (pitchRawParameter != nullptr);
+
+            createButtonGroup (typeButtons, boilerplate::parameters::chordType, 1001);
+            createButtonGroup (complexityButtons, boilerplate::parameters::complexity, 1002);
+            createButtonGroup (voicingButtons, boilerplate::parameters::voicing, 1003);
+
+            // Declared after the button arrays, so the attachments are destroyed
+            // before the buttons they point at.
+            typeAttachment = std::make_unique<ButtonGroupAttachment> (
+                state, boilerplate::parameters::chordType, typeButtons);
+            complexityAttachment = std::make_unique<ButtonGroupAttachment> (
+                state, boilerplate::parameters::complexity, complexityButtons);
+            voicingAttachment = std::make_unique<ButtonGroupAttachment> (
+                state, boilerplate::parameters::voicing, voicingButtons);
+
+            configurePitchControls();
+
+            updatePitchLabel();
+            startTimerHz (24);
+        }
+
+        ~ChordSettingsPanel() override
+        {
+            stopTimer();
+        }
+
+        //==========================================================================
+        void paint (juce::Graphics& g) override
+        {
+            drawPanelFrame (g, "CHORD SETTINGS");
+
+            if (gridArea.isEmpty())
+                return;
+
+            const auto top = gridArea.getY();
+            const auto height = gridArea.getHeight();
+
+            g.setColour (miami::radicalBlue.withAlpha (0.32f));
+            g.fillRect (typeColumn.getRight() + columnGap / 2, top, 1, height);
+            g.fillRect (complexityColumn.getRight() + columnGap / 2, top, 1, height);
+
+            drawGroupTitle (g, "TYPE", typeTitle);
+            drawGroupTitle (g, "COMPLEXITY", complexityTitle);
+            drawGroupTitle (g, "VOICING", voicingTitle);
+            drawGroupTitle (g, "PITCH OFFSET", pitchTitle);
+
+            g.setColour (miami::radicalBlue.withAlpha (0.60f));
+            g.drawRoundedRectangle (voicingBox.toFloat(), 6.0f, 1.0f);
+        }
+
+        void resized() override
+        {
+            headerHeight = juce::jlimit (28, 36, getHeight() / 10);
+
+            auto area = getLocalBounds();
+            area.removeFromTop (headerHeight);
+            area.reduce (10, 8);
+
+            if (area.getWidth() <= 0 || area.getHeight() <= 0)
+                return;
+
+            gridArea = area;
+            columnGap = juce::jmax (8, area.getWidth() / 56);
+
+            const auto contentWidth = juce::jmax (0, area.getWidth() - columnGap * 2);
+            const auto typeWidth = juce::roundToInt (static_cast<float> (contentWidth) * 0.235f);
+            const auto complexityWidth = juce::roundToInt (static_cast<float> (contentWidth) * 0.455f);
+
+            typeColumn = area.removeFromLeft (typeWidth);
+            area.removeFromLeft (columnGap);
+            complexityColumn = area.removeFromLeft (complexityWidth);
+            area.removeFromLeft (columnGap);
+            voicingColumn = area;
+
+            const auto titleHeight = juce::jlimit (16, 22, gridArea.getHeight() / 12);
+
+            // Type column: four strictly exclusive radio buttons.
+            auto typeContent = typeColumn;
+            typeTitle = typeContent.removeFromTop (titleHeight);
+            typeContent.reduce (6, 4);
+
+            if (! typeContent.isEmpty())
+            {
+                juce::FlexBox typeFlex;
+                typeFlex.flexDirection = juce::FlexBox::Direction::column;
+                typeFlex.justifyContent = juce::FlexBox::JustifyContent::spaceAround;
+
+                for (auto* button : typeButtons)
+                    typeFlex.items.add (juce::FlexItem (*button)
+                                            .withFlex (1.0f)
+                                            .withMargin (juce::FlexItem::Margin (3, 0, 3, 0)));
+
+                typeFlex.performLayout (typeContent);
+            }
+
+            // Complexity: 2 columns x 6 rows. The eleventh choice spans the whole
+            // final row, which uses the otherwise-empty twelfth cell and keeps the
+            // block symmetrical.
+            auto complexityContent = complexityColumn;
+            complexityTitle = complexityContent.removeFromTop (titleHeight);
+            complexityContent.reduce (3, 4);
+
+            if (! complexityContent.isEmpty() && complexityButtons.size() > 0)
+            {
+                juce::Grid complexityGrid;
+                complexityGrid.justifyContent = juce::Grid::JustifyContent::stretch;
+                complexityGrid.alignItems = juce::Grid::AlignItems::stretch;
+
+                using Track = juce::Grid::TrackInfo;
+                complexityGrid.templateColumns = { Track (juce::Grid::Fr (1)),
+                                                   Track (juce::Grid::Fr (1)) };
+                complexityGrid.templateRows = { Track (juce::Grid::Fr (1)),
+                                                Track (juce::Grid::Fr (1)),
+                                                Track (juce::Grid::Fr (1)),
+                                                Track (juce::Grid::Fr (1)),
+                                                Track (juce::Grid::Fr (1)),
+                                                Track (juce::Grid::Fr (1)) };
+                complexityGrid.setGap (juce::Grid::Px (5));
+
+                const auto count = complexityButtons.size();
+
+                for (int i = 0; i < count; ++i)
+                {
+                    auto item = juce::GridItem (*complexityButtons[i]);
+
+                    if (count == 11 && i == 10)
+                        item.withArea (6, 1, 7, 3); // row 6, columns 1-2
+                    else
+                        item.withArea (i / 2 + 1, (i % 2) + 1);
+
+                    complexityGrid.items.add (item);
+                }
+
+                complexityGrid.performLayout (complexityContent);
+            }
+
+            // Voicing + Pitch Offset column.
+            auto voicingContent = voicingColumn;
+            voicingTitle = voicingContent.removeFromTop (titleHeight);
+            voicingContent.reduce (6, 4);
+
+            const auto pitchHeight = juce::jlimit (44, 62, voicingContent.getHeight() / 4);
+            auto pitchBlock = voicingContent.removeFromBottom (pitchHeight);
+            voicingContent.removeFromBottom (6);
+
+            voicingBox = voicingContent;
+
+            if (! voicingBox.isEmpty())
+            {
+                juce::FlexBox voicingFlex;
+                voicingFlex.flexDirection = juce::FlexBox::Direction::column;
+                voicingFlex.justifyContent = juce::FlexBox::JustifyContent::spaceAround;
+
+                for (auto* button : voicingButtons)
+                    voicingFlex.items.add (juce::FlexItem (*button)
+                                               .withFlex (1.0f)
+                                               .withMargin (juce::FlexItem::Margin (3, 0, 3, 0)));
+
+                voicingFlex.performLayout (voicingBox.reduced (8, 6));
+            }
+
+            pitchTitle = pitchBlock.removeFromTop (juce::jmin (16, pitchBlock.getHeight()));
+
+            auto row = pitchBlock.withSizeKeepingCentre (
+                juce::jmin (pitchBlock.getWidth(), 180),
+                juce::jmin (pitchBlock.getHeight(), 28));
+
+            const auto buttonWidth = juce::jmin (36, juce::jmax (22, row.getWidth() / 4));
+            pitchDecButton.setBounds (row.removeFromLeft (buttonWidth));
+            row.removeFromLeft (6);
+            pitchIncButton.setBounds (row.removeFromRight (buttonWidth));
+            row.removeFromRight (6);
+            pitchValueLabel.setBounds (row);
+        }
+
+    private:
+        //==========================================================================
+        void createButtonGroup (juce::OwnedArray<juce::TextButton>& group,
+                                const juce::String& parameterID,
+                                int radioGroupId)
+        {
+            const auto* choice = dynamic_cast<juce::AudioParameterChoice*> (
+                state.getParameter (parameterID));
+
+            jassert (choice != nullptr);
+
+            if (choice == nullptr)
+                return;
+
+            for (const auto& label : choice->choices)
+            {
+                auto* button = group.add (std::make_unique<juce::TextButton> (label));
+
+                // Radio groups are unique per column: TYPE, COMPLEXITY and VOICING
+                // can never interfere with one another.
+                button->setClickingTogglesState (true);
+                button->setRadioGroupId (radioGroupId, juce::dontSendNotification);
+                button->setColour (juce::TextButton::buttonColourId, miami::controlFace);
+                button->setColour (juce::TextButton::buttonOnColourId, miami::radicalBlue);
+                button->setColour (juce::TextButton::textColourOffId, miami::fluorescentPink);
+                button->setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+                button->setMouseCursor (juce::MouseCursor::PointingHandCursor);
+                button->setName (label);
+
+                addAndMakeVisible (button);
+            }
+        }
+
+        void configurePitchControls()
+        {
+            for (auto* button : { &pitchDecButton, &pitchIncButton })
+            {
+                button->setColour (juce::TextButton::buttonColourId, miami::controlFace);
+                button->setColour (juce::TextButton::textColourOffId, miami::fluorescentPink);
+                button->setMouseCursor (juce::MouseCursor::PointingHandCursor);
+                addAndMakeVisible (button);
+            }
+
+            pitchDecButton.setButtonText ("-");
+            pitchIncButton.setButtonText ("+");
+            pitchDecButton.setName ("Decrease pitch offset");
+            pitchIncButton.setName ("Increase pitch offset");
+
+            pitchDecButton.onClick = [this] { nudgePitch (-1); };
+            pitchIncButton.onClick = [this] { nudgePitch (1); };
+
+            pitchValueLabel.setJustificationType (juce::Justification::centred);
+            pitchValueLabel.setColour (juce::Label::textColourId, miami::brightMint);
+            pitchValueLabel.setFont (boilerplate::ui::fonts::oxanium (15.0f, 700.0f));
+            pitchValueLabel.setInterceptsMouseClicks (false, false);
+            pitchValueLabel.setText ("0", juce::dontSendNotification);
+            addAndMakeVisible (pitchValueLabel);
+        }
+
+        void nudgePitch (int delta)
+        {
+            if (pitchParameter == nullptr || pitchRawParameter == nullptr)
+                return;
+
+            const auto current = juce::roundToInt (pitchRawParameter->load (std::memory_order_relaxed));
+            const auto next = juce::jlimit (boilerplate::parameters::pitchOffsetMin,
+                                            boilerplate::parameters::pitchOffsetMax,
+                                            current + delta);
+
+            if (next == current)
+                return;
+
+            pitchParameter->beginChangeGesture();
+            pitchParameter->setValueNotifyingHost (
+                pitchParameter->convertTo0to1 (static_cast<float> (next)));
+            pitchParameter->endChangeGesture();
+
+            lastShownPitch = std::numeric_limits<int>::max();
+            updatePitchLabel();
+        }
+
+        void updatePitchLabel()
+        {
+            if (pitchRawParameter == nullptr)
+                return;
+
+            const auto value = juce::roundToInt (pitchRawParameter->load (std::memory_order_relaxed));
+
+            if (value == lastShownPitch)
+                return;
+
+            lastShownPitch = value;
+            pitchValueLabel.setText (value > 0 ? "+" + juce::String (value)
+                                               : juce::String (value),
+                                     juce::dontSendNotification);
+        }
+
+        void timerCallback() override
+        {
+            updatePitchLabel();
+        }
+
+        void drawPanelFrame (juce::Graphics& g, const juce::String& title) const
+        {
+            auto bounds = getLocalBounds().toFloat().reduced (0.5f);
+
+            g.setColour (miami::midnightArcade);
+            g.fillRoundedRectangle (bounds, 8.0f);
+
+            g.setColour (miami::radicalBlue.withAlpha (0.90f));
+            g.drawRoundedRectangle (bounds, 8.0f, 1.5f);
+
+            auto header = bounds.removeFromTop (30.0f);
+
+            juce::Path headerShape;
+            headerShape.addRoundedRectangle (header.getX(), header.getY(),
+                                             header.getWidth(), header.getHeight(),
+                                             8.0f, 8.0f, true, true, false, false);
+
+            g.setGradientFill (juce::ColourGradient (
+                miami::radicalBlue, header.getX(), header.getY(),
+                miami::fluorescentPink, header.getRight(), header.getY(),
+                false));
+            g.fillPath (headerShape);
+
+            g.setColour (miami::highlighterYellow);
+            g.fillRect (header.getX() + 14.0f, header.getBottom() - 2.0f,
+                        juce::jmin (150.0f, header.getWidth() - 28.0f), 2.0f);
+
+            g.setColour (juce::Colours::white);
+            g.setFont (boilerplate::ui::fonts::oxanium (14.0f, 700.0f)
+                           .withExtraKerningFactor (0.12f));
+            g.drawText (title, header.reduced (14.0f, 0.0f),
+                        juce::Justification::centredLeft, false);
+        }
+
+        static void drawGroupTitle (juce::Graphics& g,
+                                    const juce::String& text,
+                                    juce::Rectangle<int> area)
+        {
+            if (area.isEmpty())
+                return;
+
+            g.setColour (miami::highlighterYellow);
+            const auto fontSize = juce::jlimit (9.5f, 12.0f,
+                                                static_cast<float> (area.getWidth()) * 0.062f);
+            g.setFont (boilerplate::ui::fonts::oxanium (fontSize, 700.0f)
+                           .withExtraKerningFactor (0.14f));
+            g.drawText (text, area, juce::Justification::centred, false);
+
+            g.setColour (miami::highlighterYellow.withAlpha (0.22f));
+            g.fillRect (area.getX() + area.getWidth() / 4,
+                        area.getBottom() - 1,
+                        juce::jmax (1, area.getWidth() / 2), 1);
+        }
+
+        //==========================================================================
+        juce::AudioProcessorValueTreeState& state;
+
+        juce::OwnedArray<juce::TextButton> typeButtons;
+        juce::OwnedArray<juce::TextButton> complexityButtons;
+        juce::OwnedArray<juce::TextButton> voicingButtons;
+
+        juce::TextButton pitchDecButton;
+        juce::TextButton pitchIncButton;
+        juce::Label pitchValueLabel;
+
+        std::unique_ptr<ButtonGroupAttachment> typeAttachment;
+        std::unique_ptr<ButtonGroupAttachment> complexityAttachment;
+        std::unique_ptr<ButtonGroupAttachment> voicingAttachment;
+
+        juce::RangedAudioParameter* pitchParameter = nullptr;
+        std::atomic<float>* pitchRawParameter = nullptr;
+        int lastShownPitch = std::numeric_limits<int>::max();
+
+        juce::Rectangle<int> typeColumn, complexityColumn, voicingColumn;
+        juce::Rectangle<int> typeTitle, complexityTitle, voicingTitle, pitchTitle;
+        juce::Rectangle<int> voicingBox;
+        juce::Rectangle<int> gridArea;
+
+        int columnGap = 12;
+        int headerHeight = 32;
+
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ChordSettingsPanel)
+    };
+
+    //==========================================================================
+    /**
+        Right column: Spread, Humanize and Strum rotary controls plus their
+        matching mode selectors. The sliders use the shared Miami look, whose
+        rotary renderer draws a radial dot indicator ring.
+    */
+    class GlobalSettingsPanel final : public juce::Component
+    {
+    public:
+        explicit GlobalSettingsPanel (PluginProcessor& processorToUse)
+            : state (processorToUse.getValueTreeState()),
+              spreadAttachment (state, boilerplate::parameters::spread, spreadSlider),
+              humanizeAttachment (state, boilerplate::parameters::humanize, humanizeSlider),
+              strumAttachment (state, boilerplate::parameters::strum, strumSlider),
+              spreadModeAttachment (state, boilerplate::parameters::spreadMode, spreadModeSelector),
+              noteOffAttachment (state, boilerplate::parameters::noteOffMode, noteOffSelector),
+              strumModeAttachment (state, boilerplate::parameters::strumMode, strumModeSelector)
+        {
+            setName ("Global Settings");
+            setDescription ("Spread, humanize, strum and their mode selectors");
+
+            configureRotary (spreadSlider, spreadLabel, "Spread",
+                             "Opens the chord voicing across the keyboard");
+            configureRotary (humanizeSlider, humanizeLabel, "Humanize",
+                             "Randomizes chord-note velocity within a tight bracket");
+            configureRotary (strumSlider, strumLabel, "Strum",
+                             "Delays successive chord tones for a strummed feel");
+
+            configureSelector (spreadModeSelector, spreadModeLabel,
+                               boilerplate::parameters::spreadMode, "Spread Mode");
+            configureSelector (noteOffSelector, noteOffLabel,
+                               boilerplate::parameters::noteOffMode, "Note Off");
+            configureSelector (strumModeSelector, strumModeLabel,
+                               boilerplate::parameters::strumMode, "Strum Mode");
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            auto bounds = getLocalBounds().toFloat().reduced (0.5f);
+
+            g.setColour (miami::midnightArcade);
+            g.fillRoundedRectangle (bounds, 8.0f);
+
+            g.setColour (miami::fluorescentPink.withAlpha (0.85f));
+            g.drawRoundedRectangle (bounds, 8.0f, 1.5f);
+
+            auto header = bounds.removeFromTop (30.0f);
+
+            juce::Path headerShape;
+            headerShape.addRoundedRectangle (header.getX(), header.getY(),
+                                             header.getWidth(), header.getHeight(),
+                                             8.0f, 8.0f, true, true, false, false);
+
+            g.setGradientFill (juce::ColourGradient (
+                miami::fluorescentPink, header.getX(), header.getY(),
+                miami::radicalBlue, header.getRight(), header.getY(),
+                false));
+            g.fillPath (headerShape);
+
+            g.setColour (miami::brightMint);
+            g.fillRect (header.getX() + 14.0f, header.getBottom() - 2.0f,
+                        juce::jmin (150.0f, header.getWidth() - 28.0f), 2.0f);
+
+            g.setColour (juce::Colours::white);
+            g.setFont (boilerplate::ui::fonts::oxanium (14.0f, 700.0f)
+                           .withExtraKerningFactor (0.12f));
+            g.drawText ("GLOBAL SETTINGS", header.reduced (14.0f, 0.0f),
+                        juce::Justification::centredLeft, false);
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds();
+            area.removeFromTop (juce::jlimit (28, 34, getHeight() / 10));
+            area.reduce (12, 10);
+
+            if (area.getWidth() <= 0 || area.getHeight() <= 0)
+                return;
+
+            auto knobBlock = area.removeFromTop (juce::jlimit (120, 150, area.getHeight() / 2));
+            area.removeFromTop (8);
+
+            const auto knobWidth = knobBlock.getWidth() / 3;
+
+            auto spreadCell = knobBlock.removeFromLeft (knobWidth);
+            auto humanizeCell = knobBlock.removeFromLeft (knobWidth);
+            auto strumCell = knobBlock;
+
+            spreadLabel.setBounds (spreadCell.removeFromTop (18));
+            humanizeLabel.setBounds (humanizeCell.removeFromTop (18));
+            strumLabel.setBounds (strumCell.removeFromTop (18));
+
+            spreadSlider.setBounds (spreadCell);
+            humanizeSlider.setBounds (humanizeCell);
+            strumSlider.setBounds (strumCell);
+
+            const auto selectorHeight = juce::jlimit (30, 38, area.getHeight() / 3);
+            auto placeSelector = [&] (juce::Label& label, juce::ComboBox& box)
+            {
+                auto row = area.removeFromTop (selectorHeight);
+                label.setBounds (row.removeFromLeft (juce::jmin (110, row.getWidth() / 2)));
+                box.setBounds (row.reduced (2, 3));
+                area.removeFromTop (6);
+            };
+
+            placeSelector (spreadModeLabel, spreadModeSelector);
+            placeSelector (noteOffLabel, noteOffSelector);
+            placeSelector (strumModeLabel, strumModeSelector);
+        }
+
+    private:
+        void configureRotary (juce::Slider& slider, juce::Label& label,
+                              const juce::String& text,
+                              const juce::String& description)
+        {
+            slider.setSliderStyle (juce::Slider::RotaryVerticalDrag);
+            slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 66, 18);
+            slider.setRotaryParameters (juce::MathConstants<float>::pi * 1.2f,
+                                        juce::MathConstants<float>::pi * 2.8f,
+                                        true);
+            slider.setDoubleClickReturnValue (true, 0.0);
+            slider.setColour (juce::Slider::textBoxTextColourId, miami::brightMint);
+            slider.setColour (juce::Slider::textBoxBackgroundColourId, miami::midnightArcade);
+            slider.setColour (juce::Slider::textBoxOutlineColourId,
+                              miami::radicalBlue.withAlpha (0.55f));
+            slider.getProperties().set ("dotRing", true);
+            slider.setName (text);
+            slider.setDescription (description);
+            addAndMakeVisible (slider);
+
+            label.setText (text.toUpperCase(), juce::dontSendNotification);
+            label.setFont (boilerplate::ui::fonts::oxanium (10.5f, 700.0f)
+                               .withExtraKerningFactor (0.14f));
+            label.setColour (juce::Label::textColourId, miami::highlighterYellow);
+            label.setJustificationType (juce::Justification::centred);
+            label.setInterceptsMouseClicks (false, false);
+            addAndMakeVisible (label);
+        }
+
+        void configureSelector (juce::ComboBox& box, juce::Label& label,
+                                const juce::String& parameterID,
+                                const juce::String& labelText)
+        {
+            if (const auto* choice = dynamic_cast<juce::AudioParameterChoice*> (
+                    state.getParameter (parameterID)))
+            {
+                int itemId = 1;
+
+                for (const auto& text : choice->choices)
+                    box.addItem (text, itemId++);
+
+                // The ComboBoxAttachment is constructed before this body runs,
+                // so seed the visible selection here as well.
+                box.setSelectedId (choice->getIndex() + 1,
+                                   juce::dontSendNotification);
+            }
+
+            box.setColour (juce::ComboBox::backgroundColourId, miami::controlFace);
+            box.setColour (juce::ComboBox::textColourId, miami::fluorescentPink);
+            box.setColour (juce::ComboBox::outlineColourId,
+                           miami::radicalBlue.withAlpha (0.65f));
+            box.setColour (juce::ComboBox::arrowColourId, miami::highlighterYellow);
+            box.setColour (juce::ComboBox::focusedOutlineColourId, miami::brightMint);
+            box.setName (labelText);
+            addAndMakeVisible (box);
+
+            label.setText (labelText.toUpperCase(), juce::dontSendNotification);
+            label.setFont (boilerplate::ui::fonts::oxanium (10.0f, 700.0f)
+                               .withExtraKerningFactor (0.08f));
+            label.setColour (juce::Label::textColourId, miami::textMuted);
+            label.setJustificationType (juce::Justification::centredLeft);
+            label.setInterceptsMouseClicks (false, false);
+            addAndMakeVisible (label);
+        }
+
+        juce::AudioProcessorValueTreeState& state;
+
+        juce::Slider spreadSlider;
+        juce::Slider humanizeSlider;
+        juce::Slider strumSlider;
+
+        juce::ComboBox spreadModeSelector;
+        juce::ComboBox noteOffSelector;
+        juce::ComboBox strumModeSelector;
+
+        juce::Label spreadLabel;
+        juce::Label humanizeLabel;
+        juce::Label strumLabel;
+        juce::Label spreadModeLabel;
+        juce::Label noteOffLabel;
+        juce::Label strumModeLabel;
+
+        // Declared after the controls so the attachments are destroyed first.
+        juce::AudioProcessorValueTreeState::SliderAttachment spreadAttachment;
+        juce::AudioProcessorValueTreeState::SliderAttachment humanizeAttachment;
+        juce::AudioProcessorValueTreeState::SliderAttachment strumAttachment;
+        juce::AudioProcessorValueTreeState::ComboBoxAttachment spreadModeAttachment;
+        juce::AudioProcessorValueTreeState::ComboBoxAttachment noteOffAttachment;
+        juce::AudioProcessorValueTreeState::ComboBoxAttachment strumModeAttachment;
+
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GlobalSettingsPanel)
+    };
+
+    //==========================================================================
+    /**
+        Per-key recipe toolbar. The map itself lives in PluginProcessor as a
+        lock-free atomic array; this component is the message-thread editor for
+        it and remains fully compatible with the original KeyRecipes state.
+    */
+    class KeyMapBar final : public juce::Component,
+                            private juce::Timer
+    {
+    public:
+        explicit KeyMapBar (PluginProcessor& processorToUse)
+            : processor (processorToUse),
+              state (processorToUse.getValueTreeState())
+        {
+            setName ("Key Map");
+
+            keyMapTitle.setText ("KEY MAP", juce::dontSendNotification);
+            keyMapTitle.setFont (boilerplate::ui::fonts::oxanium (10.0f, 700.0f)
+                                     .withExtraKerningFactor (0.12f));
+            keyMapTitle.setColour (juce::Label::textColourId, miami::highlighterYellow);
+            keyMapTitle.setColour (juce::Label::backgroundColourId,
+                                   juce::Colours::transparentBlack);
+            keyMapTitle.setJustificationType (juce::Justification::centredLeft);
+            keyMapTitle.setInterceptsMouseClicks (false, false);
+            addAndMakeVisible (keyMapTitle);
+
+            for (int note = 0; note < 128; ++note)
+                keySelector.addItem (juce::MidiMessage::getMidiNoteName (note, true, true, 4)
+                                         + "  (" + juce::String (note) + ")",
+                                     note + 1);
+
+            keySelector.setSelectedId (61, juce::dontSendNotification); // C4 = note 60
+            keySelector.setColour (juce::ComboBox::backgroundColourId, miami::controlFace);
+            keySelector.setColour (juce::ComboBox::textColourId, miami::fluorescentPink);
+            keySelector.setColour (juce::ComboBox::outlineColourId,
+                                   miami::radicalBlue.withAlpha (0.65f));
+            keySelector.setColour (juce::ComboBox::arrowColourId, miami::highlighterYellow);
+            keySelector.setColour (juce::ComboBox::focusedOutlineColourId, miami::brightMint);
+            keySelector.setName ("Key map note");
+            keySelector.setDescription (
+                "Choose the MIDI note whose chord recipe you want to edit");
+            keySelector.onChange = [this]
+            {
+                selectedKey = juce::jlimit (0, 127, keySelector.getSelectedId() - 1);
+
+                if (onSelectedKeyChanged != nullptr)
+                    onSelectedKeyChanged (selectedKey);
+
+                updateKeyMapStatus();
+            };
+            addAndMakeVisible (keySelector);
+
+            keyStatusLabel.setFont (boilerplate::ui::fonts::oxanium (10.5f, 700.0f));
+            keyStatusLabel.setMinimumHorizontalScale (0.65f);
+            keyStatusLabel.setJustificationType (juce::Justification::centredLeft);
+            keyStatusLabel.setInterceptsMouseClicks (false, false);
+            keyStatusLabel.setColour (juce::Label::backgroundColourId,
+                                      juce::Colours::transparentBlack);
+            addAndMakeVisible (keyStatusLabel);
+
+            styleSmallButton (loadKeyButton, "LOAD", false);
+            styleSmallButton (assignKeyButton, "ASSIGN", true);
+            styleSmallButton (clearKeyButton, "CLEAR", false);
+
+            loadKeyButton.setName ("Load key recipe into the matrix");
+            assignKeyButton.setName ("Assign the matrix to the selected key");
+            clearKeyButton.setName ("Clear the selected key override");
+
+            loadKeyButton.onClick = [this] { loadSelectedKeyRecipe(); };
+            assignKeyButton.onClick = [this] { assignSelectedKeyRecipe(); };
+            clearKeyButton.onClick = [this] { clearSelectedKeyRecipe(); };
+
+            addAndMakeVisible (loadKeyButton);
+            addAndMakeVisible (assignKeyButton);
+            addAndMakeVisible (clearKeyButton);
+
+            updateKeyMapStatus();
+            startTimerHz (20);
+        }
+
+        ~KeyMapBar() override
+        {
+            stopTimer();
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            auto bounds = getLocalBounds().toFloat().reduced (0.5f);
+
+            g.setColour (miami::controlFace.withAlpha (0.82f));
+            g.fillRoundedRectangle (bounds, 6.0f);
+
+            g.setColour (miami::radicalBlue.withAlpha (0.45f));
+            g.drawRoundedRectangle (bounds, 6.0f, 1.0f);
+        }
+
+        void resized() override
+        {
+            auto row = getLocalBounds().reduced (8, 2);
+
+            keyMapTitle.setBounds (row.removeFromLeft (juce::jmin (58, row.getWidth())));
+            keySelector.setBounds (row.removeFromLeft (juce::jmin (132, row.getWidth())));
+
+            clearKeyButton.setBounds (row.removeFromRight (juce::jmin (54, row.getWidth())));
+            row.removeFromRight (6);
+            assignKeyButton.setBounds (row.removeFromRight (juce::jmin (62, row.getWidth())));
+            row.removeFromRight (6);
+            loadKeyButton.setBounds (row.removeFromRight (juce::jmin (48, row.getWidth())));
+            row.removeFromRight (10);
+            keyStatusLabel.setBounds (row);
+        }
+
+        int getSelectedKey() const noexcept { return selectedKey; }
+
+        /** Updates the selector without echoing back to the keyboard. */
+        void setSelectedKey (int note)
+        {
+            note = juce::jlimit (0, 127, note);
+
+            if (selectedKey == note
+                && keySelector.getSelectedId() == note + 1)
+                return;
+
+            selectedKey = note;
             keySelector.setSelectedId (selectedKey + 1, juce::dontSendNotification);
-            chordKeyboard.setSelectedNote (selectedKey);
             updateKeyMapStatus();
-        };
-
-        addAndMakeVisible (chordKeyboard);
-    }
-
-    static void styleSmallButton (juce::TextButton& button,
-                                  const juce::String& text,
-                                  bool primary)
-    {
-        button.setButtonText (text);
-        button.setColour (juce::TextButton::buttonColourId,
-                          primary ? wicky::ui::miami::radicalBlue
-                                  : wicky::ui::miami::controlFace);
-        button.setColour (juce::TextButton::textColourOffId,
-                          primary ? juce::Colours::white
-                                  : wicky::ui::miami::fluorescentPink);
-        button.setMouseCursor (juce::MouseCursor::PointingHandCursor);
-    }
-
-    void assignSelectedKeyRecipe()
-    {
-        PluginProcessor::ChordRecipe recipe;
-        recipe.chordType = readIntParameter (boilerplate::parameters::chordType);
-        recipe.complexity = readIntParameter (boilerplate::parameters::complexity);
-        recipe.voicing = readIntParameter (boilerplate::parameters::voicing);
-        recipe.pitchOffset = readIntParameter (boilerplate::parameters::pitchOffset);
-
-        processor.setKeyRecipe (selectedKey, recipe);
-        updateKeyMapStatus();
-    }
-
-    void loadSelectedKeyRecipe()
-    {
-        if (! processor.hasKeyRecipe (selectedKey))
-            return;
-
-        const auto recipe = processor.getKeyRecipe (selectedKey);
-        setIntParameter (boilerplate::parameters::chordType, recipe.chordType);
-        setIntParameter (boilerplate::parameters::complexity, recipe.complexity);
-        setIntParameter (boilerplate::parameters::voicing, recipe.voicing);
-        setIntParameter (boilerplate::parameters::pitchOffset, recipe.pitchOffset);
-        updateKeyMapStatus();
-    }
-
-    void clearSelectedKeyRecipe()
-    {
-        processor.clearKeyRecipe (selectedKey);
-        updateKeyMapStatus();
-    }
-
-    void updateKeyMapStatus()
-    {
-        const auto hasOverride = processor.hasKeyRecipe (selectedKey);
-        const auto recipe = processor.getKeyRecipe (selectedKey);
-
-        juce::String status;
-
-        if (hasOverride)
-        {
-            const auto pitch = recipe.pitchOffset > 0
-                ? "+" + juce::String (recipe.pitchOffset)
-                : juce::String (recipe.pitchOffset);
-
-            status << "CUSTOM  "
-                   << choiceLabel (boilerplate::parameters::chordType, recipe.chordType)
-                   << "/"
-                   << choiceLabel (boilerplate::parameters::complexity, recipe.complexity)
-                   << "/"
-                   << choiceLabel (boilerplate::parameters::voicing, recipe.voicing)
-                   << "/" << pitch;
-
-            keyStatusLabel.setColour (juce::Label::textColourId,
-                                      wicky::ui::miami::brightMint);
-        }
-        else
-        {
-            status = "GLOBAL  (uses matrix)";
-            keyStatusLabel.setColour (juce::Label::textColourId,
-                                      wicky::ui::miami::highlighterYellow.withAlpha (0.85f));
         }
 
-        if (keyStatusLabel.getText() != status)
-            keyStatusLabel.setText (status, juce::dontSendNotification);
+        std::function<void (int)> onSelectedKeyChanged;
 
-        if (loadKeyButton.isEnabled() != hasOverride)
-            loadKeyButton.setEnabled (hasOverride);
-
-        if (clearKeyButton.isEnabled() != hasOverride)
-            clearKeyButton.setEnabled (hasOverride);
-    }
-
-    void updateActiveNotes()
-    {
-        const auto low = processor.getActiveInputNotes (0);
-        const auto high = processor.getActiveInputNotes (1);
-
-        chordKeyboard.setActiveNotes (low, high);
-
-        const auto active = (low | high) != 0;
-
-        if (active != anyInputActive)
+    private:
+        static void styleSmallButton (juce::TextButton& button,
+                                      const juce::String& text,
+                                      bool primary)
         {
-            anyInputActive = active;
-            repaint();
+            button.setButtonText (text);
+            button.setColour (juce::TextButton::buttonColourId,
+                              primary ? miami::radicalBlue : miami::controlFace);
+            button.setColour (juce::TextButton::textColourOffId,
+                              primary ? juce::Colours::white : miami::fluorescentPink);
+            button.setMouseCursor (juce::MouseCursor::PointingHandCursor);
         }
-    }
 
-    int readIntParameter (const char* id) const
-    {
-        if (auto* value = state.getRawParameterValue (id))
-            return juce::roundToInt (value->load (std::memory_order_relaxed));
-
-        return 0;
-    }
-
-    void setIntParameter (const char* id, int value)
-    {
-        if (auto* parameter = state.getParameter (id))
+        void assignSelectedKeyRecipe()
         {
-            parameter->beginChangeGesture();
-            parameter->setValueNotifyingHost (
-                parameter->convertTo0to1 (static_cast<float> (value)));
-            parameter->endChangeGesture();
+            PluginProcessor::ChordRecipe recipe;
+            recipe.chordType = readIntParameter (boilerplate::parameters::chordType);
+            recipe.complexity = readIntParameter (boilerplate::parameters::complexity);
+            recipe.voicing = readIntParameter (boilerplate::parameters::voicing);
+            recipe.pitchOffset = readIntParameter (boilerplate::parameters::pitchOffset);
+
+            processor.setKeyRecipe (selectedKey, recipe);
+            updateKeyMapStatus();
         }
-    }
 
-    juce::String choiceLabel (const char* id, int index) const
-    {
-        if (const auto* choice = dynamic_cast<const juce::AudioParameterChoice*> (
-                state.getParameter (id)))
-            return choice->choices[juce::jlimit (0, choice->choices.size() - 1, index)];
+        void loadSelectedKeyRecipe()
+        {
+            if (! processor.hasKeyRecipe (selectedKey))
+                return;
 
-        return {};
-    }
+            const auto recipe = processor.getKeyRecipe (selectedKey);
+            setIntParameter (boilerplate::parameters::chordType, recipe.chordType);
+            setIntParameter (boilerplate::parameters::complexity, recipe.complexity);
+            setIntParameter (boilerplate::parameters::voicing, recipe.voicing);
+            setIntParameter (boilerplate::parameters::pitchOffset, recipe.pitchOffset);
+            updateKeyMapStatus();
+        }
 
-    void nudgePitch (int delta)
-    {
-        if (pitchParameter == nullptr || pitchRawParameter == nullptr)
-            return;
+        void clearSelectedKeyRecipe()
+        {
+            processor.clearKeyRecipe (selectedKey);
+            updateKeyMapStatus();
+        }
 
-        const auto current = juce::roundToInt (pitchRawParameter->load (std::memory_order_relaxed));
-        const auto next = juce::jlimit (boilerplate::parameters::pitchOffsetMin,
-                                        boilerplate::parameters::pitchOffsetMax,
-                                        current + delta);
+        void updateKeyMapStatus()
+        {
+            const auto hasOverride = processor.hasKeyRecipe (selectedKey);
+            const auto recipe = processor.getKeyRecipe (selectedKey);
 
-        if (next == current)
-            return;
+            juce::String status;
 
-        pitchParameter->beginChangeGesture();
-        pitchParameter->setValueNotifyingHost (
-            pitchParameter->convertTo0to1 (static_cast<float> (next)));
-        pitchParameter->endChangeGesture();
+            if (hasOverride)
+            {
+                const auto pitch = recipe.pitchOffset > 0
+                    ? "+" + juce::String (recipe.pitchOffset)
+                    : juce::String (recipe.pitchOffset);
 
-        lastShownPitch = std::numeric_limits<int>::max();
-        updatePitchLabel();
-    }
+                status << "CUSTOM  "
+                       << choiceLabel (boilerplate::parameters::chordType, recipe.chordType)
+                       << "/"
+                       << choiceLabel (boilerplate::parameters::complexity, recipe.complexity)
+                       << "/"
+                       << choiceLabel (boilerplate::parameters::voicing, recipe.voicing)
+                       << "/" << pitch;
 
-    void updatePitchLabel()
-    {
-        if (pitchRawParameter == nullptr)
-            return;
+                keyStatusLabel.setColour (juce::Label::textColourId, miami::brightMint);
+            }
+            else
+            {
+                status = "GLOBAL  (uses matrix)";
+                keyStatusLabel.setColour (juce::Label::textColourId,
+                                          miami::highlighterYellow.withAlpha (0.85f));
+            }
 
-        const auto value = juce::roundToInt (pitchRawParameter->load (std::memory_order_relaxed));
+            if (keyStatusLabel.getText() != status)
+                keyStatusLabel.setText (status, juce::dontSendNotification);
 
-        if (value == lastShownPitch)
-            return;
+            if (loadKeyButton.isEnabled() != hasOverride)
+                loadKeyButton.setEnabled (hasOverride);
 
-        lastShownPitch = value;
-        pitchValueLabel.setText (value > 0 ? "+" + juce::String (value)
-                                           : juce::String (value),
-                                 juce::dontSendNotification);
-    }
+            if (clearKeyButton.isEnabled() != hasOverride)
+                clearKeyButton.setEnabled (hasOverride);
+        }
 
-    void handleNoteOn (juce::MidiKeyboardState*, int midiChannel,
-                       int midiNoteNumber, float velocity) override
-    {
-        juce::ignoreUnused (midiChannel);
-        processor.queueKeyboardNote (true, midiNoteNumber, velocity);
-    }
+        int readIntParameter (const char* id) const
+        {
+            if (auto* value = state.getRawParameterValue (id))
+                return juce::roundToInt (value->load (std::memory_order_relaxed));
 
-    void handleNoteOff (juce::MidiKeyboardState*, int midiChannel,
-                        int midiNoteNumber, float velocity) override
-    {
-        juce::ignoreUnused (midiChannel, velocity);
-        processor.queueKeyboardNote (false, midiNoteNumber, 0.0f);
-    }
+            return 0;
+        }
 
-    void timerCallback() override
-    {
-        updatePitchLabel();
-        updateKeyMapStatus();
-        updateActiveNotes();
-    }
+        void setIntParameter (const char* id, int value)
+        {
+            if (auto* parameter = state.getParameter (id))
+            {
+                parameter->beginChangeGesture();
+                parameter->setValueNotifyingHost (
+                    parameter->convertTo0to1 (static_cast<float> (value)));
+                parameter->endChangeGesture();
+            }
+        }
 
-    static void drawGroupTitle (juce::Graphics& g,
-                                const juce::String& text,
-                                juce::Rectangle<int> area)
-    {
-        if (area.isEmpty())
-            return;
+        juce::String choiceLabel (const char* id, int index) const
+        {
+            if (const auto* choice = dynamic_cast<const juce::AudioParameterChoice*> (
+                    state.getParameter (id)))
+                return choice->choices[juce::jlimit (0, choice->choices.size() - 1, index)];
 
-        g.setColour (wicky::ui::miami::highlighterYellow);
-        const auto fontSize = juce::jlimit (9.5f, 12.0f,
-                                            static_cast<float> (area.getWidth()) * 0.062f);
-        g.setFont (boilerplate::ui::fonts::oxanium (fontSize, 700.0f)
-                       .withExtraKerningFactor (0.14f));
-        g.drawText (text, area, juce::Justification::centred, false);
+            return {};
+        }
 
-        g.setColour (wicky::ui::miami::highlighterYellow.withAlpha (0.22f));
-        g.fillRect (area.getX() + area.getWidth() / 4,
-                    area.getBottom() - 1,
-                    juce::jmax (1, area.getWidth() / 2), 1);
-    }
+        void timerCallback() override
+        {
+            updateKeyMapStatus();
+        }
 
-    //==========================================================================
-    PluginProcessor& processor;
-    juce::AudioProcessorValueTreeState& state;
+        PluginProcessor& processor;
+        juce::AudioProcessorValueTreeState& state;
 
-    juce::OwnedArray<juce::TextButton> typeButtons;
-    juce::OwnedArray<juce::TextButton> complexityButtons;
-    juce::OwnedArray<juce::TextButton> voicingButtons;
+        juce::Label keyMapTitle;
+        juce::ComboBox keySelector;
+        juce::Label keyStatusLabel;
+        juce::TextButton loadKeyButton;
+        juce::TextButton assignKeyButton;
+        juce::TextButton clearKeyButton;
 
-    juce::TextButton pitchDecButton;
-    juce::TextButton pitchIncButton;
-    juce::Label pitchValueLabel;
+        int selectedKey = 60;
 
-    juce::Label keyMapTitle;
-    juce::ComboBox keySelector;
-    juce::Label keyStatusLabel;
-    juce::TextButton loadKeyButton;
-    juce::TextButton assignKeyButton;
-    juce::TextButton clearKeyButton;
-
-    wicky::ui::ChordKeyboard chordKeyboard;
-
-    std::unique_ptr<wicky::ui::ButtonGroupAttachment> typeAttachment;
-    std::unique_ptr<wicky::ui::ButtonGroupAttachment> complexityAttachment;
-    std::unique_ptr<wicky::ui::ButtonGroupAttachment> voicingAttachment;
-
-    juce::RangedAudioParameter* pitchParameter = nullptr;
-    std::atomic<float>* pitchRawParameter = nullptr;
-    int lastShownPitch = std::numeric_limits<int>::max();
-    int selectedKey = 60;
-    bool anyInputActive = false;
-
-    juce::Rectangle<int> typeColumn, complexityColumn, voicingColumn;
-    juce::Rectangle<int> typeTitle, complexityTitle, voicingTitle, pitchTitle;
-    juce::Rectangle<int> voicingBox;
-    juce::Rectangle<int> keyMapArea, keyboardArea, gridArea;
-
-    int columnGap = 12;
-    int headerHeight = 36;
-
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ChordSettingsPanel)
-};
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (KeyMapBar)
+    };
+}

@@ -73,18 +73,79 @@ Select the key and click **CLEAR**. The key returns to following the global matr
 
 Each MIDI note has its own slot, so `C4` and `C5` are independent.
 
-## 4. Velocity Gain and Bypass
+## 4. Global interaction controls
 
-The **MIDI Velocity Gain** knob scales the velocity of every generated chord note.
+These controls affect every chord, including keys with their own custom recipe.
+
+### Spread
+
+Sets how far a chord spans across the keyboard. At `0%` every chord uses its
+close-position shape. Higher values open the voicing in octave steps.
+
+### Spread Mode
+
+- **Dense** — keeps every chord tone and pushes the upper voices outward
+  gradually.
+- **Sparse** — leaves the bass/root in place and lifts the remaining voices
+  together, creating more space above the bass.
+
+At `Spread = 0%` both modes are identical.
+
+### Humanize
+
+Randomizes the velocity of each chord tone inside a tight bracket. At `0%` every
+chord note uses the incoming velocity. Higher values add more velocity variation,
+which makes programmed chords feel less mechanical.
+
+### Strum
+
+Delays successive chord tones instead of firing them all at once. The step time
+is calculated from the current sample rate, so the groove stays consistent at
+`44.1`, `48`, and `96 kHz`. A `0%` setting keeps the original instant chord.
+
+### Strum Mode
+
+- **Up** — low chord tones first, high tones last.
+- **Down** — high chord tones first, low tones last.
+
+### Note Off Mode
+
+- **Simultaneous** — every chord tone releases together when you let go of the
+  key.
+- **Staggered** — chord tones release one at a time. This is useful for short,
+  arpeggio-like taps.
+
+## 5. Power, velocity and presets
+
+### Power
+
+The large **ON / OFF** switch in the top bar arms or disables chord generation.
+When it is **OFF**, input notes pass through unchanged, exactly like bypass.
+The host-facing **Bypass** parameter still works independently.
+
+### Velocity
+
+The compact **Velocity** knob scales outgoing MIDI velocity.
 
 - `0.0 dB` — the input velocity is used unchanged.
 - Negative values soften the chord.
 - `−60 dB` — the minimum note-on velocity (1).
 - `+12 dB` — boosts velocity, clamped at 127.
 
-**BYPASS** stops chord generation and passes the input notes through unchanged. Any chord that is currently sounding is released when bypass is engaged, so you will not leave notes hanging.
+### Presets
 
-## 5. Note handling
+The **PRESET** selector in the top bar loads a factory preset. The `<` and `>`
+buttons move through the bank without opening the menu. Loading a preset changes
+the chord matrix, global interaction controls, power state and velocity; it does
+not erase your per-key recipes.
+
+### Chord readout
+
+The large **NOW PLAYING** display shows the chord symbol currently sounding, for
+example `C maj7`, `D m9`, or `G 13`. It uses the recipe assigned to the trigger
+key, so custom key recipes are reflected immediately.
+
+## 6. Note handling
 
 - Triggering a key replaces the input note with the chord.
 - Releasing the key releases the chord.
@@ -93,19 +154,25 @@ The **MIDI Velocity Gain** knob scales the velocity of every generated chord not
 - `CC123` (All Notes Off) and `CC120` (All Sound Off) release the chords on that channel.
 - Channels are tracked independently.
 - Very high or very low chords are moved by octaves so they stay inside the MIDI range.
+- With **Strum** above zero, chord tones are scheduled across block boundaries; a
+  very short key tap cancels any tones that have not sounded yet.
+- With **Staggered** release, chord tones stop one at a time instead of together.
 
-## 6. Saving
+## 7. Saving
 
-The chord matrix and the complete per-key map are saved with the plugin state and the DAW session. Reopening the session restores every custom key assignment.
+The chord matrix, the complete per-key map, the global interaction settings, power
+state and velocity are saved with the plugin state and the DAW session. Reopening
+the session restores every custom key assignment and interaction setting.
 
-A dedicated preset browser / user-preset library is not part of this build yet.
+The top-bar preset selector is a factory preset browser. Saving your own named
+presets to a user library is not part of this build yet.
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 **No sound**
 - Check that the plugin's MIDI output is routed to an instrument.
 - Check the instrument's MIDI channel.
-- Check that **BYPASS** is off.
+- Check that **POWER** is ON and the host **Bypass** is off.
 - In a DAW, make sure the track is record/monitor-enabled so MIDI reaches the plugin.
 
 **A key does not follow the matrix**
@@ -116,23 +183,23 @@ A dedicated preset browser / user-preset library is not part of this build yet.
 
 **Hanging notes**
 - Stop the transport and start it again, or send All Notes Off from your DAW.
-- Toggle **BYPASS** off and on to force a release of generated notes.
+- Toggle **POWER** off and on, or toggle host **Bypass**, to force a release of generated notes.
 
 **Standalone MIDI routing**
 - Use the standalone's Options / Audio Settings to choose your MIDI input.
 - Feeding the standalone's generated MIDI into another app through a virtual MIDI port is not implemented in this build. Use the plugin inside a DAW for now.
 
-## 8. Current limitations
+## 9. Current limitations
 
 These parts of the larger design are not in this build yet:
 
-- Spread, Humanize, and Strum controls
-- Strum patterns
-- Preset browser and user-preset saving
-- On-screen keyboard and octave-map display
+- User-preset saving and a user preset library (factory presets are included)
+- Tempo-synced strum and additional strum pattern models
 - Scale / key-signature selection
 - A custom MIDI input/output settings panel
 - A system-wide virtual MIDI output port
 - Dedicated Logic MIDI FX placement (requires the bus-free MIDI-effect build)
 
-The chord matrix, per-key recipes, velocity gain, bypass, and session persistence are complete and active.
+The chord matrix, per-key recipes, spread/humanize/strum engine, note-off modes,
+factory presets, live chord readout, power switch, velocity gain, bypass, and
+session persistence are complete and active.

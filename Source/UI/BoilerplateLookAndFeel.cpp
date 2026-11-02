@@ -57,22 +57,31 @@ namespace boilerplate::ui
         const auto trackWidth = juce::jmax (2.0f, radius * 0.055f);
         const auto arcRadius = radius * 0.80f;
 
-        // Tick ring around the outside of the value arc.
-        g.setColour (palette::tick);
-        constexpr int tickCount = 11;
+        // Radial dot indicator ring around the outside of the value arc. The
+        // dots light up as the slider travels, matching the global controls.
+        constexpr int dotCount = 15;
+        const auto dotRadius = juce::jmax (1.3f, radius * 0.028f);
 
-        for (int i = 0; i < tickCount; ++i)
+        for (int i = 0; i < dotCount; ++i)
         {
-            const auto proportion = (float) i / (float) (tickCount - 1);
-            const auto tickAngle = rotaryStartAngle
-                                 + proportion * (rotaryEndAngle - rotaryStartAngle);
-            const auto inner = centre.getPointOnCircumference (radius * 0.90f, tickAngle);
-            const auto outer = centre.getPointOnCircumference (radius * 0.96f, tickAngle);
+            const auto proportion = (float) i / (float) (dotCount - 1);
+            const auto dotAngle = rotaryStartAngle
+                                + proportion * (rotaryEndAngle - rotaryStartAngle);
+            const auto dotCentre = centre.getPointOnCircumference (radius * 0.94f, dotAngle);
+            const auto dot = juce::Rectangle<float> (dotRadius * 2.0f, dotRadius * 2.0f)
+                                 .withCentre (dotCentre);
 
-            g.setColour (proportion <= sliderPosProportional
-                             ? palette::cyberYellow.withAlpha (0.90f)
+            const auto lit = proportion <= sliderPosProportional + 0.001f;
+
+            if (lit)
+            {
+                g.setColour (palette::cyberYellow.withAlpha (0.20f));
+                g.fillEllipse (dot.expanded (dotRadius * 1.4f));
+            }
+
+            g.setColour (lit ? palette::cyberYellow
                              : palette::tick.withAlpha (0.55f));
-            g.drawLine (inner.x, inner.y, outer.x, outer.y, 1.0f);
+            g.fillEllipse (dot);
         }
 
         juce::Path track;
@@ -132,6 +141,66 @@ namespace boilerplate::ui
     {
         auto bounds = button.getLocalBounds().toFloat().reduced (1.0f);
         const auto isOn = button.getToggleState();
+
+        // The global power control is a sliding hardware-style switch rather
+        // than the LED + label style used by ordinary toggles.
+        if (button.getProperties().getWithDefault ("slidingSwitch", false)
+                == juce::var (true))
+        {
+            auto track = bounds.reduced (1.0f);
+
+            auto trackColour = isOn ? palette::electricBlue : palette::control;
+
+            if (shouldDrawButtonAsDown)
+                trackColour = trackColour.brighter (0.10f);
+            else if (shouldDrawButtonAsHighlighted)
+                trackColour = trackColour.brighter (0.05f);
+
+            g.setColour (trackColour);
+            g.fillRoundedRectangle (track, track.getHeight() * 0.5f);
+
+            g.setColour (isOn ? palette::toxicGreen
+                              : palette::electricBlue.withAlpha (0.75f));
+            g.drawRoundedRectangle (track, track.getHeight() * 0.5f,
+                                    isOn ? 1.8f : 1.2f);
+
+            if (isOn)
+            {
+                g.setColour (palette::toxicGreen.withAlpha (0.16f));
+                g.fillRoundedRectangle (track.reduced (2.5f),
+                                        track.getHeight() * 0.45f);
+            }
+
+            const auto knobDiameter = track.getHeight() - 8.0f;
+            const auto knobX = isOn ? track.getRight() - knobDiameter - 4.0f
+                                    : track.getX() + 4.0f;
+            const auto knob = juce::Rectangle<float> (knobDiameter, knobDiameter)
+                                  .withCentre ({ knobX + knobDiameter * 0.5f,
+                                                 track.getCentreY() });
+
+            g.setColour (isOn ? palette::toxicGreen.withAlpha (0.30f)
+                              : palette::electricBlue.withAlpha (0.12f));
+            g.fillEllipse (knob.expanded (3.0f));
+
+            g.setColour (isOn ? palette::toxicGreen : palette::muted);
+            g.fillEllipse (knob);
+
+            g.setColour (isOn ? juce::Colours::white : palette::midnight);
+            g.setFont (fonts::oxanium (juce::jmax (10.0f, track.getHeight() * 0.34f), 700.0f)
+                           .withExtraKerningFactor (0.14f));
+
+            auto labelArea = track;
+
+            if (isOn)
+                labelArea.removeFromRight (knobDiameter + 10.0f);
+            else
+                labelArea.removeFromLeft (knobDiameter + 10.0f);
+
+            g.setColour (isOn ? juce::Colours::white : palette::muted);
+            g.drawText (isOn ? "ON" : "OFF", labelArea,
+                        juce::Justification::centred, false);
+            return;
+        }
 
         auto fill = isOn ? palette::electricBlue : palette::control;
 

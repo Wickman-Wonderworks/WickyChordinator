@@ -30,6 +30,14 @@ namespace boilerplate::parameters
             "Bypass",
             false));
 
+        // Global power switch. ON means the chord engine is armed; this is
+        // deliberately separate from the host-facing Bypass parameter so both
+        // automation and the front-panel switch remain meaningful.
+        layout.add (std::make_unique<AudioParameterBool> (
+            ParameterID { power, powerVersionHint },
+            "Power",
+            true));
+
         // Chord Settings Matrix. The choice order is part of the state file
         // contract: append new choices at the end, never reorder existing ones.
         layout.add (std::make_unique<AudioParameterChoice> (
@@ -60,6 +68,56 @@ namespace boilerplate::parameters
             pitchOffsetMax,
             0,
             AudioParameterIntAttributes().withLabel ("st")));
+
+        //==========================================================================
+        // Global interaction engine. Percentages keep the UI consistent and let
+        // the processor map them to physical units with the current sample rate.
+        //==========================================================================
+        auto percentAttributes = AudioParameterFloatAttributes()
+            .withLabel ("%")
+            .withStringFromValueFunction ([] (float value, int)
+            {
+                return String (roundToInt (value)) + "%";
+            });
+
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { spread, spreadVersionHint },
+            "Spread",
+            NormalisableRange<float> { 0.0f, 100.0f, 0.1f },
+            0.0f,
+            percentAttributes));
+
+        layout.add (std::make_unique<AudioParameterChoice> (
+            ParameterID { spreadMode, spreadModeVersionHint },
+            "Spread Mode",
+            StringArray { "Dense", "Sparse" },
+            0));
+
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { humanize, humanizeVersionHint },
+            "Humanize",
+            NormalisableRange<float> { 0.0f, 100.0f, 0.1f },
+            0.0f,
+            percentAttributes));
+
+        layout.add (std::make_unique<AudioParameterChoice> (
+            ParameterID { noteOffMode, noteOffModeVersionHint },
+            "Note Off Mode",
+            StringArray { "Simultaneous", "Staggered" },
+            0));
+
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { strum, strumVersionHint },
+            "Strum",
+            NormalisableRange<float> { 0.0f, 100.0f, 0.1f },
+            0.0f,
+            percentAttributes));
+
+        layout.add (std::make_unique<AudioParameterChoice> (
+            ParameterID { strumMode, strumModeVersionHint },
+            "Strum Mode",
+            StringArray { "Up", "Down" },
+            0));
 
         return layout;
     }

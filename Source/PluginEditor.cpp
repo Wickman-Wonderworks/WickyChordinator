@@ -5,7 +5,7 @@
 
 namespace
 {
-    constexpr int designWidth = 720;
+    constexpr int designWidth = 1000;
     constexpr int designHeight = 580;
 
     void drawCornerBracket (juce::Graphics& g, juce::Point<float> corner,
@@ -21,80 +21,223 @@ namespace
         g.drawLine (corner.x, corner.y,
                     corner.x, corner.y + yDirection * length, 1.5f);
     }
+
+    void styleFlatButton (juce::Button& button, const juce::String& text)
+    {
+        button.setButtonText (text);
+        button.setColour (juce::TextButton::buttonColourId,
+                          wicky::ui::miami::controlFace);
+        button.setColour (juce::TextButton::textColourOffId,
+                          wicky::ui::miami::highlighterYellow);
+        button.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    }
 }
 
 //==============================================================================
 PluginEditor::PluginEditor (PluginProcessor& owner)
     : AudioProcessorEditor (&owner),
       processorRef (owner),
-      chordPanel (processorRef),
-      gainAttachment (processorRef.getValueTreeState(), boilerplate::parameters::gain, gainSlider),
-      bypassAttachment (processorRef.getValueTreeState(), boilerplate::parameters::bypass, bypassButton)
+      chordPanel (owner),
+      globalPanel (owner),
+      keyMapBar (owner),
+      chordKeyboard (owner.getKeyboardState()),
+      gainAttachment (owner.getValueTreeState(), boilerplate::parameters::gain, gainSlider),
+      powerAttachment (owner.getValueTreeState(), boilerplate::parameters::power, powerButton)
 {
     setLookAndFeel (&lookAndFeel);
     setOpaque (true);
 
-    gainSlider.setSliderStyle (juce::Slider::RotaryVerticalDrag);
-    gainSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 92, 22);
-    gainSlider.setRotaryParameters (juce::MathConstants<float>::pi * 1.2f,
-                                    juce::MathConstants<float>::pi * 2.8f,
-                                    true);
-    gainSlider.setDoubleClickReturnValue (true, 0.0);
-    gainSlider.setColour (juce::Slider::textBoxTextColourId,
-                          wicky::ui::miami::brightMint);
-    gainSlider.setColour (juce::Slider::textBoxBackgroundColourId,
-                          wicky::ui::miami::midnightArcade);
-    gainSlider.setColour (juce::Slider::textBoxOutlineColourId,
-                          wicky::ui::miami::radicalBlue.withAlpha (0.55f));
-    gainSlider.setName ("MIDI Velocity Gain");
-    gainSlider.setDescription ("Scales the velocity of outgoing MIDI notes in decibels");
-    addAndMakeVisible (gainSlider);
+    presetManager = std::make_unique<wicky::ui::PresetManager> (owner.getValueTreeState());
 
-    bypassButton.setButtonText ("BYPASS");
-    bypassButton.setName ("Bypass");
-    bypassButton.setDescription ("Passes MIDI through without velocity scaling");
-    bypassButton.setColour (juce::ToggleButton::textColourId,
-                            wicky::ui::miami::textPrimary);
-    bypassButton.setColour (juce::ToggleButton::tickColourId,
-                            wicky::ui::miami::brightMint);
-    addAndMakeVisible (bypassButton);
+    configureStatusBar();
 
     addAndMakeVisible (chordPanel);
+    addAndMakeVisible (globalPanel);
+    addAndMakeVisible (keyMapBar);
+    addAndMakeVisible (chordKeyboard);
+
+    keyMapBar.onSelectedKeyChanged = [this] (int note)
+    {
+        chordKeyboard.setSelectedNote (note);
+    };
+
+    chordKeyboard.onNoteSelected = [this] (int note)
+    {
+        keyMapBar.setSelectedKey (note);
+        chordKeyboard.setSelectedNote (note);
+    };
+
+    chordKeyboard.setSelectedNote (keyMapBar.getSelectedKey());
+
+    processorRef.getKeyboardState().addListener (this);
 
     setResizable (true, true);
-    setResizeLimits (560, 450, 1400, 1130);
+    setResizeLimits (760, 441, 2000, 1160);
 
     if (auto* constrainer = getConstrainer())
         constrainer->setFixedAspectRatio ((double) designWidth / (double) designHeight);
 
     setSize (designWidth, designHeight);
+    startTimerHz (24);
 }
 
 PluginEditor::~PluginEditor()
 {
+    stopTimer();
+
+    // Send note-offs for anything still held when the editor closes so the
+    // processor cannot be left with an orphaned chord.
+    processorRef.getKeyboardState().allNotesOff (1);
+    processorRef.getKeyboardState().removeListener (this);
+
     setLookAndFeel (nullptr);
+}
+
+//==============================================================================
+void PluginEditor::configureStatusBar()
+{
+    using namespace wicky::ui;
+
+    presetCaption.setText ("PRESET", juce::dontSendNotification);
+    presetCaption.setFont (boilerplate::ui::fonts::oxanium (9.5f, 700.0f)
+                               .withExtraKerningFactor (0.16f));
+    presetCaption.setColour (juce::Label::textColourId, miami::textMuted);
+    presetCaption.setJustificationType (juce::Justification::centredLeft);
+    presetCaption.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (presetCaption);
+
+    presetSelector.setColour (juce::ComboBox::backgroundColourId, miami::controlFace);
+    presetSelector.setColour (juce::ComboBox::textColourId, miami::highlighterYellow);
+    presetSelector.setColour (juce::ComboBox::outlineColourId,
+                              miami::radicalBlue.withAlpha (0.70f));
+    presetSelector.setColour (juce::ComboBox::arrowColourId, miami::brightMint);
+    presetSelector.setColour (juce::ComboBox::focusedOutlineColourId, miami::fluorescentPink);
+    presetSelector.setName ("Preset");
+    presetSelector.setDescription ("Select a built-in preset");
+
+    jassert (presetManager != nullptr);
+
+    if (presetManager != nullptr)
+    {
+        for (int i = 0; i < presetManager->getNumPresets(); ++i)
+            presetSelector.addItem (presetManager->getName (i), i + 1);
+
+        presetSelector.setSelectedId (presetManager->getCurrentIndex() + 1,
+                                      juce::dontSendNotification);
+    }
+
+    presetSelector.onChange = [this]
+    {
+        if (updatingPresetSelector)
+            return;
+
+        selectPreset (presetSelector.getSelectedId() - 1);
+    };
+    addAndMakeVisible (presetSelector);
+
+    styleFlatButton (presetPreviousButton, "<");
+    styleFlatButton (presetNextButton, ">");
+    presetPreviousButton.setName ("Previous preset");
+    presetNextButton.setName ("Next preset");
+
+    presetPreviousButton.onClick = [this]
+    {
+        if (presetManager == nullptr || presetManager->getNumPresets() == 0)
+            return;
+
+        selectPreset ((presetManager->getCurrentIndex()
+                       + presetManager->getNumPresets() - 1)
+                      % presetManager->getNumPresets());
+    };
+
+    presetNextButton.onClick = [this]
+    {
+        if (presetManager == nullptr || presetManager->getNumPresets() == 0)
+            return;
+
+        selectPreset ((presetManager->getCurrentIndex() + 1)
+                      % presetManager->getNumPresets());
+    };
+
+    addAndMakeVisible (presetPreviousButton);
+    addAndMakeVisible (presetNextButton);
+
+    chordCaption.setText ("NOW PLAYING", juce::dontSendNotification);
+    chordCaption.setFont (boilerplate::ui::fonts::oxanium (9.5f, 700.0f)
+                              .withExtraKerningFactor (0.24f));
+    chordCaption.setColour (juce::Label::textColourId,
+                            miami::highlighterYellow.withAlpha (0.82f));
+    chordCaption.setJustificationType (juce::Justification::centred);
+    chordCaption.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (chordCaption);
+
+    chordReadout.setText ("--", juce::dontSendNotification);
+    chordReadout.setFont (boilerplate::ui::fonts::oxanium (30.0f, 700.0f)
+                              .withExtraKerningFactor (0.04f));
+    chordReadout.setMinimumHorizontalScale (0.55f);
+    chordReadout.setColour (juce::Label::textColourId, miami::textMuted);
+    chordReadout.setJustificationType (juce::Justification::centred);
+    chordReadout.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (chordReadout);
+
+    powerButton.setButtonText ("POWER");
+    powerButton.getProperties().set ("slidingSwitch", true);
+    powerButton.setName ("Power");
+    powerButton.setDescription ("Globally enable or disable chord generation");
+    powerButton.setColour (juce::ToggleButton::textColourId, miami::textPrimary);
+    powerButton.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    addAndMakeVisible (powerButton);
+
+    gainSlider.setSliderStyle (juce::Slider::RotaryVerticalDrag);
+    gainSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 16);
+    gainSlider.setRotaryParameters (juce::MathConstants<float>::pi * 1.2f,
+                                    juce::MathConstants<float>::pi * 2.8f,
+                                    true);
+    gainSlider.setDoubleClickReturnValue (true, 0.0);
+    gainSlider.setColour (juce::Slider::textBoxTextColourId, miami::brightMint);
+    gainSlider.setColour (juce::Slider::textBoxBackgroundColourId, miami::midnightArcade);
+    gainSlider.setColour (juce::Slider::textBoxOutlineColourId,
+                          miami::radicalBlue.withAlpha (0.55f));
+    gainSlider.getProperties().set ("dotRing", true);
+    gainSlider.setName ("Velocity");
+    gainSlider.setDescription ("Scales outgoing MIDI velocity in decibels");
+    addAndMakeVisible (gainSlider);
+}
+
+void PluginEditor::selectPreset (int index)
+{
+    if (presetManager == nullptr || ! presetManager->loadPreset (index))
+        return;
+
+    updatingPresetSelector = true;
+    presetSelector.setSelectedId (presetManager->getCurrentIndex() + 1,
+                                  juce::dontSendNotification);
+    updatingPresetSelector = false;
+
+    refreshChordReadout();
 }
 
 //==============================================================================
 void PluginEditor::paint (juce::Graphics& g)
 {
+    using namespace wicky::ui;
+
     const auto bounds = getLocalBounds().toFloat();
 
-    // Deep matte dark background, with a barely-there electric-blue bloom
-    // behind the title.
-    g.setColour (wicky::ui::miami::midnightArcade);
+    // Deep matte dark background, with a barely-there electric-blue bloom.
+    g.setColour (miami::midnightArcade);
     g.fillRect (bounds);
 
     g.setGradientFill (juce::ColourGradient (
-        wicky::ui::miami::radicalBlue.withAlpha (0.10f), bounds.getCentreX(), bounds.getY(),
+        miami::radicalBlue.withAlpha (0.10f), bounds.getCentreX(), bounds.getY(),
         juce::Colours::transparentBlack, bounds.getCentreX(), bounds.getHeight() * 0.42f,
         false));
     g.fillRect (bounds);
 
-    g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.55f));
+    g.setColour (miami::radicalBlue.withAlpha (0.55f));
     g.drawRoundedRectangle (bounds.reduced (0.5f), 8.0f, 1.0f);
 
-    g.setColour (wicky::ui::miami::fluorescentPink.withAlpha (0.18f));
+    g.setColour (miami::fluorescentPink.withAlpha (0.18f));
     g.drawRoundedRectangle (bounds.reduced (3.5f), 6.0f, 1.0f);
 
     const auto bracketInset = 8.0f;
@@ -104,75 +247,50 @@ void PluginEditor::paint (juce::Graphics& g)
     drawCornerBracket (g, { bounds.getRight() - bracketInset, bounds.getBottom() - bracketInset },
                        -1.0f, -1.0f);
 
-    // -------------------------------------------------------------------------
-    // Header
-    // -------------------------------------------------------------------------
-    if (! headerArea.isEmpty())
+    // Top status bar card.
+    if (! statusArea.isEmpty())
     {
-        auto header = headerArea.toFloat();
-        const auto headerHeight = header.getHeight();
+        auto status = statusArea.toFloat();
 
-        auto titleArea = header.removeFromTop (headerHeight * 0.62f);
-        auto subtitleArea = header.removeFromTop (headerHeight * 0.23f);
+        g.setColour (miami::controlFace.withAlpha (0.94f));
+        g.fillRoundedRectangle (status, 8.0f);
 
-        const auto titleFont = boilerplate::ui::fonts::oxanium (
-            juce::jlimit (18.0f, 26.0f, static_cast<float> (getHeight()) * 0.043f), 700.0f)
-                                   .withExtraKerningFactor (0.07f);
+        g.setColour (miami::radicalBlue.withAlpha (0.90f));
+        g.drawRoundedRectangle (status.reduced (0.5f), 8.0f, 1.4f);
 
-        g.setFont (titleFont);
-        g.setColour (wicky::ui::miami::fluorescentPink.withAlpha (0.35f));
-        g.drawText (JucePlugin_Name, titleArea.translated (0.0f, 1.5f),
-                    juce::Justification::centred, false);
-
-        g.setColour (wicky::ui::miami::textPrimary);
-        g.drawText (JucePlugin_Name, titleArea, juce::Justification::centred, false);
-
-        const auto subtitleFont = boilerplate::ui::fonts::oxanium (
-            juce::jmax (8.5f, static_cast<float> (getHeight()) * 0.018f), 700.0f)
-                                      .withExtraKerningFactor (0.22f);
-
-        g.setFont (subtitleFont);
-        g.setColour (wicky::ui::miami::highlighterYellow.withAlpha (0.88f));
-        g.drawText ("CHORD MATRIX  //  MIDI VELOCITY", subtitleArea,
-                    juce::Justification::centred, false);
-
-        juce::ColourGradient underline (
-            wicky::ui::miami::radicalBlue, static_cast<float> (headerArea.getX()), 0.0f,
-            wicky::ui::miami::fluorescentPink, static_cast<float> (headerArea.getRight()), 0.0f,
-            false);
-        underline.addColour (0.72, wicky::ui::miami::brightMint);
-
-        g.setGradientFill (underline);
-        g.fillRect (headerArea.getX(), headerArea.getBottom() - 2,
-                    headerArea.getWidth(), 2);
+        g.setColour (miami::highlighterYellow);
+        g.fillRect (status.getX() + 12.0f, status.getBottom() - 2.0f,
+                    juce::jmin (180.0f, status.getWidth() - 24.0f), 2.0f);
     }
 
-    // -------------------------------------------------------------------------
-    // Output strip
-    // -------------------------------------------------------------------------
-    if (! controlsArea.isEmpty())
+    // The large chord readout sits in its own neon pill.
+    if (! chordReadout.getBounds().isEmpty())
     {
-        const auto card = controlsArea.toFloat();
+        auto pill = chordReadout.getBounds().toFloat().expanded (10.0f, 4.0f);
 
-        g.setColour (wicky::ui::miami::controlFace.withAlpha (0.92f));
-        g.fillRoundedRectangle (card, 8.0f);
+        g.setColour (miami::midnightArcade.withAlpha (0.92f));
+        g.fillRoundedRectangle (pill, 8.0f);
 
-        g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.80f));
-        g.drawRoundedRectangle (card.reduced (0.5f), 8.0f, 1.2f);
+        g.setColour (lastSoundState
+                         ? miami::brightMint.withAlpha (0.90f)
+                         : miami::fluorescentPink.withAlpha (0.48f));
+        g.drawRoundedRectangle (pill.reduced (0.5f), 8.0f, 1.3f);
 
-        g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.35f));
-        g.fillRect (controlsArea.getCentreX(),
-                    controlsArea.getY() + 12,
-                    1, juce::jmax (0, controlsArea.getHeight() - 24));
-
-        g.setColour (wicky::ui::miami::brightMint.withAlpha (0.85f));
-        g.fillEllipse (static_cast<float> (controlsArea.getRight() - 22),
-                       static_cast<float> (controlsArea.getY() + 14), 5.0f, 5.0f);
+        g.setColour (miami::brightMint.withAlpha (0.20f));
+        g.fillEllipse (pill.getRight() - 16.0f, pill.getY() + 8.0f, 4.0f, 4.0f);
     }
 
-    // -------------------------------------------------------------------------
-    // Footer
-    // -------------------------------------------------------------------------
+    // Keyboard frame.
+    if (! keyboardArea.isEmpty())
+    {
+        g.setColour (miami::fluorescentPink.withAlpha (0.90f));
+        g.drawRoundedRectangle (keyboardArea.toFloat().expanded (1.0f), 4.0f, 1.5f);
+
+        g.setColour (miami::radicalBlue.withAlpha (0.45f));
+        g.fillRect (keyboardArea.getX(), keyboardArea.getY() - 4,
+                    keyboardArea.getWidth(), 1);
+    }
+
     if (! footerArea.isEmpty())
     {
         const auto footerFont = boilerplate::ui::fonts::oxanium (
@@ -180,48 +298,184 @@ void PluginEditor::paint (juce::Graphics& g)
                                     .withExtraKerningFactor (0.12f);
 
         g.setFont (footerFont);
-        g.setColour (wicky::ui::miami::fluorescentPink.withAlpha (0.70f));
-        g.drawText ("MIAMI NIGHTS", footerArea, juce::Justification::centred, false);
+        g.setColour (miami::fluorescentPink.withAlpha (0.70f));
+        g.drawText ("WICKY CHORDINATOR  //  MIAMI NIGHTS",
+                    footerArea, juce::Justification::centred, false);
     }
 }
 
 void PluginEditor::resized()
 {
-    auto area = getLocalBounds().reduced (scaled (16));
+    auto area = getLocalBounds().reduced (scaled (14));
 
-    headerArea = area.removeFromTop (scaled (58));
+    statusArea = area.removeFromTop (scaled (74));
     area.removeFromTop (scaled (8));
 
-    footerArea = area.removeFromBottom (scaled (18));
-    area.removeFromBottom (scaled (2));
+    footerArea = area.removeFromBottom (scaled (16));
+    area.removeFromBottom (scaled (4));
 
-    const auto controlsHeight = juce::jlimit (scaled (78), scaled (92),
-                                              area.getHeight() / 5);
+    keyboardArea = area.removeFromBottom (scaled (66));
+    area.removeFromBottom (scaled (6));
 
-    controlsArea = area.removeFromBottom (controlsHeight);
-    area.removeFromBottom (scaled (10));
+    keyMapArea = area.removeFromBottom (scaled (30));
+    area.removeFromBottom (scaled (8));
 
-    chordPanel.setBounds (area);
+    leftColumnArea = area.removeFromLeft (
+        juce::roundToInt (static_cast<float> (area.getWidth()) * 0.56f));
+    area.removeFromLeft (scaled (8));
+    rightColumnArea = area;
 
-    auto knobArea = controlsArea.reduced (scaled (14), scaled (6))
-                               .removeFromLeft (controlsArea.getWidth() / 2);
+    chordPanel.setBounds (leftColumnArea);
+    globalPanel.setBounds (rightColumnArea);
+    keyMapBar.setBounds (keyMapArea);
+    chordKeyboard.setBounds (keyboardArea);
 
-    gainSlider.setBounds (knobArea.withSizeKeepingCentre (
-        juce::jmin (knobArea.getWidth(), scaled (170)),
-        juce::jmin (knobArea.getHeight(), scaled (80))));
+    if (keyboardArea.getWidth() > 0)
+        chordKeyboard.setKeyWidth (juce::jmax (12.0f,
+            static_cast<float> (keyboardArea.getWidth()) / 22.0f));
 
-    auto buttonArea = controlsArea.reduced (scaled (14), scaled (6))
-                                 .withTrimmedLeft (controlsArea.getWidth() / 2);
+    layoutStatusBar (statusArea);
+}
 
-    bypassButton.setBounds (buttonArea.withSizeKeepingCentre (
-        juce::jmin (buttonArea.getWidth(), scaled (168)),
-        juce::jmin (buttonArea.getHeight(), scaled (36))));
+void PluginEditor::layoutStatusBar (juce::Rectangle<int> area)
+{
+    auto bar = area.reduced (scaled (6), scaled (5));
+
+    auto left = bar.removeFromLeft (scaled (370));
+
+    presetCaption.setBounds (left.removeFromLeft (scaled (54))
+                                 .reduced (0, scaled (11)));
+    presetSelector.setBounds (left.removeFromLeft (scaled (226))
+                                  .reduced (0, scaled (11)));
+    left.removeFromLeft (scaled (4));
+    presetPreviousButton.setBounds (left.removeFromLeft (scaled (32))
+                                        .reduced (0, scaled (11)));
+    left.removeFromLeft (scaled (4));
+    presetNextButton.setBounds (left.removeFromLeft (scaled (32))
+                                    .reduced (0, scaled (11)));
+
+    auto right = bar.removeFromRight (scaled (232));
+
+    powerButton.setBounds (right.removeFromRight (scaled (128))
+                               .reduced (0, scaled (9)));
+    right.removeFromRight (scaled (6));
+    gainSlider.setBounds (right.removeFromRight (scaled (90))
+                              .reduced (0, scaled (2)));
+
+    auto centre = bar;
+    chordCaption.setBounds (centre.removeFromTop (scaled (15)));
+    chordReadout.setBounds (centre);
 }
 
 int PluginEditor::scaled (int value) const noexcept
 {
-    const auto widthScale = (float) getWidth() / (float) designWidth;
-    const auto heightScale = (float) getHeight() / (float) designHeight;
+    const auto widthScale = static_cast<float> (getWidth()) / static_cast<float> (designWidth);
+    const auto heightScale = static_cast<float> (getHeight()) / static_cast<float> (designHeight);
 
-    return juce::roundToInt ((float) value * juce::jmin (widthScale, heightScale));
+    return juce::roundToInt (static_cast<float> (value)
+                             * juce::jmin (widthScale, heightScale));
+}
+
+//==============================================================================
+void PluginEditor::timerCallback()
+{
+    refreshChordReadout();
+
+    chordKeyboard.setActiveNotes (processorRef.getActiveInputNotes (0),
+                                  processorRef.getActiveInputNotes (1));
+}
+
+void PluginEditor::refreshChordReadout()
+{
+    const auto symbol = currentChordSymbol();
+    const auto sounding = processorRef.getNumSoundingChords() > 0;
+
+    if (chordReadout.getText() != symbol)
+        chordReadout.setText (symbol, juce::dontSendNotification);
+
+    if (sounding != lastSoundState)
+    {
+        lastSoundState = sounding;
+        chordReadout.setColour (juce::Label::textColourId,
+                                sounding ? wicky::ui::miami::brightMint
+                                         : wicky::ui::miami::textMuted);
+        repaint (statusArea);
+    }
+}
+
+juce::String PluginEditor::currentChordSymbol() const
+{
+    const auto rootNote = processorRef.getLastTriggeredChordNote();
+
+    if (rootNote < 0 || processorRef.getNumSoundingChords() <= 0)
+        return "--";
+
+    return chordSymbolFor (rootNote, processorRef.getLastTriggeredChordRecipe());
+}
+
+juce::String PluginEditor::chordSymbolFor (int rootNote,
+                                           const PluginProcessor::ChordRecipe& recipe)
+{
+    static const char* const noteNames[12] =
+    {
+        "C", "C#", "D", "D#", "E", "F",
+        "F#", "G", "G#", "A", "A#", "B"
+    };
+
+    static const char* const majorSuffix[11] =
+    {
+        "maj", "6", "maj7", "add9", "maj9", "6/9",
+        "maj11", "maj13", "7b5", "9#11", "13#11"
+    };
+
+    static const char* const minorSuffix[11] =
+    {
+        "m", "m6", "m7", "madd9", "m9", "m6/9",
+        "m11", "m13", "m7b5", "m9#11", "m13#11"
+    };
+
+    static const char* const dominantSuffix[11] =
+    {
+        "", "6", "7", "add9", "9", "6/9",
+        "11", "13", "7b5", "9#11", "13#11"
+    };
+
+    static const char* const otherSuffix[11] =
+    {
+        "dim", "dim6", "dim7", "dimadd9", "dim9", "dim6/9",
+        "dim11", "dim13", "m7b5", "m9#11", "m13#11"
+    };
+
+    const auto type = juce::jlimit (0, 3, recipe.chordType);
+    const auto complexity = juce::jlimit (0, 10, recipe.complexity);
+
+    const char* suffix = "";
+
+    switch (type)
+    {
+        case 0: suffix = majorSuffix[complexity]; break;
+        case 1: suffix = minorSuffix[complexity]; break;
+        case 2: suffix = dominantSuffix[complexity]; break;
+        default: suffix = otherSuffix[complexity]; break;
+    }
+
+    const juce::String root (noteNames[juce::jlimit (0, 127, rootNote) % 12]);
+    const juce::String suffixString (suffix);
+
+    return suffixString.isEmpty() ? root : root + " " + suffixString;
+}
+
+//==============================================================================
+void PluginEditor::handleNoteOn (juce::MidiKeyboardState*, int midiChannel,
+                                 int midiNoteNumber, float velocity)
+{
+    juce::ignoreUnused (midiChannel);
+    processorRef.queueKeyboardNote (true, midiNoteNumber, velocity);
+}
+
+void PluginEditor::handleNoteOff (juce::MidiKeyboardState*, int midiChannel,
+                                  int midiNoteNumber, float velocity)
+{
+    juce::ignoreUnused (midiChannel, velocity);
+    processorRef.queueKeyboardNote (false, midiNoteNumber, 0.0f);
 }

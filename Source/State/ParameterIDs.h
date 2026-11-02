@@ -6,12 +6,21 @@ namespace boilerplate::parameters
     // or automation will no longer map to the correct controls.
     inline constexpr auto gain = "gain";
     inline constexpr auto bypass = "bypass";
+    inline constexpr auto power = "power";
 
     // Chord Settings Matrix.
     inline constexpr auto chordType = "chord_type";
     inline constexpr auto complexity = "complexity";
     inline constexpr auto voicing = "voicing";
     inline constexpr auto pitchOffset = "pitch_offset";
+
+    // Global interaction engine.
+    inline constexpr auto spread = "spread";
+    inline constexpr auto spreadMode = "spread_mode";
+    inline constexpr auto humanize = "humanize";
+    inline constexpr auto noteOffMode = "note_off_mode";
+    inline constexpr auto strum = "strum";
+    inline constexpr auto strumMode = "strum_mode";
 
     inline constexpr int pitchOffsetMin = -12;
     inline constexpr int pitchOffsetMax = 12;
@@ -27,4 +36,14 @@ namespace boilerplate::parameters
     inline constexpr int complexityVersionHint = 3;
     inline constexpr int voicingVersionHint = 4;
     inline constexpr int pitchOffsetVersionHint = 5;
+
+    // Added for the 1000x580 interaction-engine expansion. All of these are
+    // newer than every released hint above and must remain in ascending order.
+    inline constexpr int powerVersionHint = 6;
+    inline constexpr int spreadVersionHint = 7;
+    inline constexpr int spreadModeVersionHint = 8;
+    inline constexpr int humanizeVersionHint = 9;
+    inline constexpr int noteOffModeVersionHint = 10;
+    inline constexpr int strumVersionHint = 11;
+    inline constexpr int strumModeVersionHint = 12;
 }

@@ -122,38 +122,58 @@ Windows, which may require elevation. Override the plugin's `VST3_COPY_DIR` in
 
 ## Parameters
 
-| ID       | Name        | Range                       | Default |
-| -------- | ----------- | --------------------------- | ------- |
-| `gain`   | Output Gain | -60 to +12 dB, 0.1 dB steps | 0 dB    |
-| `bypass` | Bypass      | on/off                      | off     |
+| ID              | Name          | Range                              | Default      |
+| --------------- | ------------- | ---------------------------------- | ------------ |
+| `gain`          | Velocity Gain | -60 to +12 dB, 0.1 dB steps        | 0 dB         |
+| `bypass`        | Bypass        | on/off                             | off          |
+| `power`         | Power         | on/off                             | on           |
+| `chord_type`    | Chord Type    | Major / Minor / Dominant / Other   | Major        |
+| `complexity`    | Complexity    | Triad … 13#11                      | Triad        |
+| `voicing`       | Voicing       | High / Root / Low                  | Root         |
+| `pitch_offset`  | Pitch Offset  | -12 to +12 semitones               | 0            |
+| `spread`        | Spread        | 0 to 100%                          | 0%           |
+| `spread_mode`   | Spread Mode   | Dense / Sparse                     | Dense        |
+| `humanize`      | Humanize      | 0 to 100%                          | 0%           |
+| `note_off_mode` | Note Off Mode | Simultaneous / Staggered           | Simultaneous |
+| `strum`         | Strum         | 0 to 100%                          | 0%           |
+| `strum_mode`    | Strum Mode    | Up / Down                          | Up           |
 
 The IDs in `Source/State/ParameterIDs.h` are the automation/preset contract.
-Do not rename them after release. Bypass is smoothed to unity gain, so toggling
-it during playback does not click.
+Do not rename them after release. `bypass` is the host-facing bypass parameter;
+`power` is the front-panel ON/OFF switch and is OR-ed with bypass inside the
+processor. New interaction parameters use AU version hints 6–12, above every
+previously released hint.
 
 ## Architecture
 
 ```
 Source/
-  PluginProcessor.*        Owns APVTS + DSP; bus layout, state, thin processBlock
-  PluginEditor.*           Layout and APVTS attachments only; no DSP
+  PluginProcessor.*        APVTS, lock-free parameter cache, chord engine,
+                           strum/humanize scheduler and per-key recipe atomics
+  PluginEditor.*           Status bar, preset navigation, power switch,
+                           chord readout and two-column editor layout
+  ChordSettingsPanel.h     Chord Settings, Global Settings, Key Map and
+                           ValueTree-backed factory preset manager
   DSP/GainProcessor.*      Smoothed gain/bypass, no allocation after prepare()
-  State/ParameterIDs.h     Stable IDs and AU version hint
+  State/ParameterIDs.h     Stable IDs and AU version hints
   State/ParameterLayout.*  Parameter definitions
-  UI/BoilerplateLookAndFeel.*  Vector-drawn panel, knob, and switch
+  UI/BoilerplateLookAndFeel.*  Vector-drawn panel, radial-dot knob and switch
 ```
 
 Data flow:
 
 ```
-host -> processBlock -> GainProcessor -> output buffer
+host MIDI -> processBlock -> chord engine (spread/humanize/strum) -> MIDI out
+audio buffer -> transparent pass-through
 APVTS -> cached std::atomic<float>* -> processBlock   (audio thread)
 editor controls -> APVTS attachments                  (message thread)
 ```
 
 `processBlock` allocates nothing, takes no locks, performs no I/O, and touches
-no JUCE `String`/`ValueTree` state. Keep it that way when extending the
-boilerplate. The project skills in `skills/` document the relevant rules:
+no JUCE `String`/`ValueTree` state. Strummed note-ons and staggered note-offs
+use a fixed-size pending-event array with an absolute sample clock, so events
+can cross block boundaries without allocation. Keep it that way when extending
+the boilerplate. The project skills in `skills/` document the relevant rules:
 `audio-dsp-review`, `audio-numerics-review`, `juce-review`, and
 `dsp-algorithm-guide`.
 

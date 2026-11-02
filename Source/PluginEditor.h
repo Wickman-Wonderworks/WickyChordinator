@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "ChordSettingsPanel.h"
@@ -7,7 +9,9 @@
 
 class PluginProcessor;
 
-class PluginEditor final : public juce::AudioProcessorEditor
+class PluginEditor final : public juce::AudioProcessorEditor,
+                           private juce::Timer,
+                           private juce::MidiKeyboardState::Listener
 {
 public:
     explicit PluginEditor (PluginProcessor& processor);
@@ -17,25 +21,59 @@ public:
     void resized() override;
 
 private:
+    //==========================================================================
+    void timerCallback() override;
+
+    void handleNoteOn (juce::MidiKeyboardState*, int midiChannel,
+                       int midiNoteNumber, float velocity) override;
+    void handleNoteOff (juce::MidiKeyboardState*, int midiChannel,
+                        int midiNoteNumber, float velocity) override;
+
+    //==========================================================================
     int scaled (int value) const noexcept;
 
+    void configureStatusBar();
+    void layoutStatusBar (juce::Rectangle<int> area);
+    void refreshChordReadout();
+    void selectPreset (int index);
+    juce::String currentChordSymbol() const;
+    static juce::String chordSymbolFor (int rootNote,
+                                        const PluginProcessor::ChordRecipe& recipe);
+
+    //==========================================================================
     PluginProcessor& processorRef;
     boilerplate::ui::BoilerplateLookAndFeel lookAndFeel;
+    std::unique_ptr<wicky::ui::PresetManager> presetManager;
 
-    juce::Rectangle<int> headerArea;
-    juce::Rectangle<int> controlsArea;
-    juce::Rectangle<int> footerArea;
-
-    // Declaration order matters: the panel owns parameter attachments that
-    // must be destroyed before the controls they point at.
-    ChordSettingsPanel chordPanel;
-
+    // Top status bar.
+    juce::Label presetCaption;
+    juce::ComboBox presetSelector;
+    juce::TextButton presetPreviousButton;
+    juce::TextButton presetNextButton;
+    juce::Label chordCaption;
+    juce::Label chordReadout;
+    juce::ToggleButton powerButton;
     juce::Slider gainSlider;
-    juce::ToggleButton bypassButton;
+
+    // Main two-column surface plus the shared key-map/keyboard strip.
+    wicky::ui::ChordSettingsPanel chordPanel;
+    wicky::ui::GlobalSettingsPanel globalPanel;
+    wicky::ui::KeyMapBar keyMapBar;
+    wicky::ui::ChordKeyboard chordKeyboard;
 
     // Declared after their controls so the attachments are destroyed first.
     juce::AudioProcessorValueTreeState::SliderAttachment gainAttachment;
-    juce::AudioProcessorValueTreeState::ButtonAttachment bypassAttachment;
+    juce::AudioProcessorValueTreeState::ButtonAttachment powerAttachment;
+
+    juce::Rectangle<int> statusArea;
+    juce::Rectangle<int> leftColumnArea;
+    juce::Rectangle<int> rightColumnArea;
+    juce::Rectangle<int> keyMapArea;
+    juce::Rectangle<int> keyboardArea;
+    juce::Rectangle<int> footerArea;
+
+    bool lastSoundState = false;
+    bool updatingPresetSelector = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginEditor)
 };

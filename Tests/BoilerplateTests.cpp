@@ -1,4 +1,5 @@
 #include "PluginProcessor.h"
+#include "ChordSettingsPanel.h"
 #include "DSP/GainProcessor.h"
 #include "State/ParameterIDs.h"
 #include "UI/OxaniumFonts.h"
@@ -285,6 +286,15 @@ namespace
         require (events.size() == 3, "Input note was not replaced by a triad");
         require (hasNoteOn (events, 0, 60) && hasNoteOn (events, 0, 64)
                  && hasNoteOn (events, 0, 67), "Incorrect C major triad");
+        require (processor.getLastTriggeredChordNote() == 60,
+                 "Last chord note was not recorded");
+        require (processor.getNumSoundingChords() > 0,
+                 "Sounding chord count was not recorded");
+
+        const auto lastRecipe = processor.getLastTriggeredChordRecipe();
+        require (lastRecipe.chordType == 0 && lastRecipe.complexity == 0
+                 && lastRecipe.voicing == 1 && lastRecipe.pitchOffset == 0,
+                 "Last chord recipe was not recorded");
 
         // Per-key assignment: D4 gets its own root without changing the matrix.
         auto dEvents = processMessages (processor, { noteOn (1, 62) });
@@ -572,6 +582,184 @@ namespace
                  "Virtual keyboard note-off was not mirrored to the UI mask");
     }
 
+    void testInteractionEngine()
+    {
+        PluginProcessor processor;
+        processor.prepareToPlay (48000.0, 64);
+        setChordMatrix (processor, 0, 0, 1, 0); // C major triad, root position.
+
+        const auto noteOn = [] (int channel, int note, int velocity = 100)
+        {
+            return juce::MidiMessage::noteOn (channel, note,
+                                              static_cast<juce::uint8> (velocity));
+        };
+
+        const auto noteOff = [] (int channel, int note)
+        {
+            return juce::MidiMessage::noteOff (channel, note);
+        };
+
+        // Spread = 100, Dense: the upper voices open by one and two octaves.
+        setParameter (processor, boilerplate::parameters::spread, 100.0f);
+        setParameter (processor, boilerplate::parameters::spreadMode, 0.0f);
+        auto spreadEvents = processMessages (processor, { noteOn (1, 60) });
+        require (hasNoteOn (spreadEvents, 0, 60)
+                 && hasNoteOn (spreadEvents, 0, 76)
+                 && hasNoteOn (spreadEvents, 0, 91),
+                 "Dense spread voicing is wrong");
+        processMessages (processor, { noteOff (1, 60) });
+        setParameter (processor, boilerplate::parameters::spread, 0.0f);
+
+        // Humanize must vary velocities inside a chord. Use a seven-note shape
+        // so a single chord contains enough rolls of the PRNG to observe it.
+        setChordMatrix (processor, 0, 10, 1, 0); // Major 13#11
+        setParameter (processor, boilerplate::parameters::humanize, 100.0f);
+
+        bool sawVelocityVariation = false;
+        auto humanized = processMessages (processor, { noteOn (1, 60) });
+        int firstVelocity = -1;
+
+        for (const auto& event : humanized)
+        {
+            if (event.status != 0x90 || event.data2 <= 0)
+                continue;
+
+            if (firstVelocity < 0)
+                firstVelocity = event.data2;
+            else if (event.data2 != firstVelocity)
+                sawVelocityVariation = true;
+        }
+
+        require (sawVelocityVariation, "Humanize did not vary chord velocities");
+        processMessages (processor, { noteOff (1, 60) });
+        setParameter (processor, boilerplate::parameters::humanize, 0.0f);
+
+        // Strum Up: only the root is allowed through on the first block, and
+        // the remaining tones arrive over subsequent blocks.
+        setChordMatrix (processor, 0, 0, 1, 0);
+        setParameter (processor, boilerplate::parameters::strum, 100.0f);
+        setParameter (processor, boilerplate::parameters::strumMode, 0.0f);
+
+        auto firstStrumBlock = processMessages (processor, { noteOn (1, 60) });
+        require (countNoteOns (firstStrumBlock) == 1,
+                 "Strum emitted more than one tone in the first block");
+        require (hasNoteOn (firstStrumBlock, 0, 60),
+                 "Strum Up did not start from the lowest chord tone");
+
+        std::vector<CapturedEvent> strumEvents = firstStrumBlock;
+
+        for (int block = 0; block < 120; ++block)
+        {
+            auto pending = processMessages (processor, {});
+            strumEvents.insert (strumEvents.end(), pending.begin(), pending.end());
+        }
+
+        require (hasNoteOn (strumEvents, 0, 60)
+                 && hasNoteOn (strumEvents, 0, 64)
+                 && hasNoteOn (strumEvents, 0, 67),
+                 "Strum Up did not deliver every chord tone");
+        processMessages (processor, { noteOff (1, 60) });
+
+        // Strum Down starts from the highest chord tone.
+        setParameter (processor, boilerplate::parameters::strumMode, 1.0f);
+        auto downStrumBlock = processMessages (processor, { noteOn (1, 60) });
+        require (countNoteOns (downStrumBlock) == 1,
+                 "Down strum emitted more than one tone in the first block");
+        require (hasNoteOn (downStrumBlock, 0, 67),
+                 "Strum Down did not start from the highest chord tone");
+
+        for (int block = 0; block < 120; ++block)
+            processMessages (processor, {});
+
+        processMessages (processor, { noteOff (1, 60) });
+        setParameter (processor, boilerplate::parameters::strum, 0.0f);
+        setParameter (processor, boilerplate::parameters::strumMode, 0.0f);
+
+        // Staggered release: the first note-off is immediate, the remaining
+        // chord tones release over later blocks.
+        setParameter (processor, boilerplate::parameters::noteOffMode, 1.0f);
+        processMessages (processor, { noteOn (1, 60) });
+
+        auto firstOffBlock = processMessages (processor, { noteOff (1, 60) });
+        require (! firstOffBlock.empty(), "Staggered release emitted no note-off");
+        require (hasNoteOff (firstOffBlock, 0, 60),
+                 "Staggered release did not start at the lowest chord tone");
+
+        std::vector<CapturedEvent> staggeredOffs = firstOffBlock;
+
+        for (int block = 0; block < 120; ++block)
+        {
+            auto pending = processMessages (processor, {});
+            staggeredOffs.insert (staggeredOffs.end(), pending.begin(), pending.end());
+        }
+
+        require (hasNoteOff (staggeredOffs, 0, 60)
+                 && hasNoteOff (staggeredOffs, 0, 64)
+                 && hasNoteOff (staggeredOffs, 0, 67),
+                 "Staggered release did not deliver every note-off");
+
+        setParameter (processor, boilerplate::parameters::noteOffMode, 0.0f);
+
+        // The global power switch must behave like bypass: one pass-through
+        // note instead of a generated chord.
+        setParameter (processor, boilerplate::parameters::power, 0.0f);
+        auto poweredOff = processMessages (processor, { noteOn (1, 60) });
+        require (countNoteOns (poweredOff) == 1
+                 && hasNoteOn (poweredOff, 0, 60)
+                 && ! hasNoteOn (poweredOff, 0, 64),
+                 "Power OFF did not pass the input through");
+        processMessages (processor, { noteOff (1, 60) });
+        setParameter (processor, boilerplate::parameters::power, 1.0f);
+    }
+
+    void testPresetManager()
+    {
+        PluginProcessor processor;
+        processor.prepareToPlay (48000.0, 64);
+        processor.setKeyRecipe (60, { 2, 4, 2, -3 });
+
+        wicky::ui::PresetManager presets (processor.getValueTreeState());
+        require (presets.getNumPresets() > 1, "Preset bank is empty");
+        require (presets.getName (0) == "Init", "First preset is not Init");
+
+        require (presets.loadPreset (1), "Could not load the second preset");
+        require (presets.getCurrentIndex() == 1, "Preset index did not advance");
+
+        auto& parameters = processor.getValueTreeState();
+        require (std::abs (parameters.getRawParameterValue (
+                               boilerplate::parameters::spread)->load() - 32.0f) < 0.01f,
+                 "Preset did not apply Spread");
+        require (std::abs (parameters.getRawParameterValue (
+                               boilerplate::parameters::strum)->load() - 22.0f) < 0.01f,
+                 "Preset did not apply Strum");
+
+        // Loading a global preset must not erase per-key recipes.
+        const auto recipe = processor.getKeyRecipe (60);
+        require (recipe.chordType == 2 && recipe.complexity == 4
+                 && recipe.voicing == 2 && recipe.pitchOffset == -3,
+                 "Preset load destroyed a per-key recipe");
+
+        require (presets.loadPrevious(), "Previous preset navigation failed");
+        require (presets.getCurrentIndex() == 0, "Previous preset index is wrong");
+
+        require (presets.loadNext(), "Next preset navigation failed");
+        require (presets.getCurrentIndex() == 1, "Next preset index is wrong");
+
+        // A preset manager created while the live state is modified must still
+        // offer a deterministic Init preset based on parameter defaults.
+        wicky::ui::PresetManager rebuiltPresets (processor.getValueTreeState());
+        require (rebuiltPresets.loadPreset (0), "Could not load Init");
+        require (std::abs (parameters.getRawParameterValue (
+                               boilerplate::parameters::spread)->load()) < 0.01f,
+                 "Init preset inherited the live Spread value");
+        require (std::abs (parameters.getRawParameterValue (
+                               boilerplate::parameters::strum)->load()) < 0.01f,
+                 "Init preset inherited the live Strum value");
+        require (std::abs (parameters.getRawParameterValue (
+                               boilerplate::parameters::chordType)->load()) < 0.01f,
+                 "Init preset inherited the live Chord Type");
+    }
+
     void testStateAndProcessing()
     {
         PluginProcessor source;
@@ -581,6 +769,13 @@ namespace
         setParameter (source, boilerplate::parameters::complexity, 6.0f);
         setParameter (source, boilerplate::parameters::voicing, 2.0f);
         setParameter (source, boilerplate::parameters::pitchOffset, 5.0f);
+        setParameter (source, boilerplate::parameters::power, 0.0f);
+        setParameter (source, boilerplate::parameters::spread, 72.0f);
+        setParameter (source, boilerplate::parameters::spreadMode, 1.0f);
+        setParameter (source, boilerplate::parameters::humanize, 33.0f);
+        setParameter (source, boilerplate::parameters::noteOffMode, 1.0f);
+        setParameter (source, boilerplate::parameters::strum, 44.0f);
+        setParameter (source, boilerplate::parameters::strumMode, 1.0f);
         juce::MemoryBlock state;
         source.getStateInformation (state);
         require (state.getSize() > 0, "Empty saved state");
@@ -600,6 +795,20 @@ namespace
                           - 2.0f) < 0.01f, "Voicing recall failed");
         require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::pitchOffset)->load()
                           - 5.0f) < 0.01f, "Pitch offset recall failed");
+        require (parameters.getRawParameterValue (boilerplate::parameters::power)->load() < 0.5f,
+                 "Power recall failed");
+        require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::spread)->load()
+                          - 72.0f) < 0.01f, "Spread recall failed");
+        require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::spreadMode)->load()
+                          - 1.0f) < 0.01f, "Spread mode recall failed");
+        require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::humanize)->load()
+                          - 33.0f) < 0.01f, "Humanize recall failed");
+        require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::noteOffMode)->load()
+                          - 1.0f) < 0.01f, "Note-off mode recall failed");
+        require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::strum)->load()
+                          - 44.0f) < 0.01f, "Strum recall failed");
+        require (std::abs (parameters.getRawParameterValue (boilerplate::parameters::strumMode)->load()
+                          - 1.0f) < 0.01f, "Strum mode recall failed");
         require (restored.getBypassParameter() == parameters.getParameter (boilerplate::parameters::bypass),
                  "Wrong host bypass parameter");
         require (parameters.getParameter (boilerplate::parameters::gain)->getVersionHint() == 1
@@ -609,6 +818,14 @@ namespace
                  && parameters.getParameter (boilerplate::parameters::voicing)->getVersionHint() == 4
                  && parameters.getParameter (boilerplate::parameters::pitchOffset)->getVersionHint() == 5,
                  "Chord matrix AU hints changed");
+        require (parameters.getParameter (boilerplate::parameters::power)->getVersionHint() == 6
+                 && parameters.getParameter (boilerplate::parameters::spread)->getVersionHint() == 7
+                 && parameters.getParameter (boilerplate::parameters::spreadMode)->getVersionHint() == 8
+                 && parameters.getParameter (boilerplate::parameters::humanize)->getVersionHint() == 9
+                 && parameters.getParameter (boilerplate::parameters::noteOffMode)->getVersionHint() == 10
+                 && parameters.getParameter (boilerplate::parameters::strum)->getVersionHint() == 11
+                 && parameters.getParameter (boilerplate::parameters::strumMode)->getVersionHint() == 12,
+                 "Interaction engine AU hints changed");
 
         restored.setStateInformation (nullptr, 0);
         juce::MemoryBlock unrelated;
@@ -696,6 +913,8 @@ int main (int argc, char** argv)
             testChordEngine();
             testPerKeyRecipes();
             testVirtualKeyboardBridge();
+            testInteractionEngine();
+            testPresetManager();
             testStateAndProcessing();
         }
         std::cout << "Passed\n";

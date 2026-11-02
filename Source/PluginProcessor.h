@@ -59,6 +59,12 @@ public:
     /** Queues a virtual-keyboard note for the next processBlock without locking. */
     void queueKeyboardNote (bool noteOn, int midiNote, float velocity) noexcept;
 
+    /** Last trigger key that started a chord (message-thread safe). */
+    int getLastTriggeredChordNote() const noexcept;
+
+    /** Number of currently held/generated chords (message-thread safe). */
+    int getNumSoundingChords() const noexcept;
+
     //==========================================================================
     /** One chord assignment for a single MIDI note. */
     struct ChordRecipe
@@ -68,6 +74,9 @@ public:
         int voicing = 1;     // 0..2 (High/Root/Low)
         int pitchOffset = 0; // -12..+12
     };
+
+    /** Evaluated recipe that generated the last chord (message-thread safe). */
+    ChordRecipe getLastTriggeredChordRecipe() const noexcept;
 
     /** Message-thread API for the per-key recipe map. Safe while audio runs. */
     void setKeyRecipe (int midiNote, ChordRecipe recipe) noexcept;
@@ -117,6 +126,16 @@ private:
     std::atomic<float>* voicingParam = nullptr;
     std::atomic<float>* pitchOffsetParam = nullptr;
 
+    // Global interaction engine. These pointers are cached alongside the chord
+    // matrix and read with relaxed ordering inside processBlock.
+    std::atomic<float>* powerParam = nullptr;
+    std::atomic<float>* spreadParam = nullptr;
+    std::atomic<float>* spreadModeParam = nullptr;
+    std::atomic<float>* humanizeParam = nullptr;
+    std::atomic<float>* noteOffModeParam = nullptr;
+    std::atomic<float>* strumParam = nullptr;
+    std::atomic<float>* strumModeParam = nullptr;
+
     // Audio-thread scratch for the copy-then-swap MIDI pass. Preallocated in
     // prepareToPlay so processBlock never has to grow it.
     juce::MidiBuffer midiSwapBuffer;
@@ -141,7 +160,8 @@ private:
     void restoreKeyRecipeState (const juce::ValueTree& state);
 
     //==========================================================================
-    // Chord engine state. Everything below is touched only by the audio thread.
+    // Chord engine state. Everything below is touched only by the audio thread
+    // unless explicitly marked otherwise.
     static constexpr int maxChordTones = 8;
     static constexpr int maxActiveChords = 128;
     static constexpr int midiChannels = 16;
@@ -152,25 +172,93 @@ private:
         int channel = 0;
         int numNotes = 0;
         juce::uint8 notes[maxChordTones] {};
+        bool noteOnSent[maxChordTones] {};
     };
 
+    // A note-on or note-off that could not be placed inside the current block.
+    // The array is preallocated: no allocation is ever performed for strumming
+    // or staggered releases.
+    struct PendingNote
+    {
+        int chordIndex = -1; // -1 for a note-off (not owned by a chord slot).
+        int noteIndex = 0;
+        int channel = 0;
+        int note = 0;
+        juce::uint8 velocity = 0;
+        juce::int64 dueSample = 0;
+        bool isNoteOn = false;
+        bool active = false;
+    };
+
+    static constexpr int maxPendingNotes = 512;
+
     ActiveChord activeChords[maxActiveChords];
+    PendingNote pendingNotes[maxPendingNotes] {};
     juce::uint8 noteRefCounts[midiChannels][128] {};
     bool wasBypassed = false;
 
+    // Snapshot of the block-local engine settings, refreshed at the start of
+    // processBlock and consumed by the chord helpers below.
+    int currentBlockSize = 0;
+    int currentStrumStepSamples = 0;
+    int currentStaggerStepSamples = 0;
+    int currentNoteOffMode = 0;
+    int currentSpreadMode = 0;
+    int currentStrumMode = 0;
+    float currentSpreadAmount = 0.0f;
+    float currentHumanizeAmount = 0.0f;
+    bool currentBypassState = false;
+
+    // Monotonic sample clock for the pending strum/stagger scheduler. Only the
+    // audio thread touches it.
+    juce::int64 totalSamplesProcessed = 0;
+
+    // Relaxed-atomic PRNG state. Only the audio thread advances it; the message
+    // thread may re-seed it while the engine is stopped.
+    std::atomic<juce::uint32> humanizeSeed { 0x9e3779b9u };
+
+    // Message-thread-safe chord status for the editor's symbol readout.
+    std::atomic<int> lastTriggeredChordNote { -1 };
+    std::atomic<juce::uint32> lastTriggeredRecipe { 0 };
+    std::atomic<int> soundingChordCount { 0 };
+
     void resetChordState() noexcept;
+
     int buildChordNotes (int triggerNote, int chordType, int complexity,
                          int voicing, int pitchOffset,
+                         float spreadAmount, int spreadMode,
                          juce::uint8* notesOut) const noexcept;
+
     bool startChord (int triggerNote, int channel, juce::uint8 velocity,
                      int chordType, int complexity, int voicing, int pitchOffset,
                      juce::MidiBuffer& output, int samplePosition) noexcept;
+
     void stopChord (ActiveChord& chord, juce::MidiBuffer& output,
                     int samplePosition) noexcept;
+
     int findActiveChord (int triggerNote, int channel) const noexcept;
     bool isNoteActive (int channel, int note) const noexcept;
     void releaseAllChords (juce::MidiBuffer& output, int samplePosition,
                            int channel = -1) noexcept;
+
+    //==========================================================================
+    // Strum / humanize / staggered-release plumbing.
+    void emitNoteOn (int chordIndex, int noteIndex, int note, int channel,
+                     juce::uint8 velocity, int samplePosition,
+                     juce::MidiBuffer& output) noexcept;
+
+    void scheduleNoteOn (int chordIndex, int noteIndex, int note, int channel,
+                         juce::uint8 velocity, int targetSample,
+                         juce::MidiBuffer& output) noexcept;
+
+    void scheduleNoteOff (int channel, int note, int targetSample,
+                          juce::MidiBuffer& output) noexcept;
+
+    void processPendingNotes (juce::MidiBuffer& output, int numSamples) noexcept;
+    void cancelPendingNotesForChord (int chordIndex) noexcept;
+
+    juce::uint32 nextRandom() noexcept;
+    juce::uint8 humanizedVelocity (juce::uint8 velocity) noexcept;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginProcessor)
 };

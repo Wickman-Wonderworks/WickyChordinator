@@ -10,6 +10,9 @@ namespace
     constexpr int kMaxChordTones = 8; // Matches PluginProcessor::maxChordTones.
     constexpr int chordTypeCount = 4;
     constexpr int complexityCount = 11;
+    constexpr float maxStrumSecondsPerStep = 0.060f;
+    constexpr float minStaggerSecondsPerStep = 0.020f;
+    constexpr int maxHumanizeVelocityDeviation = 15;
 
     struct ChordShape
     {
@@ -90,6 +93,35 @@ namespace
         }
     }
 
+    /**
+        Spread opens the chord away from a close-position voicing.
+
+        Dense keeps every chord tone and pushes the upper voices out gradually,
+        while Sparse keeps the bass/root in place and lifts the remaining voices
+        together. Both modes are exactly zero at Spread = 0 so existing presets
+        and per-key recipes remain bit-for-bit compatible.
+    */
+    int spreadOffsetForNote (int noteIndex, int numNotes,
+                             float spreadAmount, int spreadMode) noexcept
+    {
+        if (spreadAmount <= 0.0f || numNotes <= 1 || noteIndex <= 0)
+            return 0;
+
+        const auto amount = juce::jlimit (0.0f, 1.0f, spreadAmount);
+        const auto octaves = amount < 0.34f ? 0 : (amount < 0.67f ? 1 : 2);
+
+        if (octaves == 0)
+            return 0;
+
+        if (spreadMode == 1) // Sparse: bass stays put, upper voices lift.
+            return octaves * 12;
+
+        // Dense: progressively open the upper voices across the chord.
+        const auto position = static_cast<float> (noteIndex)
+                            / static_cast<float> (numNotes - 1);
+        return juce::roundToInt (position * static_cast<float> (octaves)) * 12;
+    }
+
     const juce::Identifier keyRecipesStateTag ("KeyRecipes");
     const juce::Identifier keyRecipeStateTag ("Key");
 
@@ -117,6 +149,15 @@ PluginProcessor::PluginProcessor()
     voicingParam = apvts.getRawParameterValue (boilerplate::parameters::voicing);
     pitchOffsetParam = apvts.getRawParameterValue (boilerplate::parameters::pitchOffset);
 
+    // Global interaction engine: same lock-free caching contract.
+    powerParam = apvts.getRawParameterValue (boilerplate::parameters::power);
+    spreadParam = apvts.getRawParameterValue (boilerplate::parameters::spread);
+    spreadModeParam = apvts.getRawParameterValue (boilerplate::parameters::spreadMode);
+    humanizeParam = apvts.getRawParameterValue (boilerplate::parameters::humanize);
+    noteOffModeParam = apvts.getRawParameterValue (boilerplate::parameters::noteOffMode);
+    strumParam = apvts.getRawParameterValue (boilerplate::parameters::strum);
+    strumModeParam = apvts.getRawParameterValue (boilerplate::parameters::strumMode);
+
     jassert (gainDbParameter != nullptr);
     jassert (bypassParameter != nullptr);
     jassert (bypassParameterObject != nullptr);
@@ -124,12 +165,21 @@ PluginProcessor::PluginProcessor()
     jassert (complexityParam != nullptr);
     jassert (voicingParam != nullptr);
     jassert (pitchOffsetParam != nullptr);
+    jassert (powerParam != nullptr);
+    jassert (spreadParam != nullptr);
+    jassert (spreadModeParam != nullptr);
+    jassert (humanizeParam != nullptr);
+    jassert (noteOffModeParam != nullptr);
+    jassert (strumParam != nullptr);
+    jassert (strumModeParam != nullptr);
 
     for (auto& recipe : keyRecipes)
         recipe.store (0, std::memory_order_relaxed);
 
     for (auto& word : activeInputNotes)
         word.store (0, std::memory_order_relaxed);
+
+    humanizeSeed.store (0x9e3779b9u, std::memory_order_relaxed);
 
     // Reserved on the message thread so the audio callback never grows it.
     keyboardEventBuffer.ensureSize (keyboardEventBufferBytes);
@@ -175,6 +225,21 @@ juce::uint64 PluginProcessor::getActiveInputNotes (const int wordIndex) const no
         return 0;
 
     return activeInputNotes[wordIndex].load (std::memory_order_relaxed);
+}
+
+int PluginProcessor::getLastTriggeredChordNote() const noexcept
+{
+    return lastTriggeredChordNote.load (std::memory_order_relaxed);
+}
+
+PluginProcessor::ChordRecipe PluginProcessor::getLastTriggeredChordRecipe() const noexcept
+{
+    return unpackKeyRecipe (lastTriggeredRecipe.load (std::memory_order_relaxed));
+}
+
+int PluginProcessor::getNumSoundingChords() const noexcept
+{
+    return soundingChordCount.load (std::memory_order_relaxed);
 }
 
 void PluginProcessor::queueKeyboardNote (const bool noteOn, const int midiNote,
@@ -298,6 +363,13 @@ void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     keyboardEventBuffer.ensureSize (keyboardEventBufferBytes);
     keyboardEventFifo.reset();
 
+    // Re-seed the relaxed PRNG at preparation time. The audio thread only ever
+    // performs relaxed loads/stores on this atomic, so no lock or allocation is
+    // introduced into processBlock.
+    humanizeSeed.store (static_cast<juce::uint32> (juce::Random::getSystemRandom().nextInt()),
+                        std::memory_order_relaxed);
+
+    totalSamplesProcessed = 0;
     resetChordState();
     wasBypassed = bypassParameter != nullptr && bypassParameter->load() > 0.5f;
 }
@@ -319,8 +391,16 @@ void PluginProcessor::resetChordState() noexcept
     for (auto& chord : activeChords)
         chord = {};
 
+    for (auto& pending : pendingNotes)
+        pending = {};
+
     std::memset (noteRefCounts, 0, sizeof (noteRefCounts));
     clearInputNotes();
+
+    lastTriggeredChordNote.store (-1, std::memory_order_relaxed);
+    lastTriggeredRecipe.store (0, std::memory_order_relaxed);
+    soundingChordCount.store (0, std::memory_order_relaxed);
+    totalSamplesProcessed = 0;
 }
 
 bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -417,6 +497,7 @@ PluginProcessor::ChordRecipe PluginProcessor::getKeyRecipe (int midiNote) const 
 //==============================================================================
 int PluginProcessor::buildChordNotes (int triggerNote, int chordType, int complexity,
                                       int voicing, int pitchOffset,
+                                      float spreadAmount, int spreadMode,
                                       juce::uint8* notesOut) const noexcept
 {
     if (notesOut == nullptr)
@@ -444,12 +525,22 @@ int PluginProcessor::buildChordNotes (int triggerNote, int chordType, int comple
     pitchOffset = juce::jlimit (boilerplate::parameters::pitchOffsetMin,
                                 boilerplate::parameters::pitchOffsetMax,
                                 pitchOffset);
+    spreadMode = juce::jlimit (0, 1, spreadMode);
 
     const auto& shape = chordShapes[chordType][complexity];
     const auto numTones = juce::jlimit (0, maxChordTones, shape.numTones);
 
     if (numTones == 0)
         return 0;
+
+    int spreadOffsets[maxChordTones] {};
+    int maxSpreadOffset = 0;
+
+    for (int i = 0; i < numTones; ++i)
+    {
+        spreadOffsets[i] = spreadOffsetForNote (i, numTones, spreadAmount, spreadMode);
+        maxSpreadOffset = juce::jmax (maxSpreadOffset, spreadOffsets[i]);
+    }
 
     // Per-key assignment: the trigger key is the chord root, so different keys
     // and octaves generate different chords from the same matrix state.
@@ -458,7 +549,7 @@ int PluginProcessor::buildChordNotes (int triggerNote, int chordType, int comple
     // Keep the whole shape inside the MIDI range by moving it in octaves. This
     // preserves the intervals instead of folding individual notes into a
     // different inversion.
-    const auto highestInterval = shape.intervals[numTones - 1];
+    const auto highestInterval = shape.intervals[numTones - 1] + maxSpreadOffset;
 
     while (base < 0)
         base += 12;
@@ -473,7 +564,7 @@ int PluginProcessor::buildChordNotes (int triggerNote, int chordType, int comple
 
     for (int i = 0; i < numTones; ++i)
     {
-        const auto note = base + shape.intervals[i];
+        const auto note = base + shape.intervals[i] + spreadOffsets[i];
 
         if (note >= 0 && note <= 127)
             notesOut[count++] = static_cast<juce::uint8> (note);
@@ -482,6 +573,202 @@ int PluginProcessor::buildChordNotes (int triggerNote, int chordType, int comple
     return count;
 }
 
+//==============================================================================
+juce::uint32 PluginProcessor::nextRandom() noexcept
+{
+    auto state = humanizeSeed.load (std::memory_order_relaxed);
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+
+    if (state == 0)
+        state = 0x9e3779b9u;
+
+    humanizeSeed.store (state, std::memory_order_relaxed);
+    return state;
+}
+
+juce::uint8 PluginProcessor::humanizedVelocity (juce::uint8 velocity) noexcept
+{
+    const auto deviation = juce::roundToInt (currentHumanizeAmount
+                                             * static_cast<float> (maxHumanizeVelocityDeviation));
+
+    if (deviation <= 0)
+        return velocity;
+
+    const auto span = static_cast<juce::uint32> (deviation * 2 + 1);
+    const auto offset = static_cast<int> (nextRandom() % span) - deviation;
+
+    return static_cast<juce::uint8> (
+        juce::jlimit (1, 127, static_cast<int> (velocity) + offset));
+}
+
+//==============================================================================
+void PluginProcessor::emitNoteOn (int chordIndex, int noteIndex, int note,
+                                  int channel, juce::uint8 velocity,
+                                  int samplePosition, juce::MidiBuffer& output) noexcept
+{
+    if (! juce::isPositiveAndBelow (channel, midiChannels)
+        || ! juce::isPositiveAndBelow (note, 128))
+        return;
+
+    if (juce::isPositiveAndBelow (chordIndex, maxActiveChords))
+    {
+        auto& chord = activeChords[chordIndex];
+
+        // The slot may have been stolen or released between scheduling and
+        // dispatch; never resurrect a dead chord.
+        if (chord.triggerNote < 0
+            || ! juce::isPositiveAndBelow (noteIndex, chord.numNotes)
+            || chord.notes[noteIndex] != static_cast<juce::uint8> (note))
+            return;
+
+        chord.noteOnSent[noteIndex] = true;
+    }
+
+    auto& refCount = noteRefCounts[channel][note];
+
+    if (refCount == 0)
+        output.addEvent (juce::MidiMessage::noteOn (channel + 1, note, velocity),
+                         samplePosition);
+
+    if (refCount < 255)
+        ++refCount;
+}
+
+void PluginProcessor::scheduleNoteOn (int chordIndex, int noteIndex, int note,
+                                      int channel, juce::uint8 velocity,
+                                      int targetSample,
+                                      juce::MidiBuffer& output) noexcept
+{
+    targetSample = juce::jmax (0, targetSample);
+
+    // With no strum, preserve the original immediate path exactly. This keeps
+    // sample positions and ref-counting identical for existing presets.
+    if (currentStrumStepSamples <= 0 || targetSample < currentBlockSize)
+    {
+        if (currentStrumStepSamples <= 0)
+        {
+            emitNoteOn (chordIndex, noteIndex, note, channel, velocity,
+                        juce::jmin (targetSample, juce::jmax (0, currentBlockSize - 1)),
+                        output);
+            return;
+        }
+    }
+
+    // Strummed notes are always queued, even when their target lies inside the
+    // current block. This lets a fast note-off in the same block cancel the
+    // remaining notes before any premature note-on reaches the host.
+    for (auto& pending : pendingNotes)
+    {
+        if (pending.active)
+            continue;
+
+        pending.chordIndex = chordIndex;
+        pending.noteIndex = noteIndex;
+        pending.channel = channel;
+        pending.note = note;
+        pending.velocity = velocity;
+        pending.dueSample = totalSamplesProcessed + targetSample;
+        pending.isNoteOn = true;
+        pending.active = true;
+        return;
+    }
+
+    // Queue exhausted: fall back to an immediate note so the key is never
+    // silently swallowed.
+    emitNoteOn (chordIndex, noteIndex, note, channel, velocity,
+                juce::jmax (0, currentBlockSize - 1), output);
+}
+
+void PluginProcessor::scheduleNoteOff (int channel, int note, int targetSample,
+                                       juce::MidiBuffer& output) noexcept
+{
+    if (! juce::isPositiveAndBelow (channel, midiChannels)
+        || ! juce::isPositiveAndBelow (note, 128))
+        return;
+
+    // Release ownership immediately, but defer the wire-level note-off. If
+    // another chord still owns the note, no event is needed at all.
+    auto& refCount = noteRefCounts[channel][note];
+
+    if (refCount > 0)
+        --refCount;
+
+    if (refCount != 0)
+        return;
+
+    targetSample = juce::jmax (0, targetSample);
+
+    for (auto& pending : pendingNotes)
+    {
+        if (pending.active)
+            continue;
+
+        pending.chordIndex = -1;
+        pending.noteIndex = 0;
+        pending.channel = channel;
+        pending.note = note;
+        pending.velocity = 0;
+        pending.dueSample = totalSamplesProcessed + targetSample;
+        pending.isNoteOn = false;
+        pending.active = true;
+        return;
+    }
+
+    // Queue exhausted: send the note-off right away rather than leak a note.
+    output.addEvent (juce::MidiMessage::noteOff (channel + 1, note),
+                     juce::jmax (0, currentBlockSize - 1));
+}
+
+void PluginProcessor::processPendingNotes (juce::MidiBuffer& output,
+                                           int numSamples) noexcept
+{
+    if (numSamples <= 0)
+        return;
+
+    const auto blockStart = totalSamplesProcessed;
+    const auto blockEnd = blockStart + static_cast<juce::int64> (numSamples);
+
+    for (auto& pending : pendingNotes)
+    {
+        if (! pending.active || pending.dueSample >= blockEnd)
+            continue;
+
+        const auto position = static_cast<int> (
+            juce::jlimit<juce::int64> (0, static_cast<juce::int64> (numSamples - 1),
+                                       pending.dueSample - blockStart));
+
+        if (pending.isNoteOn)
+        {
+            // Bypass may have engaged after this note was scheduled.
+            if (! currentBypassState)
+                emitNoteOn (pending.chordIndex, pending.noteIndex, pending.note,
+                            pending.channel, pending.velocity, position, output);
+        }
+        else
+        {
+            // The ref-count was already decremented when the release was
+            // scheduled. Only emit the wire note-off if nobody re-took the note
+            // in the meantime.
+            if (noteRefCounts[pending.channel][pending.note] == 0)
+                output.addEvent (
+                    juce::MidiMessage::noteOff (pending.channel + 1, pending.note),
+                    position);
+        }
+
+        pending.active = false;
+    }
+}
+
+void PluginProcessor::cancelPendingNotesForChord (int chordIndex) noexcept
+{
+    for (auto& pending : pendingNotes)
+        if (pending.active && pending.isNoteOn && pending.chordIndex == chordIndex)
+            pending.active = false;
+}
+
+//==============================================================================
 bool PluginProcessor::startChord (int triggerNote, int channel, juce::uint8 velocity,
                                   int chordType, int complexity, int voicing, int pitchOffset,
                                   juce::MidiBuffer& output, int samplePosition) noexcept
@@ -502,7 +789,9 @@ bool PluginProcessor::startChord (int triggerNote, int channel, juce::uint8 velo
 
     juce::uint8 notes[maxChordTones] {};
     const auto numNotes = buildChordNotes (triggerNote, chordType, complexity,
-                                           voicing, pitchOffset, notes);
+                                           voicing, pitchOffset,
+                                           currentSpreadAmount, currentSpreadMode,
+                                           notes);
 
     if (numNotes == 0)
         return false;
@@ -527,26 +816,53 @@ bool PluginProcessor::startChord (int triggerNote, int channel, juce::uint8 velo
         stopChord (*slot, output, samplePosition);
     }
 
+    const auto chordIndex = static_cast<int> (slot - activeChords);
+
     slot->triggerNote = triggerNote;
     slot->channel = channel;
     slot->numNotes = numNotes;
 
     for (int i = 0; i < numNotes; ++i)
-        slot->notes[i] = notes[i];
-
-    for (int i = 0; i < numNotes; ++i)
     {
-        const auto note = notes[i];
-        auto& refCount = noteRefCounts[channel][note];
+        slot->notes[i] = notes[i];
+        slot->noteOnSent[i] = false;
+    }
 
-        // Reference counting means a note shared by two held chords is only
-        // switched off when the last chord that owns it is released.
-        if (refCount == 0)
-            output.addEvent (juce::MidiMessage::noteOn (channel + 1, note, velocity),
-                             samplePosition);
+    soundingChordCount.fetch_add (1, std::memory_order_relaxed);
+    lastTriggeredChordNote.store (triggerNote, std::memory_order_relaxed);
 
-        if (refCount < 255)
-            ++refCount;
+    // Preserve the exact evaluated recipe for the editor's symbol readout.
+    // Per-key overrides win over the global matrix exactly as they do when
+    // buildChordNotes constructed the notes above.
+    ChordRecipe evaluatedRecipe;
+    evaluatedRecipe.chordType = chordType;
+    evaluatedRecipe.complexity = complexity;
+    evaluatedRecipe.voicing = voicing;
+    evaluatedRecipe.pitchOffset = pitchOffset;
+
+    if (juce::isPositiveAndBelow (triggerNote, 128))
+    {
+        const auto packed = keyRecipes[triggerNote].load (std::memory_order_acquire);
+
+        if ((packed & keyRecipeOverrideBit) != 0)
+            evaluatedRecipe = unpackKeyRecipe (packed);
+    }
+
+    lastTriggeredRecipe.store (packKeyRecipe (evaluatedRecipe),
+                               std::memory_order_relaxed);
+
+    // Strum Up plays low-to-high; Strum Down plays high-to-low. The per-step
+    // distance is derived from the current sample rate inside processBlock.
+    const auto down = currentStrumMode == 1;
+
+    for (int order = 0; order < numNotes; ++order)
+    {
+        const auto noteIndex = down ? (numNotes - 1 - order) : order;
+        const auto delaySamples = currentStrumStepSamples * order;
+
+        scheduleNoteOn (chordIndex, noteIndex, notes[noteIndex], channel,
+                        humanizedVelocity (velocity),
+                        samplePosition + delaySamples, output);
     }
 
     return true;
@@ -555,28 +871,49 @@ bool PluginProcessor::startChord (int triggerNote, int channel, juce::uint8 velo
 void PluginProcessor::stopChord (ActiveChord& chord, juce::MidiBuffer& output,
                                  int samplePosition) noexcept
 {
+    const auto chordIndex = static_cast<int> (&chord - activeChords);
+    cancelPendingNotesForChord (chordIndex);
+
     if (! juce::isPositiveAndBelow (chord.channel, midiChannels))
     {
         chord = {};
         return;
     }
 
-    for (int i = 0; i < chord.numNotes; ++i)
+    const auto staggered = currentNoteOffMode == 1;
+    const auto channel = chord.channel;
+    const auto numNotes = chord.numNotes;
+
+    for (int i = 0; i < numNotes; ++i)
     {
+        if (! chord.noteOnSent[i])
+            continue;
+
         const auto note = chord.notes[i];
-        auto& refCount = noteRefCounts[chord.channel][note];
 
-        if (refCount > 0)
+        if (staggered)
         {
-            --refCount;
+            scheduleNoteOff (channel, note,
+                             samplePosition + i * currentStaggerStepSamples,
+                             output);
+        }
+        else
+        {
+            auto& refCount = noteRefCounts[channel][note];
 
-            if (refCount == 0)
-                output.addEvent (juce::MidiMessage::noteOff (chord.channel + 1, note),
-                                 samplePosition);
+            if (refCount > 0)
+            {
+                --refCount;
+
+                if (refCount == 0)
+                    output.addEvent (juce::MidiMessage::noteOff (channel + 1, note),
+                                     samplePosition);
+            }
         }
     }
 
     chord = {};
+    soundingChordCount.fetch_sub (1, std::memory_order_relaxed);
 }
 
 int PluginProcessor::findActiveChord (int triggerNote, int channel) const noexcept
@@ -618,8 +955,24 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const auto voicingIndex = juce::roundToInt (voicingParam->load (std::memory_order_relaxed));
     const auto pitchOffsetSemitones = juce::roundToInt (pitchOffsetParam->load (std::memory_order_relaxed));
 
+    // Global interaction engine snapshots.
+    const auto powerOn = powerParam->load (std::memory_order_relaxed) > 0.5f;
+    const auto spreadValue = juce::jlimit (0.0f, 100.0f,
+        spreadParam->load (std::memory_order_relaxed));
+    const auto spreadModeIndex = juce::jlimit (0, 1,
+        juce::roundToInt (spreadModeParam->load (std::memory_order_relaxed)));
+    const auto humanizeValue = juce::jlimit (0.0f, 100.0f,
+        humanizeParam->load (std::memory_order_relaxed));
+    const auto noteOffModeIndex = juce::jlimit (0, 1,
+        juce::roundToInt (noteOffModeParam->load (std::memory_order_relaxed)));
+    const auto strumValue = juce::jlimit (0.0f, 100.0f,
+        strumParam->load (std::memory_order_relaxed));
+    const auto strumModeIndex = juce::jlimit (0, 1,
+        juce::roundToInt (strumModeParam->load (std::memory_order_relaxed)));
+
     const auto gainDecibels = gainDbParameter->load (std::memory_order_relaxed);
-    const auto bypassed = bypassParameter->load (std::memory_order_relaxed) > 0.5f;
+    const auto bypassed = bypassParameter->load (std::memory_order_relaxed) > 0.5f
+                       || ! powerOn;
 
     const auto chordType = juce::jlimit (0, chordTypeCount - 1, chordTypeIndex);
     const auto complexity = juce::jlimit (0, complexityCount - 1, complexityIndex);
@@ -627,6 +980,22 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const auto pitchOffset = juce::jlimit (boilerplate::parameters::pitchOffsetMin,
                                            boilerplate::parameters::pitchOffsetMax,
                                            pitchOffsetSemitones);
+
+    const auto sampleRate = getSampleRate() > 0.0 ? getSampleRate() : 44100.0;
+
+    currentBlockSize = buffer.getNumSamples();
+    currentNoteOffMode = noteOffModeIndex;
+    currentSpreadMode = spreadModeIndex;
+    currentStrumMode = strumModeIndex;
+    currentSpreadAmount = spreadValue / 100.0f;
+    currentHumanizeAmount = humanizeValue / 100.0f;
+    currentBypassState = bypassed;
+
+    currentStrumStepSamples = juce::roundToInt (
+        (strumValue / 100.0f) * maxStrumSecondsPerStep * sampleRate);
+    currentStaggerStepSamples = currentStrumStepSamples > 0
+        ? currentStrumStepSamples
+        : juce::roundToInt (minStaggerSecondsPerStep * sampleRate);
 
     const auto totalNumInputChannels = getTotalNumInputChannels();
     const auto totalNumOutputChannels = getTotalNumOutputChannels();
@@ -751,6 +1120,13 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             }
         }
     }
+
+    // Dispatch strummed note-ons and staggered note-offs whose sample time has
+    // arrived. This runs after all incoming events so a fast release in the
+    // same block can cancel pending note-ons before they reach the host.
+    processPendingNotes (midiSwapBuffer, currentBlockSize);
+
+    totalSamplesProcessed += static_cast<juce::int64> (currentBlockSize);
 
     midiMessages.swapWith (midiSwapBuffer);
 }
