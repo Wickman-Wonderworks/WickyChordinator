@@ -7,6 +7,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -102,65 +103,430 @@ namespace
                 }
     }
 
-    int firstNoteOnVelocity (const juce::MidiBuffer& midi)
+    struct CapturedEvent
     {
-        for (const auto metadata : midi)
-            if (metadata.numBytes == 3
-                && (metadata.data[0] & 0xf0) == 0x90
-                && metadata.data[2] > 0)
-                return metadata.data[2];
+        int position = 0;
+        int status = 0;
+        int channel = 0;
+        int data1 = 0;
+        int data2 = 0;
+    };
 
-        return -1;
+    std::vector<CapturedEvent> captureMidi (const juce::MidiBuffer& midi)
+    {
+        std::vector<CapturedEvent> events;
+
+        for (const auto metadata : midi)
+        {
+            if (metadata.numBytes < 2)
+                continue;
+
+            CapturedEvent event;
+            event.position = metadata.samplePosition;
+            event.status = metadata.data[0] & 0xf0;
+            event.channel = metadata.data[0] & 0x0f;
+            event.data1 = metadata.data[1];
+            event.data2 = metadata.numBytes > 2 ? metadata.data[2] : 0;
+            events.push_back (event);
+        }
+
+        return events;
+    }
+
+    bool hasEvent (const std::vector<CapturedEvent>& events, int status, int channel,
+                   int data1, int data2 = -1)
+    {
+        for (const auto& event : events)
+            if (event.status == status && event.channel == channel
+                && event.data1 == data1 && (data2 < 0 || event.data2 == data2))
+                return true;
+
+        return false;
+    }
+
+    bool hasNoteOn (const std::vector<CapturedEvent>& events, int channel, int note)
+    {
+        for (const auto& event : events)
+            if (event.status == 0x90 && event.channel == channel
+                && event.data1 == note && event.data2 > 0)
+                return true;
+
+        return false;
+    }
+
+    bool hasNoteOff (const std::vector<CapturedEvent>& events, int channel, int note)
+    {
+        for (const auto& event : events)
+            if ((event.status == 0x80 || (event.status == 0x90 && event.data2 == 0))
+                && event.channel == channel && event.data1 == note)
+                return true;
+
+        return false;
+    }
+
+    int countNoteOns (const std::vector<CapturedEvent>& events)
+    {
+        int count = 0;
+
+        for (const auto& event : events)
+            if (event.status == 0x90 && event.data2 > 0)
+                ++count;
+
+        return count;
+    }
+
+    std::vector<CapturedEvent> processMessages (PluginProcessor& processor,
+                                                std::initializer_list<juce::MidiMessage> messages)
+    {
+        juce::MidiBuffer midi;
+        int position = 0;
+
+        for (const auto& message : messages)
+            midi.addEvent (message, position++);
+
+        juce::AudioBuffer<float> buffer (2, 64);
+        processor.processBlock (buffer, midi);
+        return captureMidi (midi);
+    }
+
+    void setChordMatrix (PluginProcessor& processor, int type, int complexity,
+                         int voicing, int pitchOffset)
+    {
+        setParameter (processor, boilerplate::parameters::chordType, (float) type);
+        setParameter (processor, boilerplate::parameters::complexity, (float) complexity);
+        setParameter (processor, boilerplate::parameters::voicing, (float) voicing);
+        setParameter (processor, boilerplate::parameters::pitchOffset, (float) pitchOffset);
+        setParameter (processor, boilerplate::parameters::gain, 0.0f);
+        setParameter (processor, boilerplate::parameters::bypass, 0.0f);
     }
 
     void testMidiVelocityGain()
     {
         PluginProcessor processor;
         processor.prepareToPlay (48000.0, 64);
+        setChordMatrix (processor, 0, 0, 1, 0);
 
-        auto processVelocity = [&] (float gainDb, bool bypassed, int velocity)
+        auto scaledVelocityFor = [&] (float gainDb, int velocity)
         {
             setParameter (processor, boilerplate::parameters::gain, gainDb);
-            setParameter (processor, boilerplate::parameters::bypass, bypassed ? 1.0f : 0.0f);
+            setParameter (processor, boilerplate::parameters::bypass, 0.0f);
 
-            juce::AudioBuffer<float> buffer (2, 64);
-            fill (buffer, 0.25f);
+            const auto events = processMessages (processor, {
+                juce::MidiMessage::noteOn (1, 60, static_cast<juce::uint8> (velocity)) });
 
-            juce::MidiBuffer midi;
-            midi.addEvent (juce::MidiMessage::noteOn (1, 60, static_cast<juce::uint8> (velocity)), 0);
-            midi.addEvent (juce::MidiMessage::controllerEvent (1, 1, 64), 1);
-            midi.addEvent (juce::MidiMessage::noteOff (1, 60), 2);
+            int expected = -1;
+            int noteOnCount = 0;
 
-            processor.processBlock (buffer, midi);
-
-            int eventCount = 0;
-            int controllerValue = -1;
-            bool sawNoteOff = false;
-
-            for (const auto metadata : midi)
+            for (const auto& event : events)
             {
-                ++eventCount;
-                const auto message = metadata.getMessage();
+                if (event.status == 0x90 && event.data2 > 0)
+                {
+                    if (expected < 0)
+                        expected = event.data2;
 
-                if (message.isNoteOff (false))
-                    sawNoteOff = true;
-                else if (message.isController())
-                    controllerValue = message.getControllerValue();
+                    require (event.data2 == expected, "Chord notes have different velocities");
+                    ++noteOnCount;
+                }
             }
 
-            require (eventCount == 3, "MIDI events were lost");
-            require (sawNoteOff, "Note-off was lost");
-            require (controllerValue == 64, "Controller data changed");
-            expectSamples (buffer, 0.25f); // Audio stays a transparent pass-through.
-
-            return firstNoteOnVelocity (midi);
+            require (noteOnCount == 3, "Chord did not produce three note-ons");
+            processMessages (processor, { juce::MidiMessage::noteOff (1, 60) });
+            return expected;
         };
 
-        require (processVelocity (0.0f, false, 100) == 100, "0 dB changed velocity");
-        require (processVelocity (-6.0f, false, 100) == 50, "Velocity attenuation failed");
-        require (processVelocity (12.0f, false, 100) == 127, "Velocity boost did not clamp");
-        require (processVelocity (-60.0f, false, 100) == 1, "Full attenuation lost the note-on");
-        require (processVelocity (-24.0f, true, 100) == 100, "Bypass changed velocity");
+        require (scaledVelocityFor (0.0f, 100) == 100, "0 dB changed velocity");
+        require (scaledVelocityFor (-6.0f, 100) == 50, "Velocity attenuation failed");
+        require (scaledVelocityFor (12.0f, 100) == 127, "Velocity boost did not clamp");
+        require (scaledVelocityFor (-60.0f, 100) == 1, "Full attenuation lost the note-on");
+
+        // Bypass is a transparent pass-through: one note-on, one CC, one note-off.
+        setParameter (processor, boilerplate::parameters::gain, -24.0f);
+        setParameter (processor, boilerplate::parameters::bypass, 1.0f);
+
+        juce::AudioBuffer<float> buffer (2, 64);
+        fill (buffer, 0.25f);
+
+        juce::MidiBuffer midi;
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, static_cast<juce::uint8> (100)), 0);
+        midi.addEvent (juce::MidiMessage::controllerEvent (1, 1, 64), 1);
+        midi.addEvent (juce::MidiMessage::noteOff (1, 60), 2);
+        processor.processBlock (buffer, midi);
+
+        const auto bypassed = captureMidi (midi);
+        require (countNoteOns (bypassed) == 1, "Bypass generated extra notes");
+        require (hasEvent (bypassed, 0x90, 0, 60, 100), "Bypass changed the note-on");
+        require (hasEvent (bypassed, 0xB0, 0, 1, 64), "Bypass dropped a controller");
+        require (hasNoteOff (bypassed, 0, 60), "Bypass dropped the note-off");
+        expectSamples (buffer, 0.25f);
+
+        setParameter (processor, boilerplate::parameters::bypass, 0.0f);
+    }
+
+    void testChordEngine()
+    {
+        PluginProcessor processor;
+        processor.prepareToPlay (48000.0, 64);
+
+        const auto noteOn = [] (int channel, int note, int velocity = 100)
+        {
+            return juce::MidiMessage::noteOn (channel, note,
+                                              static_cast<juce::uint8> (velocity));
+        };
+
+        const auto noteOff = [] (int channel, int note)
+        {
+            return juce::MidiMessage::noteOff (channel, note);
+        };
+
+        // Root position, major triad. The input note is replaced by the chord.
+        setChordMatrix (processor, 0, 0, 1, 0);
+        auto events = processMessages (processor, { noteOn (1, 60) });
+        require (events.size() == 3, "Input note was not replaced by a triad");
+        require (hasNoteOn (events, 0, 60) && hasNoteOn (events, 0, 64)
+                 && hasNoteOn (events, 0, 67), "Incorrect C major triad");
+
+        // Per-key assignment: D4 gets its own root without changing the matrix.
+        auto dEvents = processMessages (processor, { noteOn (1, 62) });
+        require (hasNoteOn (dEvents, 0, 62) && hasNoteOn (dEvents, 0, 66)
+                 && hasNoteOn (dEvents, 0, 69), "Per-key root mapping failed");
+
+        auto releaseC = processMessages (processor, { noteOff (1, 60) });
+        require (hasNoteOff (releaseC, 0, 60) && hasNoteOff (releaseC, 0, 64)
+                 && hasNoteOff (releaseC, 0, 67), "C chord did not release");
+
+        auto releaseD = processMessages (processor, { noteOff (1, 62) });
+        require (hasNoteOff (releaseD, 0, 62) && hasNoteOff (releaseD, 0, 66)
+                 && hasNoteOff (releaseD, 0, 69), "D chord did not release");
+
+        // Complexity and type tables.
+        setChordMatrix (processor, 0, 2, 1, 0); // Major 7th
+        events = processMessages (processor, { noteOn (1, 60) });
+        require (hasNoteOn (events, 0, 60) && hasNoteOn (events, 0, 64)
+                 && hasNoteOn (events, 0, 67) && hasNoteOn (events, 0, 71),
+                 "Major 7th table is wrong");
+        processMessages (processor, { noteOff (1, 60) });
+
+        setChordMatrix (processor, 2, 2, 1, 0); // Dominant 7th
+        events = processMessages (processor, { noteOn (1, 60) });
+        require (hasNoteOn (events, 0, 60) && hasNoteOn (events, 0, 64)
+                 && hasNoteOn (events, 0, 67) && hasNoteOn (events, 0, 70),
+                 "Dominant 7th table is wrong");
+        processMessages (processor, { noteOff (1, 60) });
+
+        // Voicing register and pitch offset.
+        setChordMatrix (processor, 0, 0, 0, 0); // High
+        events = processMessages (processor, { noteOn (1, 60) });
+        require (hasNoteOn (events, 0, 72) && hasNoteOn (events, 0, 76)
+                 && hasNoteOn (events, 0, 79), "High voicing is wrong");
+        processMessages (processor, { noteOff (1, 60) });
+
+        setChordMatrix (processor, 0, 0, 2, 0); // Low
+        events = processMessages (processor, { noteOn (1, 60) });
+        require (hasNoteOn (events, 0, 48) && hasNoteOn (events, 0, 52)
+                 && hasNoteOn (events, 0, 55), "Low voicing is wrong");
+        processMessages (processor, { noteOff (1, 60) });
+
+        setChordMatrix (processor, 0, 0, 1, 2); // +2 semitones
+        events = processMessages (processor, { noteOn (1, 60) });
+        require (hasNoteOn (events, 0, 62) && hasNoteOn (events, 0, 66)
+                 && hasNoteOn (events, 0, 69), "Pitch offset is wrong");
+        processMessages (processor, { noteOff (1, 60) });
+
+        // C major (C E G) and E major (E G# B) share E: refcount keeps it on.
+        setChordMatrix (processor, 0, 0, 1, 0);
+        processMessages (processor, { noteOn (1, 60) });
+
+        auto eEvents = processMessages (processor, { noteOn (1, 64) });
+        require (hasNoteOn (eEvents, 0, 68) && hasNoteOn (eEvents, 0, 71),
+                 "E major did not join the shared note");
+        require (! hasNoteOn (eEvents, 0, 64), "Shared note was retriggered");
+
+        releaseC = processMessages (processor, { noteOff (1, 60) });
+        require (hasNoteOff (releaseC, 0, 60) && hasNoteOff (releaseC, 0, 67),
+                 "C release dropped the wrong notes");
+        require (! hasNoteOff (releaseC, 0, 64), "Shared note was cut early");
+
+        auto releaseE = processMessages (processor, { noteOff (1, 64) });
+        require (hasNoteOff (releaseE, 0, 64) && hasNoteOff (releaseE, 0, 68)
+                 && hasNoteOff (releaseE, 0, 71), "E release failed");
+
+        // Retriggering a held key replaces its chord without orphaning notes.
+        processMessages (processor, { noteOn (1, 60) });
+        auto retrigger = processMessages (processor, { noteOn (1, 60) });
+        require (hasNoteOff (retrigger, 0, 60) && hasNoteOff (retrigger, 0, 64)
+                 && hasNoteOff (retrigger, 0, 67),
+                 "Retrigger did not release the old chord");
+        require (hasNoteOn (retrigger, 0, 60) && hasNoteOn (retrigger, 0, 64)
+                 && hasNoteOn (retrigger, 0, 67),
+                 "Retrigger did not start the new chord");
+        processMessages (processor, { noteOff (1, 60) });
+
+        // A note-off for a generated, non-trigger note must not cut that note.
+        processMessages (processor, { noteOn (1, 60) });
+        auto strayOff = processMessages (processor, { noteOff (1, 64) });
+        require (strayOff.empty(), "Stray note-off cut a generated note");
+
+        auto finalRelease = processMessages (processor, { noteOff (1, 60) });
+        require (hasNoteOff (finalRelease, 0, 60) && hasNoteOff (finalRelease, 0, 64)
+                 && hasNoteOff (finalRelease, 0, 67), "Final release failed");
+
+        // CC123 releases every chord on its channel and is forwarded.
+        processMessages (processor, { noteOn (1, 60) });
+        auto panicEvents = processMessages (processor, { juce::MidiMessage::allNotesOff (1) });
+        require (hasNoteOff (panicEvents, 0, 60) && hasNoteOff (panicEvents, 0, 64)
+                 && hasNoteOff (panicEvents, 0, 67),
+                 "All-notes-off did not release the chord");
+        require (hasEvent (panicEvents, 0xB0, 0, 123, 0), "All-notes-off was not forwarded");
+
+        // Bypass releases chord notes and passes the input through untouched.
+        processMessages (processor, { noteOn (1, 60) });
+        setParameter (processor, boilerplate::parameters::bypass, 1.0f);
+
+        auto bypassEvents = processMessages (processor, { noteOn (1, 62) });
+        require (hasNoteOff (bypassEvents, 0, 60) && hasNoteOff (bypassEvents, 0, 64)
+                 && hasNoteOff (bypassEvents, 0, 67), "Bypass orphaned the chord");
+        require (hasNoteOn (bypassEvents, 0, 62), "Bypass did not pass the input");
+        require (! hasNoteOn (bypassEvents, 0, 66), "Bypass still generated a chord");
+
+        setParameter (processor, boilerplate::parameters::bypass, 0.0f);
+        auto passThroughOff = processMessages (processor, { noteOff (1, 62) });
+        require (hasNoteOff (passThroughOff, 0, 62), "Bypass note-off was lost");
+
+        // Channels are independent.
+        setChordMatrix (processor, 0, 0, 1, 0);
+        processMessages (processor, { noteOn (1, 60) });
+
+        auto channelTwoOn = processMessages (processor, { noteOn (2, 60) });
+        require (hasNoteOn (channelTwoOn, 1, 60) && hasNoteOn (channelTwoOn, 1, 64)
+                 && hasNoteOn (channelTwoOn, 1, 67), "Channel 2 chord missing");
+
+        auto channelOneOff = processMessages (processor, { noteOff (1, 60) });
+        require (hasNoteOff (channelOneOff, 0, 60) && hasNoteOff (channelOneOff, 0, 64)
+                 && hasNoteOff (channelOneOff, 0, 67), "Channel 1 release failed");
+        require (! hasNoteOff (channelOneOff, 1, 60), "Channel 1 release touched channel 2");
+
+        auto channelTwoOff = processMessages (processor, { noteOff (2, 60) });
+        require (hasNoteOff (channelTwoOff, 1, 60) && hasNoteOff (channelTwoOff, 1, 64)
+                 && hasNoteOff (channelTwoOff, 1, 67), "Channel 2 release failed");
+
+        // High keys fold by octaves instead of producing out-of-range notes.
+        setChordMatrix (processor, 0, 0, 1, 0);
+        events = processMessages (processor, { noteOn (1, 125) });
+        require (hasNoteOn (events, 0, 113) && hasNoteOn (events, 0, 117)
+                 && hasNoteOn (events, 0, 120), "High-key octave folding is wrong");
+
+        for (const auto& event : events)
+            require (event.data1 >= 0 && event.data1 <= 127, "Out-of-range MIDI note");
+
+        processMessages (processor, { noteOff (1, 125) });
+
+        // Smoke test every type/complexity for note balance.
+        for (int type = 0; type < 4; ++type)
+        {
+            for (int complexity = 0; complexity < 11; ++complexity)
+            {
+                setChordMatrix (processor, type, complexity, 1, 0);
+
+                auto on = processMessages (processor, { noteOn (1, 60) });
+                auto off = processMessages (processor, { noteOff (1, 60) });
+
+                require (! on.empty(), "Chord shape produced no notes");
+                require (on.size() == off.size(), "Chord note release count mismatch");
+            }
+        }
+    }
+
+    void testPerKeyRecipes()
+    {
+        PluginProcessor processor;
+        processor.prepareToPlay (48000.0, 64);
+        setChordMatrix (processor, 0, 0, 1, 0); // global: Major triad, Root
+
+        // Override C4 only: Minor 7th, High voicing, +2 semitones.
+        processor.setKeyRecipe (60, { 1, 2, 0, 2 });
+        require (processor.hasKeyRecipe (60), "Override was not stored");
+        require (! processor.hasKeyRecipe (62), "Unexpected override on D4");
+
+        const auto recipe = processor.getKeyRecipe (60);
+        require (recipe.chordType == 1 && recipe.complexity == 2
+                 && recipe.voicing == 0 && recipe.pitchOffset == 2,
+                 "Override readback is wrong");
+
+        // C4 uses the override: 60 + 2 + 12 = 74, minor 7th = 74/77/81/84.
+        auto cEvents = processMessages (processor, {
+            juce::MidiMessage::noteOn (1, 60, static_cast<juce::uint8> (100)) });
+        require (hasNoteOn (cEvents, 0, 74) && hasNoteOn (cEvents, 0, 77)
+                 && hasNoteOn (cEvents, 0, 81) && hasNoteOn (cEvents, 0, 84),
+                 "Per-key recipe was not applied");
+        processMessages (processor, { juce::MidiMessage::noteOff (1, 60) });
+
+        // D4 must still use the global matrix.
+        auto dEvents = processMessages (processor, {
+            juce::MidiMessage::noteOn (1, 62, static_cast<juce::uint8> (100)) });
+        require (hasNoteOn (dEvents, 0, 62) && hasNoteOn (dEvents, 0, 66)
+                 && hasNoteOn (dEvents, 0, 69), "Global fallback failed");
+        processMessages (processor, { juce::MidiMessage::noteOff (1, 62) });
+
+        // C5 is a separate slot and must not inherit C4's override.
+        auto c5Events = processMessages (processor, {
+            juce::MidiMessage::noteOn (1, 72, static_cast<juce::uint8> (100)) });
+        require (hasNoteOn (c5Events, 0, 72) && hasNoteOn (c5Events, 0, 76)
+                 && hasNoteOn (c5Events, 0, 79), "C5 incorrectly used C4's override");
+        processMessages (processor, { juce::MidiMessage::noteOff (1, 72) });
+
+        // Full state round-trip through the ValueTree.
+        juce::MemoryBlock state;
+        processor.getStateInformation (state);
+        require (state.getSize() > 0, "Empty state");
+
+        PluginProcessor restored;
+        restored.setStateInformation (state.getData(), static_cast<int> (state.getSize()));
+        restored.prepareToPlay (48000.0, 64);
+
+        require (restored.hasKeyRecipe (60), "Recipe was not restored");
+        require (! restored.hasKeyRecipe (62), "Restore created a stray recipe");
+
+        const auto restoredRecipe = restored.getKeyRecipe (60);
+        require (restoredRecipe.chordType == 1 && restoredRecipe.complexity == 2
+                 && restoredRecipe.voicing == 0 && restoredRecipe.pitchOffset == 2,
+                 "Restored recipe values are wrong");
+
+        auto restoredEvents = processMessages (restored, {
+            juce::MidiMessage::noteOn (1, 60, static_cast<juce::uint8> (100)) });
+        require (hasNoteOn (restoredEvents, 0, 74) && hasNoteOn (restoredEvents, 0, 77)
+                 && hasNoteOn (restoredEvents, 0, 81) && hasNoteOn (restoredEvents, 0, 84),
+                 "Restored recipe was not applied");
+        processMessages (restored, { juce::MidiMessage::noteOff (1, 60) });
+
+        // An older state without a KeyRecipes child must clear stale overrides.
+        auto legacyTree = juce::ValueTree::readFromData (state.getData(),
+                                                         static_cast<size_t> (state.getSize()));
+        const auto recipesChild = legacyTree.getChildWithName (juce::Identifier ("KeyRecipes"));
+        require (recipesChild.isValid(), "Missing KeyRecipes child");
+        legacyTree.removeChild (recipesChild, nullptr);
+
+        juce::MemoryBlock legacyState;
+        {
+            juce::MemoryOutputStream stream (legacyState, false);
+            legacyTree.writeToStream (stream);
+        }
+
+        PluginProcessor legacy;
+        legacy.setKeyRecipe (60, { 2, 4, 2, -3 });
+        require (legacy.hasKeyRecipe (60), "Legacy setup failed");
+        legacy.setStateInformation (legacyState.getData(),
+                                    static_cast<int> (legacyState.getSize()));
+        require (! legacy.hasKeyRecipe (60), "Legacy state kept a stale override");
+
+        // Clearing an override returns the key to the global matrix.
+        processor.clearKeyRecipe (60);
+        require (! processor.hasKeyRecipe (60), "Recipe was not cleared");
+
+        auto clearedEvents = processMessages (processor, {
+            juce::MidiMessage::noteOn (1, 60, static_cast<juce::uint8> (100)) });
+        require (hasNoteOn (clearedEvents, 0, 60) && hasNoteOn (clearedEvents, 0, 64)
+                 && hasNoteOn (clearedEvents, 0, 67), "Cleared key did not fall back");
+        processMessages (processor, { juce::MidiMessage::noteOff (1, 60) });
     }
 
     void testStateAndProcessing()
@@ -283,6 +649,8 @@ int main (int argc, char** argv)
         {
             testGain();
             testMidiVelocityGain();
+            testChordEngine();
+            testPerKeyRecipes();
             testStateAndProcessing();
         }
         std::cout << "Passed\n";

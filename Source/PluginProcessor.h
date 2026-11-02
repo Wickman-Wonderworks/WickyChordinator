@@ -13,6 +13,7 @@ public:
     //==========================================================================
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
+    void reset() override;
 
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
 
@@ -47,6 +48,23 @@ public:
     //==========================================================================
     juce::AudioProcessorValueTreeState& getValueTreeState() noexcept { return apvts; }
 
+    //==========================================================================
+    /** One chord assignment for a single MIDI note. */
+    struct ChordRecipe
+    {
+        int chordType = 0;   // 0..3
+        int complexity = 0;  // 0..10
+        int voicing = 1;     // 0..2 (High/Root/Low)
+        int pitchOffset = 0; // -12..+12
+    };
+
+    /** Message-thread API for the per-key recipe map. Safe while audio runs. */
+    void setKeyRecipe (int midiNote, ChordRecipe recipe) noexcept;
+    void clearKeyRecipe (int midiNote) noexcept;
+    bool hasKeyRecipe (int midiNote) const noexcept;
+    /** Returns the override, or the current global matrix values if unassigned. */
+    ChordRecipe getKeyRecipe (int midiNote) const noexcept;
+
 private:
     // Declared before the raw parameter pointers so that it outlives them.
     juce::AudioProcessorValueTreeState apvts;
@@ -66,6 +84,57 @@ private:
     // Audio-thread scratch for the copy-then-swap MIDI pass. Preallocated in
     // prepareToPlay so processBlock never has to grow it.
     juce::MidiBuffer midiSwapBuffer;
+
+    //==========================================================================
+    // Per-key chord recipes. One packed, lock-free 32-bit atomic per MIDI note:
+    // type (2 bits) | complexity (4) | voicing (2) | pitch+12 (5) | override
+    // flag (bit 31). A zero value means "no override, use the global matrix".
+    std::atomic<juce::uint32> keyRecipes[128] {};
+
+    static constexpr juce::uint32 keyRecipeOverrideBit = 1u << 31;
+
+   #if defined(__cpp_lib_atomic_is_always_lock_free)
+    static_assert (std::atomic<juce::uint32>::is_always_lock_free,
+                   "Per-key recipes require lock-free 32-bit atomics");
+   #endif
+
+    static juce::uint32 packKeyRecipe (const ChordRecipe& recipe) noexcept;
+    static ChordRecipe unpackKeyRecipe (juce::uint32 packed) noexcept;
+
+    juce::ValueTree createKeyRecipeState() const;
+    void restoreKeyRecipeState (const juce::ValueTree& state);
+
+    //==========================================================================
+    // Chord engine state. Everything below is touched only by the audio thread.
+    static constexpr int maxChordTones = 8;
+    static constexpr int maxActiveChords = 128;
+    static constexpr int midiChannels = 16;
+
+    struct ActiveChord
+    {
+        int triggerNote = -1; // -1 marks a free slot.
+        int channel = 0;
+        int numNotes = 0;
+        juce::uint8 notes[maxChordTones] {};
+    };
+
+    ActiveChord activeChords[maxActiveChords];
+    juce::uint8 noteRefCounts[midiChannels][128] {};
+    bool wasBypassed = false;
+
+    void resetChordState() noexcept;
+    int buildChordNotes (int triggerNote, int chordType, int complexity,
+                         int voicing, int pitchOffset,
+                         juce::uint8* notesOut) const noexcept;
+    bool startChord (int triggerNote, int channel, juce::uint8 velocity,
+                     int chordType, int complexity, int voicing, int pitchOffset,
+                     juce::MidiBuffer& output, int samplePosition) noexcept;
+    void stopChord (ActiveChord& chord, juce::MidiBuffer& output,
+                    int samplePosition) noexcept;
+    int findActiveChord (int triggerNote, int channel) const noexcept;
+    bool isNoteActive (int channel, int note) const noexcept;
+    void releaseAllChords (juce::MidiBuffer& output, int samplePosition,
+                           int channel = -1) noexcept;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginProcessor)
 };

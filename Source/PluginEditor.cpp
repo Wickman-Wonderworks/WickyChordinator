@@ -32,7 +32,7 @@ namespace
 PluginEditor::PluginEditor (PluginProcessor& owner)
     : AudioProcessorEditor (&owner),
       processorRef (owner),
-      chordPanel (processorRef.getValueTreeState()),
+      chordPanel (processorRef),
       gainAttachment (processorRef.getValueTreeState(), boilerplate::parameters::gain, gainSlider),
       bypassAttachment (processorRef.getValueTreeState(), boilerplate::parameters::bypass, bypassButton)
 {
