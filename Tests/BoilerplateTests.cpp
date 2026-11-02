@@ -1,6 +1,7 @@
 #include "PluginProcessor.h"
 #include "DSP/GainProcessor.h"
 #include "State/ParameterIDs.h"
+#include "UI/OxaniumFonts.h"
 
 #include <cmath>
 #include <iostream>
@@ -529,6 +530,48 @@ namespace
         processMessages (processor, { juce::MidiMessage::noteOff (1, 60) });
     }
 
+    void testOxaniumFont()
+    {
+        const auto regular = boilerplate::ui::fonts::oxaniumTypeface (400.0f);
+        require (regular != nullptr, "Oxanium regular typeface failed to load");
+        require (regular->getName().containsIgnoreCase ("Oxanium"),
+                 "Embedded typeface is not Oxanium");
+
+        const auto bold = boilerplate::ui::fonts::oxaniumTypeface (700.0f);
+        require (bold != nullptr, "Oxanium bold typeface failed to load");
+    }
+
+    void testVirtualKeyboardBridge()
+    {
+        PluginProcessor processor;
+        processor.prepareToPlay (48000.0, 64);
+        setChordMatrix (processor, 0, 0, 1, 0); // C major triad, root position.
+
+        juce::AudioBuffer<float> buffer (2, 64);
+        juce::MidiBuffer midi;
+
+        processor.queueKeyboardNote (true, 60, 0.8f);
+        processor.processBlock (buffer, midi);
+
+        auto events = captureMidi (midi);
+        require (hasNoteOn (events, 0, 60) && hasNoteOn (events, 0, 64)
+                 && hasNoteOn (events, 0, 67),
+                 "Virtual keyboard note did not generate a chord");
+        require ((processor.getActiveInputNotes (0) & (juce::uint64 (1) << 60)) != 0,
+                 "Virtual keyboard note was not mirrored to the UI mask");
+
+        processor.queueKeyboardNote (false, 60, 0.0f);
+        midi.clear();
+        processor.processBlock (buffer, midi);
+
+        events = captureMidi (midi);
+        require (hasNoteOff (events, 0, 60) && hasNoteOff (events, 0, 64)
+                 && hasNoteOff (events, 0, 67),
+                 "Virtual keyboard note-off did not release the chord");
+        require ((processor.getActiveInputNotes (0) & (juce::uint64 (1) << 60)) == 0,
+                 "Virtual keyboard note-off was not mirrored to the UI mask");
+    }
+
     void testStateAndProcessing()
     {
         PluginProcessor source;
@@ -648,9 +691,11 @@ int main (int argc, char** argv)
         else
         {
             testGain();
+            testOxaniumFont();
             testMidiVelocityGain();
             testChordEngine();
             testPerKeyRecipes();
+            testVirtualKeyboardBridge();
             testStateAndProcessing();
         }
         std::cout << "Passed\n";

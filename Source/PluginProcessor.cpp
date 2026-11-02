@@ -127,6 +127,12 @@ PluginProcessor::PluginProcessor()
 
     for (auto& recipe : keyRecipes)
         recipe.store (0, std::memory_order_relaxed);
+
+    for (auto& word : activeInputNotes)
+        word.store (0, std::memory_order_relaxed);
+
+    // Reserved on the message thread so the audio callback never grows it.
+    keyboardEventBuffer.ensureSize (keyboardEventBufferBytes);
 }
 
 PluginProcessor::~PluginProcessor() = default;
@@ -160,6 +166,95 @@ double PluginProcessor::getTailLengthSeconds() const
 juce::AudioProcessorParameter* PluginProcessor::getBypassParameter() const
 {
     return bypassParameterObject;
+}
+
+//==============================================================================
+juce::uint64 PluginProcessor::getActiveInputNotes (const int wordIndex) const noexcept
+{
+    if (! juce::isPositiveAndBelow (wordIndex, 2))
+        return 0;
+
+    return activeInputNotes[wordIndex].load (std::memory_order_relaxed);
+}
+
+void PluginProcessor::queueKeyboardNote (const bool noteOn, const int midiNote,
+                                         const float velocity) noexcept
+{
+    if (! juce::isPositiveAndBelow (midiNote, 128))
+        return;
+
+    const auto status = static_cast<juce::uint8> (noteOn ? 0x90 : 0x80);
+    const auto data2 = static_cast<juce::uint8> (
+        noteOn ? juce::jlimit (1, 127, juce::roundToInt (velocity * 127.0f))
+               : 0);
+
+    int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
+    keyboardEventFifo.prepareToWrite (1, start1, size1, start2, size2);
+
+    if (size1 > 0)
+    {
+        keyboardEvents[start1].data[0] = status;
+        keyboardEvents[start1].data[1] = static_cast<juce::uint8> (midiNote);
+        keyboardEvents[start1].data[2] = data2;
+        keyboardEventFifo.finishedWrite (1);
+    }
+}
+
+void PluginProcessor::drainKeyboardEvents() noexcept
+{
+    const auto ready = keyboardEventFifo.getNumReady();
+
+    if (ready <= 0)
+        return;
+
+    int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
+    keyboardEventFifo.prepareToRead (ready, start1, size1, start2, size2);
+
+    for (int i = 0; i < size1; ++i)
+        keyboardEventBuffer.addEvent (keyboardEvents[start1 + i].data, 3, 0);
+
+    for (int i = 0; i < size2; ++i)
+        keyboardEventBuffer.addEvent (keyboardEvents[start2 + i].data, 3, 0);
+
+    keyboardEventFifo.finishedRead (size1 + size2);
+}
+
+void PluginProcessor::setInputNoteActive (const int midiNote, const bool active) noexcept
+{
+    if (! juce::isPositiveAndBelow (midiNote, 128))
+        return;
+
+    auto& word = activeInputNotes[midiNote >> 6];
+    const auto bit = static_cast<juce::uint64> (1) << (midiNote & 63);
+
+    if (active)
+        word.fetch_or (bit, std::memory_order_relaxed);
+    else
+        word.fetch_and (~bit, std::memory_order_relaxed);
+}
+
+void PluginProcessor::clearInputNotes() noexcept
+{
+    for (auto& word : activeInputNotes)
+        word.store (0, std::memory_order_relaxed);
+}
+
+void PluginProcessor::updateInputNoteMask (const juce::uint8* data,
+                                           const int numBytes) noexcept
+{
+    if (data == nullptr || numBytes != 3)
+        return;
+
+    const auto status = data[0] & 0xf0;
+    const auto note = static_cast<int> (data[1]);
+    const auto value = static_cast<int> (data[2]);
+
+    if (status == 0x90 && value > 0)
+        setInputNoteActive (note, true);
+    else if (status == 0x80 || (status == 0x90 && value == 0))
+        setInputNoteActive (note, false);
+    else if (status == 0xB0 && (data[1] == 120 || data[1] == 123))
+        clearInputNotes();
 }
 
 //==============================================================================
@@ -199,6 +294,10 @@ void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     midiSwapBuffer.clear();
     midiSwapBuffer.ensureSize (static_cast<size_t> (juce::jmax (65536, samplesPerBlock * 128)));
 
+    keyboardEventBuffer.clear();
+    keyboardEventBuffer.ensureSize (keyboardEventBufferBytes);
+    keyboardEventFifo.reset();
+
     resetChordState();
     wasBypassed = bypassParameter != nullptr && bypassParameter->load() > 0.5f;
 }
@@ -221,6 +320,7 @@ void PluginProcessor::resetChordState() noexcept
         chord = {};
 
     std::memset (noteRefCounts, 0, sizeof (noteRefCounts));
+    clearInputNotes();
 }
 
 bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -547,10 +647,23 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         ? 1.0f
         : juce::Decibels::decibelsToGain (gainDecibels, -60.0f);
 
-    // Copy-then-swap: the source buffer is never mutated while it is being
-    // iterated, so no iterator can be invalidated. Three-byte MIDI messages
-    // are stored inline by juce::MidiMessage, so the per-event path does not
-    // allocate.
+    // Move on-screen keyboard events across the lock-free FIFO. The buffer is
+    // preallocated, so this never allocates in the audio callback.
+    keyboardEventBuffer.clear();
+    drainKeyboardEvents();
+
+    // UI-only mirror of the held input notes. It never influences the audio
+    // path; the editor polls it to highlight keys on the virtual keyboard.
+    for (const auto metadata : midiMessages)
+        updateInputNoteMask (metadata.data, metadata.numBytes);
+
+    for (const auto metadata : keyboardEventBuffer)
+        updateInputNoteMask (metadata.data, metadata.numBytes);
+
+    // Copy-then-swap: the source buffers are never mutated while they are
+    // being iterated, so no iterator can be invalidated. Three-byte MIDI
+    // messages are stored inline by juce::MidiMessage, so the per-event path
+    // does not allocate.
     midiSwapBuffer.clear();
 
     // Retire every sounding chord on the bypass edge so no generated note can
@@ -562,68 +675,80 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     if (bypassed)
     {
-        for (const auto metadata : midiMessages)
-            midiSwapBuffer.addEvent (metadata.data, metadata.numBytes,
-                                     metadata.samplePosition);
+        for (int sourceIndex = 0; sourceIndex < 2; ++sourceIndex)
+        {
+            const juce::MidiBuffer& source = sourceIndex == 0 ? midiMessages
+                                                              : keyboardEventBuffer;
+
+            for (const auto metadata : source)
+                midiSwapBuffer.addEvent (metadata.data, metadata.numBytes,
+                                         metadata.samplePosition);
+        }
     }
     else
     {
-        for (const auto metadata : midiMessages)
+        for (int sourceIndex = 0; sourceIndex < 2; ++sourceIndex)
         {
-            const auto* data = metadata.data;
-            const auto numBytes = metadata.numBytes;
-            const auto samplePosition = metadata.samplePosition;
+            const juce::MidiBuffer& source = sourceIndex == 0 ? midiMessages
+                                                              : keyboardEventBuffer;
 
-            if (numBytes == 3)
+            for (const auto metadata : source)
             {
-                const auto status = data[0] & 0xf0;
-                const auto channel = static_cast<int> (data[0] & 0x0f);
-                const auto note = static_cast<int> (data[1]);
-                const auto value = static_cast<int> (data[2]);
+                const auto* data = metadata.data;
+                const auto numBytes = metadata.numBytes;
+                const auto samplePosition = metadata.samplePosition;
 
-                if (status == 0x90 && value > 0)
+                if (numBytes == 3)
                 {
-                    const auto scaledVelocity = static_cast<juce::uint8> (
-                        juce::jlimit (1, 127,
-                            juce::roundToInt (static_cast<float> (value) * velocityGain)));
+                    const auto status = data[0] & 0xf0;
+                    const auto channel = static_cast<int> (data[0] & 0x0f);
+                    const auto note = static_cast<int> (data[1]);
+                    const auto value = static_cast<int> (data[2]);
 
-                    if (! startChord (note, channel, scaledVelocity,
-                                      chordType, complexity, voicing, pitchOffset,
-                                      midiSwapBuffer, samplePosition))
+                    if (status == 0x90 && value > 0)
                     {
-                        // Safety fallback for an empty/invalid shape: keep the
-                        // original note instead of swallowing the key.
-                        midiSwapBuffer.addEvent (
-                            juce::MidiMessage::noteOn (channel + 1, note, scaledVelocity),
-                            samplePosition);
-                    }
+                        const auto scaledVelocity = static_cast<juce::uint8> (
+                            juce::jlimit (1, 127,
+                                juce::roundToInt (static_cast<float> (value) * velocityGain)));
 
-                    continue;
-                }
+                        if (! startChord (note, channel, scaledVelocity,
+                                          chordType, complexity, voicing, pitchOffset,
+                                          midiSwapBuffer, samplePosition))
+                        {
+                            // Safety fallback for an empty/invalid shape: keep the
+                            // original note instead of swallowing the key.
+                            midiSwapBuffer.addEvent (
+                                juce::MidiMessage::noteOn (channel + 1, note, scaledVelocity),
+                                samplePosition);
+                        }
 
-                if (status == 0x80 || (status == 0x90 && value == 0))
-                {
-                    const auto chordIndex = findActiveChord (note, channel);
-
-                    if (chordIndex >= 0)
-                    {
-                        stopChord (activeChords[chordIndex], midiSwapBuffer, samplePosition);
                         continue;
                     }
 
-                    // A note-off aimed at a generated note must not cut a note
-                    // that another chord still owns.
-                    if (isNoteActive (channel, note))
-                        continue;
+                    if (status == 0x80 || (status == 0x90 && value == 0))
+                    {
+                        const auto chordIndex = findActiveChord (note, channel);
 
-                    // Otherwise it belongs to a pass-through/bypassed note.
+                        if (chordIndex >= 0)
+                        {
+                            stopChord (activeChords[chordIndex], midiSwapBuffer, samplePosition);
+                            continue;
+                        }
+
+                        // A note-off aimed at a generated note must not cut a note
+                        // that another chord still owns.
+                        if (isNoteActive (channel, note))
+                            continue;
+
+                        // Otherwise it belongs to a pass-through/bypassed note.
+                    }
+
+                    if (status == 0xB0 && (data[1] == 120 || data[1] == 123))
+                        releaseAllChords (midiSwapBuffer, samplePosition, channel);
                 }
 
-                if (status == 0xB0 && (data[1] == 120 || data[1] == 123))
-                    releaseAllChords (midiSwapBuffer, samplePosition, channel);
+                midiSwapBuffer.addEvent (data, numBytes, samplePosition);
             }
-
-            midiSwapBuffer.addEvent (data, numBytes, samplePosition);
         }
     }
 

@@ -1,30 +1,25 @@
 #include "PluginEditor.h"
 #include "PluginProcessor.h"
 #include "State/ParameterIDs.h"
+#include "UI/OxaniumFonts.h"
 
 namespace
 {
     constexpr int designWidth = 720;
     constexpr int designHeight = 580;
 
-    void drawScrew (juce::Graphics& g, juce::Point<float> centre, float radius)
+    void drawCornerBracket (juce::Graphics& g, juce::Point<float> corner,
+                            float xDirection, float yDirection)
     {
-        const auto bounds = juce::Rectangle<float> (radius * 2.0f, radius * 2.0f)
-                                .withCentre (centre);
+        constexpr float length = 15.0f;
 
-        g.setColour (boilerplate::ui::palette::screw.withAlpha (0.35f));
-        g.fillEllipse (bounds);
-        g.setColour (boilerplate::ui::palette::screw);
-        g.drawEllipse (bounds, 1.0f);
+        g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.90f));
+        g.drawLine (corner.x, corner.y,
+                    corner.x + xDirection * length, corner.y, 1.5f);
 
-        juce::Path slot;
-        slot.addRectangle (-radius * 0.62f, -radius * 0.13f,
-                           radius * 1.24f, radius * 0.26f);
-        slot.applyTransform (juce::AffineTransform::rotation (juce::MathConstants<float>::pi * 0.25f)
-                                 .translated (centre.x, centre.y));
-
-        g.setColour (boilerplate::ui::palette::screwSlot);
-        g.fillPath (slot);
+        g.setColour (wicky::ui::miami::fluorescentPink.withAlpha (0.90f));
+        g.drawLine (corner.x, corner.y,
+                    corner.x, corner.y + yDirection * length, 1.5f);
     }
 }
 
@@ -45,6 +40,12 @@ PluginEditor::PluginEditor (PluginProcessor& owner)
                                     juce::MathConstants<float>::pi * 2.8f,
                                     true);
     gainSlider.setDoubleClickReturnValue (true, 0.0);
+    gainSlider.setColour (juce::Slider::textBoxTextColourId,
+                          wicky::ui::miami::brightMint);
+    gainSlider.setColour (juce::Slider::textBoxBackgroundColourId,
+                          wicky::ui::miami::midnightArcade);
+    gainSlider.setColour (juce::Slider::textBoxOutlineColourId,
+                          wicky::ui::miami::radicalBlue.withAlpha (0.55f));
     gainSlider.setName ("MIDI Velocity Gain");
     gainSlider.setDescription ("Scales the velocity of outgoing MIDI notes in decibels");
     addAndMakeVisible (gainSlider);
@@ -52,12 +53,16 @@ PluginEditor::PluginEditor (PluginProcessor& owner)
     bypassButton.setButtonText ("BYPASS");
     bypassButton.setName ("Bypass");
     bypassButton.setDescription ("Passes MIDI through without velocity scaling");
+    bypassButton.setColour (juce::ToggleButton::textColourId,
+                            wicky::ui::miami::textPrimary);
+    bypassButton.setColour (juce::ToggleButton::tickColourId,
+                            wicky::ui::miami::brightMint);
     addAndMakeVisible (bypassButton);
 
     addAndMakeVisible (chordPanel);
 
     setResizable (true, true);
-    setResizeLimits (560, 450, 1200, 970);
+    setResizeLimits (560, 450, 1400, 1130);
 
     if (auto* constrainer = getConstrainer())
         constrainer->setFixedAspectRatio ((double) designWidth / (double) designHeight);
@@ -75,90 +80,142 @@ void PluginEditor::paint (juce::Graphics& g)
 {
     const auto bounds = getLocalBounds().toFloat();
 
-    g.setGradientFill (juce::ColourGradient (boilerplate::ui::palette::panelTop,
-                                             bounds.getCentreX(), bounds.getY(),
-                                             boilerplate::ui::palette::panelBottom,
-                                             bounds.getCentreX(), bounds.getBottom(),
-                                             false));
+    // Deep matte dark background, with a barely-there electric-blue bloom
+    // behind the title.
+    g.setColour (wicky::ui::miami::midnightArcade);
     g.fillRect (bounds);
 
-    g.setColour (boilerplate::ui::palette::frame);
+    g.setGradientFill (juce::ColourGradient (
+        wicky::ui::miami::radicalBlue.withAlpha (0.10f), bounds.getCentreX(), bounds.getY(),
+        juce::Colours::transparentBlack, bounds.getCentreX(), bounds.getHeight() * 0.42f,
+        false));
+    g.fillRect (bounds);
+
+    g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.55f));
     g.drawRoundedRectangle (bounds.reduced (0.5f), 8.0f, 1.0f);
-    g.setColour (juce::Colours::white.withAlpha (0.04f));
-    g.drawRoundedRectangle (bounds.reduced (4.5f), 6.0f, 1.0f);
 
-    const auto screwInset = (float) scaled (14);
-    const auto screwRadius = (float) scaled (5);
+    g.setColour (wicky::ui::miami::fluorescentPink.withAlpha (0.18f));
+    g.drawRoundedRectangle (bounds.reduced (3.5f), 6.0f, 1.0f);
 
-    drawScrew (g, { screwInset, screwInset }, screwRadius);
-    drawScrew (g, { bounds.getRight() - screwInset, screwInset }, screwRadius);
-    drawScrew (g, { screwInset, bounds.getBottom() - screwInset }, screwRadius);
-    drawScrew (g, { bounds.getRight() - screwInset, bounds.getBottom() - screwInset }, screwRadius);
+    const auto bracketInset = 8.0f;
+    drawCornerBracket (g, { bracketInset, bracketInset }, 1.0f, 1.0f);
+    drawCornerBracket (g, { bounds.getRight() - bracketInset, bracketInset }, -1.0f, 1.0f);
+    drawCornerBracket (g, { bracketInset, bounds.getBottom() - bracketInset }, 1.0f, -1.0f);
+    drawCornerBracket (g, { bounds.getRight() - bracketInset, bounds.getBottom() - bracketInset },
+                       -1.0f, -1.0f);
 
-    auto area = getLocalBounds().reduced (scaled (20));
-    auto header = area.removeFromTop (scaled (64));
+    // -------------------------------------------------------------------------
+    // Header
+    // -------------------------------------------------------------------------
+    if (! headerArea.isEmpty())
+    {
+        auto header = headerArea.toFloat();
+        const auto headerHeight = header.getHeight();
 
-    auto titleArea = header.removeFromTop (scaled (40));
-    const auto titleFont = juce::Font (juce::FontOptions (
-        juce::jmax (18.0f, (float) getHeight() * 0.080f), juce::Font::bold))
-                               .withExtraKerningFactor (0.06f);
+        auto titleArea = header.removeFromTop (headerHeight * 0.62f);
+        auto subtitleArea = header.removeFromTop (headerHeight * 0.23f);
 
-    g.setFont (titleFont);
-    g.setColour (juce::Colours::black.withAlpha (0.55f));
-    g.drawText (JucePlugin_Name, titleArea.translated (0, 1),
-                juce::Justification::centred, false);
-    g.setColour (boilerplate::ui::palette::cream);
-    g.drawText (JucePlugin_Name, titleArea, juce::Justification::centred, false);
+        const auto titleFont = boilerplate::ui::fonts::oxanium (
+            juce::jlimit (18.0f, 26.0f, static_cast<float> (getHeight()) * 0.043f), 700.0f)
+                                   .withExtraKerningFactor (0.07f);
 
-    const auto subtitleFont = juce::Font (juce::FontOptions (
-        juce::jmax (8.5f, (float) getHeight() * 0.029f), juce::Font::plain))
-                                  .withExtraKerningFactor (0.18f);
+        g.setFont (titleFont);
+        g.setColour (wicky::ui::miami::fluorescentPink.withAlpha (0.35f));
+        g.drawText (JucePlugin_Name, titleArea.translated (0.0f, 1.5f),
+                    juce::Justification::centred, false);
 
-    g.setFont (subtitleFont);
-    g.setColour (boilerplate::ui::palette::muted);
-    g.drawText ("JUCE 9  /  CHORD MATRIX  /  MIDI VELOCITY", header,
-                juce::Justification::centred, false);
+        g.setColour (wicky::ui::miami::textPrimary);
+        g.drawText (JucePlugin_Name, titleArea, juce::Justification::centred, false);
 
-    const auto divider = area.removeFromTop (scaled (1));
-    g.setColour (boilerplate::ui::palette::line);
-    g.fillRect (divider);
+        const auto subtitleFont = boilerplate::ui::fonts::oxanium (
+            juce::jmax (8.5f, static_cast<float> (getHeight()) * 0.018f), 700.0f)
+                                      .withExtraKerningFactor (0.22f);
 
-    const auto footer = getLocalBounds().reduced (scaled (20)).removeFromBottom (scaled (24));
-    const auto footerFont = juce::Font (juce::FontOptions (
-        juce::jmax (8.0f, (float) getHeight() * 0.026f), juce::Font::plain))
-                                .withExtraKerningFactor (0.12f);
+        g.setFont (subtitleFont);
+        g.setColour (wicky::ui::miami::highlighterYellow.withAlpha (0.88f));
+        g.drawText ("CHORD MATRIX  //  MIDI VELOCITY", subtitleArea,
+                    juce::Justification::centred, false);
 
-    g.setFont (footerFont);
-    g.setColour (boilerplate::ui::palette::muted);
+        juce::ColourGradient underline (
+            wicky::ui::miami::radicalBlue, static_cast<float> (headerArea.getX()), 0.0f,
+            wicky::ui::miami::fluorescentPink, static_cast<float> (headerArea.getRight()), 0.0f,
+            false);
+        underline.addColour (0.72, wicky::ui::miami::brightMint);
 
-    const char* formats = "VST3 / STANDALONE";
-   #if JUCE_MAC
-    formats = "VST3 / AU / STANDALONE";
-   #endif
+        g.setGradientFill (underline);
+        g.fillRect (headerArea.getX(), headerArea.getBottom() - 2,
+                    headerArea.getWidth(), 2);
+    }
 
-    g.drawText (formats, footer, juce::Justification::centredLeft, false);
-    g.drawText ("v" JucePlugin_VersionString, footer, juce::Justification::centredRight, false);
+    // -------------------------------------------------------------------------
+    // Output strip
+    // -------------------------------------------------------------------------
+    if (! controlsArea.isEmpty())
+    {
+        const auto card = controlsArea.toFloat();
+
+        g.setColour (wicky::ui::miami::controlFace.withAlpha (0.92f));
+        g.fillRoundedRectangle (card, 8.0f);
+
+        g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.80f));
+        g.drawRoundedRectangle (card.reduced (0.5f), 8.0f, 1.2f);
+
+        g.setColour (wicky::ui::miami::radicalBlue.withAlpha (0.35f));
+        g.fillRect (controlsArea.getCentreX(),
+                    controlsArea.getY() + 12,
+                    1, juce::jmax (0, controlsArea.getHeight() - 24));
+
+        g.setColour (wicky::ui::miami::brightMint.withAlpha (0.85f));
+        g.fillEllipse (static_cast<float> (controlsArea.getRight() - 22),
+                       static_cast<float> (controlsArea.getY() + 14), 5.0f, 5.0f);
+    }
+
+    // -------------------------------------------------------------------------
+    // Footer
+    // -------------------------------------------------------------------------
+    if (! footerArea.isEmpty())
+    {
+        const auto footerFont = boilerplate::ui::fonts::oxanium (
+            juce::jmax (8.0f, static_cast<float> (getHeight()) * 0.015f), 400.0f)
+                                    .withExtraKerningFactor (0.12f);
+
+        g.setFont (footerFont);
+        g.setColour (wicky::ui::miami::fluorescentPink.withAlpha (0.70f));
+        g.drawText ("MIAMI NIGHTS", footerArea, juce::Justification::centred, false);
+    }
 }
 
 void PluginEditor::resized()
 {
-    auto area = getLocalBounds().reduced (scaled (20));
+    auto area = getLocalBounds().reduced (scaled (16));
 
-    area.removeFromTop (scaled (64));   // title block drawn in paint()
-    area.removeFromBottom (scaled (24)); // footer drawn in paint()
-    area.removeFromBottom (scaled (8));
+    headerArea = area.removeFromTop (scaled (58));
+    area.removeFromTop (scaled (8));
 
-    const auto controlsHeight = juce::jmin (area.getHeight() / 3, scaled (132));
-    auto controls = area.removeFromBottom (controlsHeight);
+    footerArea = area.removeFromBottom (scaled (18));
+    area.removeFromBottom (scaled (2));
+
+    const auto controlsHeight = juce::jlimit (scaled (78), scaled (92),
+                                              area.getHeight() / 5);
+
+    controlsArea = area.removeFromBottom (controlsHeight);
     area.removeFromBottom (scaled (10));
 
     chordPanel.setBounds (area);
 
-    auto knobArea = controls.removeFromLeft (controls.getWidth() / 2);
-    const auto knobSize = juce::jmin (knobArea.getWidth(), knobArea.getHeight());
-    gainSlider.setBounds (knobArea.withSizeKeepingCentre (knobSize, knobSize));
+    auto knobArea = controlsArea.reduced (scaled (14), scaled (6))
+                               .removeFromLeft (controlsArea.getWidth() / 2);
 
-    bypassButton.setBounds (controls.withSizeKeepingCentre (scaled (150), scaled (36)));
+    gainSlider.setBounds (knobArea.withSizeKeepingCentre (
+        juce::jmin (knobArea.getWidth(), scaled (170)),
+        juce::jmin (knobArea.getHeight(), scaled (80))));
+
+    auto buttonArea = controlsArea.reduced (scaled (14), scaled (6))
+                                 .withTrimmedLeft (controlsArea.getWidth() / 2);
+
+    bypassButton.setBounds (buttonArea.withSizeKeepingCentre (
+        juce::jmin (buttonArea.getWidth(), scaled (168)),
+        juce::jmin (buttonArea.getHeight(), scaled (36))));
 }
 
 int PluginEditor::scaled (int value) const noexcept

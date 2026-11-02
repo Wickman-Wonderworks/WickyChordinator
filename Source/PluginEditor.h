@@ -22,6 +22,10 @@ private:
     PluginProcessor& processorRef;
     boilerplate::ui::BoilerplateLookAndFeel lookAndFeel;
 
+    juce::Rectangle<int> headerArea;
+    juce::Rectangle<int> controlsArea;
+    juce::Rectangle<int> footerArea;
+
     // Declaration order matters: the panel owns parameter attachments that
     // must be destroyed before the controls they point at.
     ChordSettingsPanel chordPanel;

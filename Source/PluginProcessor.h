@@ -2,6 +2,7 @@
 
 #include <atomic>
 
+#include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 
 class PluginProcessor final : public juce::AudioProcessor
@@ -49,6 +50,16 @@ public:
     juce::AudioProcessorValueTreeState& getValueTreeState() noexcept { return apvts; }
 
     //==========================================================================
+    /** Message-thread keyboard state used by the editor's virtual keyboard. */
+    juce::MidiKeyboardState& getKeyboardState() noexcept { return keyboardState; }
+
+    /** Lock-free snapshot of the notes currently held by the host. */
+    juce::uint64 getActiveInputNotes (int wordIndex) const noexcept;
+
+    /** Queues a virtual-keyboard note for the next processBlock without locking. */
+    void queueKeyboardNote (bool noteOn, int midiNote, float velocity) noexcept;
+
+    //==========================================================================
     /** One chord assignment for a single MIDI note. */
     struct ChordRecipe
     {
@@ -66,6 +77,31 @@ public:
     ChordRecipe getKeyRecipe (int midiNote) const noexcept;
 
 private:
+    // Message-thread view of the on-screen keyboard. The audio thread never
+    // touches this object; note events cross over through the FIFO below.
+    juce::MidiKeyboardState keyboardState;
+
+    // Lock-free SPSC bridge from the editor's keyboard to the audio callback.
+    struct KeyboardEvent
+    {
+        juce::uint8 data[3] {};
+    };
+
+    static constexpr int keyboardEventCapacity = 256;
+    static constexpr int keyboardEventBufferBytes = 8192;
+
+    juce::AbstractFifo keyboardEventFifo { keyboardEventCapacity };
+    KeyboardEvent keyboardEvents[keyboardEventCapacity] {};
+    juce::MidiBuffer keyboardEventBuffer;
+
+    // Two 64-bit words: bit n of word 0/1 means "input note n is held".
+    std::atomic<juce::uint64> activeInputNotes[2] {};
+
+    void drainKeyboardEvents() noexcept;
+    void updateInputNoteMask (const juce::uint8* data, int numBytes) noexcept;
+    void setInputNoteActive (int midiNote, bool active) noexcept;
+    void clearInputNotes() noexcept;
+
     // Declared before the raw parameter pointers so that it outlives them.
     juce::AudioProcessorValueTreeState apvts;
 

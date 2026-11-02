@@ -97,6 +97,15 @@ else()
 endif()
 
 #===============================================================================
+# Embedded UI assets
+#===============================================================================
+# Oxanium is licensed under the SIL Open Font License 1.1; the licence text is
+# kept next to the font in Assets/Fonts/Oxanium/OFL.txt.
+juce_add_binary_data(WickyChordinatorAssets
+    SOURCES
+        Assets/Fonts/Oxanium/OxaniumVariable.ttf)
+
+#===============================================================================
 # Plugin target
 #===============================================================================
 set(BOILERPLATE_PLUGIN_FORMATS VST3 Standalone)
@@ -151,7 +160,9 @@ target_sources(JUCEBoilerplate
         Source/State/ParameterLayout.cpp
         Source/State/ParameterLayout.h
         Source/UI/BoilerplateLookAndFeel.cpp
-        Source/UI/BoilerplateLookAndFeel.h)
+        Source/UI/BoilerplateLookAndFeel.h
+        Source/UI/OxaniumFonts.cpp
+        Source/UI/OxaniumFonts.h)
 
 target_include_directories(JUCEBoilerplate PRIVATE Source)
 
@@ -179,6 +190,7 @@ target_link_libraries(JUCEBoilerplate
         juce::juce_data_structures
         juce::juce_graphics
         juce::juce_gui_basics
+        WickyChordinatorAssets
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags)
@@ -190,7 +202,7 @@ endif()
 if(BOILERPLATE_BUILD_TESTS)
     enable_testing()
     add_executable(BoilerplateTests Tests/BoilerplateTests.cpp)
-    target_link_libraries(BoilerplateTests PRIVATE JUCEBoilerplate)
+    target_link_libraries(BoilerplateTests PRIVATE JUCEBoilerplate WickyChordinatorAssets)
     # Reuse the shared code's module settings/headers without compiling JUCE again.
     target_include_directories(BoilerplateTests PRIVATE
         $<TARGET_PROPERTY:JUCEBoilerplate,INCLUDE_DIRECTORIES>)
