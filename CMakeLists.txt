@@ -147,6 +147,18 @@ juce_add_plugin(JUCEBoilerplate
     VST3_AUTO_MANIFEST TRUE
     VST3_CATEGORIES ${_boilerplate_vst3_categories})
 
+# Replace JUCE's default standalone shell with a custom one that drops the
+# muted-input warning strip.
+if("Standalone" IN_LIST BOILERPLATE_PLUGIN_FORMATS)
+    target_compile_definitions(JUCEBoilerplate_Standalone
+        PRIVATE
+            JUCE_USE_CUSTOM_PLUGIN_STANDALONE_APP=1)
+
+    target_sources(JUCEBoilerplate_Standalone
+        PRIVATE
+            Source/Standalone/StandaloneApp.cpp)
+endif()
+
 target_sources(JUCEBoilerplate
     PRIVATE
         Source/PluginProcessor.cpp
