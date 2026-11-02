@@ -9,7 +9,7 @@ Audio passes through unchanged in the default configuration; the Velocity knob
 scales generated MIDI velocities. Route MIDI output to an instrument to hear it.
 The standalone does not contain a synthesizer.
 
-![Project Screenshot](Assets/Images/interface-UI.png)
+![Project Screenshot](Assets/Images/Interface-UI.png)
 
 ## Build
 
