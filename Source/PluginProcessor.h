@@ -100,8 +100,26 @@ public:
     bool hasKeyRecipe (int midiNote) const noexcept;
     /** Returns the override, or the current global matrix values if unassigned. */
     ChordRecipe getKeyRecipe (int midiNote) const noexcept;
+    void setPitchClassRecipe (int pitchClass, ChordRecipe) noexcept;
+    void clearPitchClassRecipe (int pitchClass) noexcept;
+    bool hasPitchClassRecipe (int pitchClass) const noexcept;
+    ChordRecipe getPitchClassRecipe (int pitchClass) const noexcept;
 
 private:
+    static constexpr int midiOutputBytes = 65536;
+    static constexpr int maxInputEventsPerBlock = 4096;
+    friend class PluginProcessorTestAccess;
+    bool midiOverflow = false;
+    std::atomic<bool> keyboardOverflow { false };
+    bool appendMidi (juce::MidiBuffer&, const juce::uint8*, int, int) noexcept;
+    bool appendMidi (juce::MidiBuffer&, const juce::MidiMessage&, int) noexcept;
+    void flushGeneratedNotes (juce::MidiBuffer&, int, int channel = -1) noexcept;
+    bool passThroughNotes[16][128] {};
+    bool inputNotesByChannel[16][128] {};
+    bool outputNotesByChannel[16][128] {};
+    void updateNoteMask (const juce::uint8*, int, bool (&)[16][128],
+                         std::atomic<juce::uint64> (&)[2]) noexcept;
+
     // Display mirror of the on-screen keyboard. The audio thread never touches
     // this object; processBlock publishes the final output note mask below and
     // the editor's timer applies it on the message thread.
@@ -131,8 +149,6 @@ private:
     void drainKeyboardEvents() noexcept;
     void updateInputNoteMask (const juce::uint8* data, int numBytes) noexcept;
     void updateOutputNoteMask (const juce::uint8* data, int numBytes) noexcept;
-    void setInputNoteActive (int midiNote, bool active) noexcept;
-    void setOutputNoteActive (int midiNote, bool active) noexcept;
     void clearInputNotes() noexcept;
     void clearOutputNotes() noexcept;
 
@@ -160,20 +176,26 @@ private:
     std::atomic<float>* noteOffModeParam = nullptr;
     std::atomic<float>* strumParam = nullptr;
     std::atomic<float>* strumModeParam = nullptr;
+    std::atomic<float>* voicingStyleParam = nullptr;
+    std::atomic<float>* humanizeTimingParam = nullptr;
+    std::atomic<float>* scaleRootParam = nullptr;
+    std::atomic<float>* scaleModeParam = nullptr;
 
-    // Audio-thread scratch for the copy-then-swap MIDI pass. Preallocated in
-    // prepareToPlay so processBlock never has to grow it.
-    juce::MidiBuffer midiSwapBuffer;
+    // Owned bounded output scratch. Never exchange its reservation with host storage.
+    juce::MidiBuffer midiOutputBuffer;
 
     //==========================================================================
     // Per-key chord recipes. One packed, lock-free 32-bit atomic per MIDI note:
     // type (2 bits) | complexity (4) | voicing (2) | pitch+12 (5) | override
     // flag (bit 31). A zero value means "no override, use the global matrix".
     std::atomic<juce::uint32> keyRecipes[128] {};
+    std::atomic<juce::uint32> pitchClassRecipes[12] {};
 
     static constexpr juce::uint32 keyRecipeOverrideBit = 1u << 31;
 
    #if defined(__cpp_lib_atomic_is_always_lock_free)
+    static_assert (std::atomic<juce::uint64>::is_always_lock_free,
+                   "Keyboard snapshots require lock-free 64-bit atomics");
     static_assert (std::atomic<juce::uint32>::is_always_lock_free,
                    "Per-key recipes require lock-free 32-bit atomics");
    #endif
@@ -219,7 +241,7 @@ private:
 
     ActiveChord activeChords[maxActiveChords];
     PendingNote pendingNotes[maxPendingNotes] {};
-    juce::uint8 noteRefCounts[midiChannels][128] {};
+    juce::uint16 noteRefCounts[midiChannels][128] {};
     bool wasBypassed = false;
 
     // Snapshot of the block-local engine settings, refreshed at the start of
@@ -233,6 +255,13 @@ private:
     float currentSpreadAmount = 0.0f;
     float currentHumanizeAmount = 0.0f;
     bool currentBypassState = false;
+    int currentHumanizeMaxSamples = 0;
+    int currentVoicingStyle = 0;
+    int currentScaleRoot = 0;
+    int currentScaleMode = 0;
+    juce::uint8 previousVoicing[16][8] {};
+    int previousVoicingCount[16] {};
+    void applyVoicing (juce::uint8*, int, int, int) noexcept;
 
     // Monotonic sample clock for the pending strum/stagger scheduler. Only the
     // audio thread touches it.

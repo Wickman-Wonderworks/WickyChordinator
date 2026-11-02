@@ -47,7 +47,7 @@ PluginEditor::PluginEditor (PluginProcessor& owner)
     setLookAndFeel (&lookAndFeel);
     setOpaque (true);
 
-    presetManager = std::make_unique<wicky::ui::PresetManager> (owner.getValueTreeState());
+    presetManager = std::make_unique<wicky::ui::PresetManager> (owner);
 
     configureStatusBar();
 
@@ -128,7 +128,7 @@ void PluginEditor::configureStatusBar()
     presetSelector.setColour (juce::ComboBox::arrowColourId, miami::brightMint);
     presetSelector.setColour (juce::ComboBox::focusedOutlineColourId, miami::fluorescentPink);
     presetSelector.setName ("Preset");
-    presetSelector.setDescription ("Select a built-in preset");
+    presetSelector.setDescription ("Select a factory or saved user preset");
 
     jassert (presetManager != nullptr);
 
@@ -176,6 +176,14 @@ void PluginEditor::configureStatusBar()
 
     addAndMakeVisible (presetPreviousButton);
     addAndMakeVisible (presetNextButton);
+    styleFlatButton (savePresetButton, "SAVE");
+    savePresetButton.setName ("Save user preset");
+    savePresetButton.onClick = [this] { chooseUserPreset (true); };
+    styleFlatButton (loadPresetButton, "LOAD");
+    loadPresetButton.setName ("Load user preset file");
+    loadPresetButton.onClick = [this] { chooseUserPreset (false); };
+    addAndMakeVisible (loadPresetButton);
+    addAndMakeVisible (savePresetButton);
 
     chordCaption.setText ("NOW PLAYING", juce::dontSendNotification);
     chordCaption.setFont (boilerplate::ui::fonts::oxanium (9.5f, 700.0f)
@@ -217,6 +225,42 @@ void PluginEditor::configureStatusBar()
     gainSlider.setName ("Velocity");
     gainSlider.setDescription ("Scales outgoing MIDI velocity in decibels");
     addAndMakeVisible (gainSlider);
+}
+
+void PluginEditor::refreshPresetList()
+{
+    presetSelector.clear (juce::dontSendNotification);
+    for (int i = 0; i < presetManager->getNumPresets(); ++i)
+        presetSelector.addItem (presetManager->getName (i), i + 1);
+    presetSelector.setSelectedId (presetManager->getCurrentIndex() + 1, juce::dontSendNotification);
+}
+
+void PluginEditor::chooseUserPreset (bool save)
+{
+    auto directory = wicky::ui::PresetManager::getUserPresetDirectory();
+    if (save && directory.createDirectory().failed())
+        directory = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory);
+    presetFileChooser = std::make_unique<juce::FileChooser> (
+        save ? "Save chord preset" : "Load chord preset",
+        save ? directory.getChildFile ("My Preset.wickychord") : directory, "*.wickychord");
+    juce::Component::SafePointer<PluginEditor> safeThis (this);
+    const auto flags = juce::FileBrowserComponent::canSelectFiles
+        | (save ? juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting
+                : juce::FileBrowserComponent::openMode);
+    presetFileChooser->launchAsync (flags, [safeThis, save] (const juce::FileChooser& chooser)
+    {
+        if (safeThis == nullptr || chooser.getResult() == juce::File())
+            return;
+        const auto file = save ? chooser.getResult().withFileExtension ("wickychord") : chooser.getResult();
+        const auto success = save ? safeThis->presetManager->saveUserPreset (file)
+                                  : safeThis->presetManager->loadUserPreset (file);
+        if (! success)
+            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                save ? "Preset could not be saved" : "Preset could not be loaded",
+                save ? "Choose a writable folder and try again." : "Choose a valid Wicky Chordinator preset.");
+        else
+            safeThis->refreshPresetList();
+    });
 }
 
 void PluginEditor::selectPreset (int index)
@@ -352,11 +396,11 @@ void PluginEditor::layoutStatusBar (juce::Rectangle<int> area)
 {
     auto bar = area.reduced (scaled (6), scaled (5));
 
-    auto left = bar.removeFromLeft (scaled (370));
+    auto left = bar.removeFromLeft (scaled (445));
 
-    presetCaption.setBounds (left.removeFromLeft (scaled (54))
+    presetCaption.setBounds (left.removeFromLeft (scaled (50))
                                  .reduced (0, scaled (11)));
-    presetSelector.setBounds (left.removeFromLeft (scaled (226))
+    presetSelector.setBounds (left.removeFromLeft (scaled (190))
                                   .reduced (0, scaled (11)));
     left.removeFromLeft (scaled (4));
     presetPreviousButton.setBounds (left.removeFromLeft (scaled (32))
@@ -364,6 +408,11 @@ void PluginEditor::layoutStatusBar (juce::Rectangle<int> area)
     left.removeFromLeft (scaled (4));
     presetNextButton.setBounds (left.removeFromLeft (scaled (32))
                                     .reduced (0, scaled (11)));
+
+    left.removeFromLeft (scaled (4));
+    loadPresetButton.setBounds (left.removeFromLeft (scaled (60)).reduced (0, scaled (11)));
+    left.removeFromLeft (scaled (4));
+    savePresetButton.setBounds (left.reduced (0, scaled (11)));
 
     auto right = bar.removeFromRight (scaled (232));
 
@@ -373,7 +422,8 @@ void PluginEditor::layoutStatusBar (juce::Rectangle<int> area)
     gainSlider.setBounds (right.removeFromRight (scaled (90))
                               .reduced (0, scaled (2)));
 
-    auto centre = bar;
+    presetCaption.setFont (boilerplate::ui::fonts::oxanium (static_cast<float> (scaled (9)), 700.0f));
+    auto centre = bar.reduced (scaled (12), 0);
     chordCaption.setBounds (centre.removeFromTop (scaled (15)));
     centre.removeFromTop (scaled (3)); // breathing room under the caption
     chordReadout.setBounds (centre.withTrimmedBottom (scaled (10)));
@@ -391,6 +441,9 @@ int PluginEditor::scaled (int value) const noexcept
 //==============================================================================
 void PluginEditor::timerCallback()
 {
+    auto& parameters = processorRef.getValueTreeState();
+    chordKeyboard.setScale (juce::roundToInt (parameters.getRawParameterValue (boilerplate::parameters::scaleRoot)->load()),
+                            juce::roundToInt (parameters.getRawParameterValue (boilerplate::parameters::scaleMode)->load()));
     refreshChordReadout();
     syncKeyboardDisplay();
 }
@@ -451,7 +504,19 @@ juce::String PluginEditor::currentChordSymbol() const
     if (rootNote < 0 || processorRef.getNumSoundingChords() <= 0)
         return "--";
 
-    return chordSymbolFor (rootNote, processorRef.getLastTriggeredChordRecipe());
+    auto& state = processorRef.getValueTreeState();
+    const auto scaleRoot = juce::roundToInt (state.getRawParameterValue (boilerplate::parameters::scaleRoot)->load());
+    const auto scaleMode = juce::roundToInt (state.getRawParameterValue (boilerplate::parameters::scaleMode)->load());
+    if (scaleMode == 2)
+    {
+        juce::StringArray names;
+        for (int note = 0; note < 128; ++note)
+            if ((processorRef.getActiveOutputNotes (note / 64) & (juce::uint64 (1) << (note % 64))) != 0)
+                names.addIfNotAlreadyThere (juce::MidiMessage::getMidiNoteName (note, true, false, 4));
+        return names.isEmpty() ? "--" : names.joinIntoString (" ");
+    }
+    const auto recipe = processorRef.getLastTriggeredChordRecipe();
+    return chordSymbolFor ((rootNote + recipe.pitchOffset + scaleRoot + 144) % 12, recipe);
 }
 
 juce::String PluginEditor::chordSymbolFor (int rootNote,

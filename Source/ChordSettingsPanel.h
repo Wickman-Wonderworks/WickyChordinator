@@ -96,6 +96,15 @@ namespace wicky::ui
 
         int getSelectedNote() const noexcept { return selectedNote; }
 
+        void setScale (int root, int mode)
+        {
+            if (root == scaleRoot && mode == scaleMode)
+                return;
+            scaleRoot = root;
+            scaleMode = mode;
+            repaint();
+        }
+
         /** Releases any note currently held by the mouse (used on teardown). */
         void releaseHeldRawNote()
         {
@@ -159,6 +168,8 @@ namespace wicky::ui
             g.setColour (fill);
             g.fillRect (area);
 
+            drawScaleMarker (midiNoteNumber, g, area);
+
             // Thin separators between adjacent white keys, plus a closing
             // edge after the final key in the visible range.
             g.setColour (lineColour);
@@ -202,9 +213,28 @@ namespace wicky::ui
 
             g.setColour (miami::radicalBlue.withAlpha (0.80f));
             g.drawRect (area.reduced (0.5f), 0.8f);
+            drawScaleMarker (midiNoteNumber, g, area);
         }
 
     private:
+        int scaleRoot = 0, scaleMode = 0;
+        void drawScaleMarker (int note, juce::Graphics& g, juce::Rectangle<float> area)
+        {
+            if (scaleMode == 0)
+                return;
+            const int major[] { 0, 2, 4, 5, 7, 9, 11 };
+            const int minor[] { 0, 2, 3, 5, 7, 8, 10 };
+            const auto pc = (note - scaleRoot + 144) % 12;
+            const auto* degrees = scaleMode == 2 ? minor : major;
+            for (int i = 0; i < 7; ++i)
+                if (degrees[i] == pc)
+                {
+                    g.setColour (miami::brightMint.darker (0.2f));
+                    g.fillEllipse (area.getCentreX() - 2.0f, area.getBottom() - 18.0f, 4.0f, 4.0f);
+                    break;
+                }
+        }
+
         void startRawNote (int midiNoteNumber)
         {
             stopRawNote();
@@ -373,10 +403,10 @@ namespace wicky::ui
     /**
         Factory/built-in preset store, backed by the APVTS ValueTree itself.
 
-        Presets are complete parameter ValueTrees, not ad-hoc structs, so a
-        preset captures exactly what the plugin's native state serialization
-        captures. The per-key recipe map lives in the processor and is therefore
-        never destroyed by loading a global preset.
+        Factory values are applied with parameter gestures. User preset files
+        contain the processor's native state, including both recipe layers.
+        Loading a factory preset retains mappings. Scale is session-owned and
+        is preserved when loading either kind of preset.
     */
     class PresetManager final
     {
@@ -389,20 +419,11 @@ namespace wicky::ui
             // Build the factory baseline from each parameter's real default,
             // not from the live session. The editor can be created after a DAW
             // has restored a session, and preset names must stay deterministic.
-            defaultState = state.copyState();
-            defaultState.removeAllChildren (nullptr);
-
-            for (int i = 0; i < defaultState.getNumProperties(); ++i)
-            {
-                const auto propertyName = defaultState.getPropertyName (i);
-
-                if (auto* parameter = state.getParameter (propertyName.toString()))
-                    defaultState.setProperty (
-                        propertyName,
-                        static_cast<float> (parameter->convertFrom0to1 (
-                            parameter->getDefaultValue())),
-                        nullptr);
-            }
+            defaultState = juce::ValueTree (state.state.getType());
+            for (auto* parameter : state.processor.getParameters())
+                if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (parameter))
+                    defaultState.setProperty (ranged->paramID,
+                        ranged->convertFrom0to1 (ranged->getDefaultValue()), nullptr);
 
             addPreset ("Init", {});
 
@@ -449,6 +470,57 @@ namespace wicky::ui
                   { gain, -4.0f } });
         }
 
+        explicit PresetManager (PluginProcessor& owner)
+            : PresetManager (owner.getValueTreeState())
+        {
+            processor = &owner;
+            auto files = getUserPresetDirectory().findChildFiles (juce::File::findFiles, false, "*.wickychord");
+            files.sort();
+            for (const auto& file : files)
+                presets.push_back ({ file.getFileNameWithoutExtension(), {}, file });
+        }
+
+        static juce::File getUserPresetDirectory()
+        {
+            return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                .getChildFile ("Wickman Wonderworks/Wicky Chordinator/Presets");
+        }
+
+        bool loadUserPreset (const juce::File& file)
+        {
+            for (size_t i = 0; i < presets.size(); ++i)
+                if (presets[i].file == file)
+                    return loadPreset (static_cast<int> (i));
+            presets.push_back ({ file.getFileNameWithoutExtension(), {}, file });
+            if (loadPreset (getNumPresets() - 1))
+                return true;
+            presets.pop_back();
+            return false;
+        }
+
+        bool saveUserPreset (const juce::File& file)
+        {
+            if (processor == nullptr || file.getFileNameWithoutExtension().isEmpty())
+                return false;
+            juce::MemoryBlock data;
+            processor->getStateInformation (data);
+            if (file.getParentDirectory().createDirectory().failed())
+                return false;
+            juce::TemporaryFile temporary (file);
+            if (! temporary.getFile().replaceWithData (data.getData(), data.getSize())
+                || ! temporary.overwriteTargetFileWithTemporary())
+                return false;
+            for (size_t i = 0; i < presets.size(); ++i)
+                if (presets[i].file == file)
+                {
+                    currentIndex = static_cast<int> (i);
+                    return true;
+                }
+            presets.push_back ({ file.getFileNameWithoutExtension(), {}, file });
+            currentIndex = getNumPresets() - 1;
+            return true;
+        }
+
         int getNumPresets() const noexcept
         {
             return static_cast<int> (presets.size());
@@ -469,20 +541,61 @@ namespace wicky::ui
             if (! juce::isPositiveAndBelow (index, getNumPresets()))
                 return false;
 
+            using namespace boilerplate::parameters;
+            const auto root = state.getRawParameterValue (scaleRoot)->load();
+            const auto mode = state.getRawParameterValue (scaleMode)->load();
+            const auto setValue = [&] (const char* id, float value)
+            {
+                if (auto* parameter = state.getParameter (id))
+                {
+                    parameter->beginChangeGesture();
+                    parameter->setValueNotifyingHost (parameter->convertTo0to1 (value));
+                    parameter->endChangeGesture();
+                }
+            };
+            const auto& selected = presets[static_cast<size_t> (index)];
+            if (selected.file != juce::File())
+            {
+                juce::MemoryBlock data;
+                if (processor == nullptr || ! selected.file.loadFileAsData (data))
+                    return false;
+                auto tree = juce::ValueTree::readFromData (data.getData(), data.getSize());
+                if (! tree.hasType (state.state.getType()))
+                    return false;
+                // Scale is a session preference, not a preset setting. Patch it
+                // before recall to avoid even a transient scale change.
+                for (const auto* id : { scaleRoot, scaleMode })
+                {
+                    auto child = tree.getChildWithProperty ("id", id);
+                    if (! child.isValid())
+                    {
+                        child = juce::ValueTree ("PARAM");
+                        child.setProperty ("id", id, nullptr);
+                        tree.appendChild (child, nullptr);
+                    }
+                    child.setProperty ("value", juce::String (id) == scaleRoot ? root : mode, nullptr);
+                }
+                juce::MemoryBlock recalled;
+                juce::MemoryOutputStream stream (recalled, false);
+                tree.writeToStream (stream);
+                processor->setStateInformation (recalled.getData(), static_cast<int> (recalled.getSize()));
+                currentIndex = index;
+                return true;
+            }
             currentIndex = index;
 
             const auto presetState =
                 presets[static_cast<size_t> (index)].state.createCopy();
 
-            // Keep the native APVTS ValueTree authoritative...
-            state.replaceState (presetState.createCopy());
+            // Parameter gestures update the APVTS's native PARAM children.
+            // Never replace it with a property-only pseudo-state.
 
-            // ...and push every stored parameter value through the normal
-            // gesture-safe API. replaceState alone updates the tree, but some
-            // JUCE versions do not copy those values back into the parameters.
+            // Apply defaults and overrides through normal parameter gestures.
             for (int property = 0; property < presetState.getNumProperties(); ++property)
             {
                 const auto propertyName = presetState.getPropertyName (property);
+                if (propertyName.toString() == scaleRoot || propertyName.toString() == scaleMode)
+                    continue;
                 auto* parameter = state.getParameter (propertyName.toString());
 
                 if (parameter == nullptr)
@@ -491,7 +604,7 @@ namespace wicky::ui
                 const auto value = static_cast<float> (
                     static_cast<double> (presetState.getProperty (propertyName)));
 
-                parameter->setValueNotifyingHost (parameter->convertTo0to1 (value));
+                setValue (propertyName.toString().toRawUTF8(), value);
             }
 
             return true;
@@ -518,6 +631,7 @@ namespace wicky::ui
         {
             juce::String name;
             juce::ValueTree state;
+            juce::File file;
         };
 
         void addPreset (juce::String name,
@@ -528,12 +642,13 @@ namespace wicky::ui
             for (const auto& value : values)
                 tree.setProperty (juce::Identifier (value.first), value.second, nullptr);
 
-            presets.push_back ({ std::move (name), std::move (tree) });
+            presets.push_back ({ std::move (name), std::move (tree), {} });
         }
 
         juce::AudioProcessorValueTreeState& state;
         juce::ValueTree defaultState;
         std::vector<Preset> presets;
+        PluginProcessor* processor = nullptr;
         int currentIndex = 0;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PresetManager)
@@ -935,15 +1050,22 @@ namespace wicky::ui
               strumAttachment (state, boilerplate::parameters::strum, strumSlider),
               spreadModeAttachment (state, boilerplate::parameters::spreadMode, spreadModeSelector),
               noteOffAttachment (state, boilerplate::parameters::noteOffMode, noteOffSelector),
-              strumModeAttachment (state, boilerplate::parameters::strumMode, strumModeSelector)
+              strumModeAttachment (state, boilerplate::parameters::strumMode, strumModeSelector),
+              voicingStyleAttachment (state, boilerplate::parameters::voicingStyle, voicingStyleSelector),
+              scaleRootAttachment (state, boilerplate::parameters::scaleRoot, scaleRootSelector),
+              scaleModeAttachment (state, boilerplate::parameters::scaleMode, scaleModeSelector),
+              humanizeTimingAttachment (state, boilerplate::parameters::humanizeTiming, humanizeTimingButton)
         {
+            humanizeTimingButton.setButtonText ("Timing");
+            humanizeTimingButton.setTooltip ("Include up to 10 ms of random note-on delay");
+            addAndMakeVisible (humanizeTimingButton);
             setName ("Global Settings");
             setDescription ("Spread, humanize, strum and their mode selectors");
 
             configureRotary (spreadSlider, spreadLabel, "Spread",
                              "Opens the chord voicing across the keyboard");
             configureRotary (humanizeSlider, humanizeLabel, "Humanize",
-                             "Randomizes chord-note velocity within a tight bracket");
+                             "Randomizes velocity and, when Timing is enabled, note-on timing");
             configureRotary (strumSlider, strumLabel, "Strum",
                              "Delays successive chord tones for a strummed feel");
 
@@ -953,6 +1075,12 @@ namespace wicky::ui
                                boilerplate::parameters::noteOffMode, "Note Off");
             configureSelector (strumModeSelector, strumModeLabel,
                                boilerplate::parameters::strumMode, "Strum Mode");
+            configureSelector (voicingStyleSelector, voicingStyleLabel,
+                               boilerplate::parameters::voicingStyle, "Voicing");
+            configureSelector (scaleRootSelector, scaleRootLabel,
+                               boilerplate::parameters::scaleRoot, "Scale Root");
+            configureSelector (scaleModeSelector, scaleModeLabel,
+                               boilerplate::parameters::scaleMode, "Scale Mode");
         }
 
         void paint (juce::Graphics& g) override
@@ -998,7 +1126,7 @@ namespace wicky::ui
             if (area.getWidth() <= 0 || area.getHeight() <= 0)
                 return;
 
-            auto knobBlock = area.removeFromTop (juce::jlimit (120, 150, area.getHeight() / 2));
+            auto knobBlock = area.removeFromTop (juce::jlimit (66, 105, area.getHeight() / 3));
             area.removeFromTop (8);
 
             const auto knobWidth = knobBlock.getWidth() / 3;
@@ -1012,21 +1140,24 @@ namespace wicky::ui
             strumLabel.setBounds (strumCell.removeFromTop (18));
 
             spreadSlider.setBounds (spreadCell);
+            humanizeTimingButton.setBounds (getWidth() - 95, 4, 90, 22);
             humanizeSlider.setBounds (humanizeCell);
             strumSlider.setBounds (strumCell);
 
-            const auto selectorHeight = juce::jlimit (30, 38, area.getHeight() / 3);
+            const auto selectorHeight = juce::jmax (18, area.getHeight() / 6);
             auto placeSelector = [&] (juce::Label& label, juce::ComboBox& box)
             {
                 auto row = area.removeFromTop (selectorHeight);
                 label.setBounds (row.removeFromLeft (juce::jmin (110, row.getWidth() / 2)));
                 box.setBounds (row.reduced (2, 3));
-                area.removeFromTop (6);
             };
 
             placeSelector (spreadModeLabel, spreadModeSelector);
             placeSelector (noteOffLabel, noteOffSelector);
             placeSelector (strumModeLabel, strumModeSelector);
+            placeSelector (voicingStyleLabel, voicingStyleSelector);
+            placeSelector (scaleRootLabel, scaleRootSelector);
+            placeSelector (scaleModeLabel, scaleModeSelector);
         }
 
     private:
@@ -1103,6 +1234,9 @@ namespace wicky::ui
         juce::ComboBox spreadModeSelector;
         juce::ComboBox noteOffSelector;
         juce::ComboBox strumModeSelector;
+        juce::ComboBox voicingStyleSelector, scaleRootSelector, scaleModeSelector;
+        juce::Label voicingStyleLabel, scaleRootLabel, scaleModeLabel;
+        juce::ToggleButton humanizeTimingButton;
 
         juce::Label spreadLabel;
         juce::Label humanizeLabel;
@@ -1118,6 +1252,10 @@ namespace wicky::ui
         juce::AudioProcessorValueTreeState::ComboBoxAttachment spreadModeAttachment;
         juce::AudioProcessorValueTreeState::ComboBoxAttachment noteOffAttachment;
         juce::AudioProcessorValueTreeState::ComboBoxAttachment strumModeAttachment;
+        juce::AudioProcessorValueTreeState::ComboBoxAttachment voicingStyleAttachment;
+        juce::AudioProcessorValueTreeState::ComboBoxAttachment scaleRootAttachment;
+        juce::AudioProcessorValueTreeState::ComboBoxAttachment scaleModeAttachment;
+        juce::AudioProcessorValueTreeState::ButtonAttachment humanizeTimingAttachment;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GlobalSettingsPanel)
     };
@@ -1198,6 +1336,10 @@ namespace wicky::ui
             addAndMakeVisible (assignKeyButton);
             addAndMakeVisible (clearKeyButton);
 
+            allOctavesButton.setButtonText ("All octaves");
+            allOctavesButton.setToggleState (true, juce::dontSendNotification);
+            allOctavesButton.onClick = [this] { updateKeyMapStatus(); };
+            addAndMakeVisible (allOctavesButton);
             updateKeyMapStatus();
             startTimerHz (20);
         }
@@ -1231,6 +1373,7 @@ namespace wicky::ui
             row.removeFromRight (6);
             loadKeyButton.setBounds (row.removeFromRight (juce::jmin (48, row.getWidth())));
             row.removeFromRight (10);
+            allOctavesButton.setBounds (row.removeFromLeft (juce::jmin (110, row.getWidth())));
             keyStatusLabel.setBounds (row);
         }
 
@@ -1273,16 +1416,21 @@ namespace wicky::ui
             recipe.voicing = readIntParameter (boilerplate::parameters::voicing);
             recipe.pitchOffset = readIntParameter (boilerplate::parameters::pitchOffset);
 
-            processor.setKeyRecipe (selectedKey, recipe);
+            if (allOctavesButton.getToggleState())
+                processor.setPitchClassRecipe (selectedKey % 12, recipe);
+            else
+                processor.setKeyRecipe (selectedKey, recipe);
             updateKeyMapStatus();
         }
 
         void loadSelectedKeyRecipe()
         {
-            if (! processor.hasKeyRecipe (selectedKey))
+            const auto all = allOctavesButton.getToggleState();
+            if (all ? ! processor.hasPitchClassRecipe (selectedKey % 12)
+                    : ! processor.hasKeyRecipe (selectedKey))
                 return;
-
-            const auto recipe = processor.getKeyRecipe (selectedKey);
+            const auto recipe = all ? processor.getPitchClassRecipe (selectedKey % 12)
+                                    : processor.getKeyRecipe (selectedKey);
             setIntParameter (boilerplate::parameters::chordType, recipe.chordType);
             setIntParameter (boilerplate::parameters::complexity, recipe.complexity);
             setIntParameter (boilerplate::parameters::voicing, recipe.voicing);
@@ -1292,14 +1440,20 @@ namespace wicky::ui
 
         void clearSelectedKeyRecipe()
         {
-            processor.clearKeyRecipe (selectedKey);
+            if (allOctavesButton.getToggleState())
+                processor.clearPitchClassRecipe (selectedKey % 12);
+            else
+                processor.clearKeyRecipe (selectedKey);
             updateKeyMapStatus();
         }
 
         void updateKeyMapStatus()
         {
-            const auto hasOverride = processor.hasKeyRecipe (selectedKey);
-            const auto recipe = processor.getKeyRecipe (selectedKey);
+            const auto all = allOctavesButton.getToggleState();
+            const auto hasOverride = all ? processor.hasPitchClassRecipe (selectedKey % 12)
+                                         : processor.hasKeyRecipe (selectedKey);
+            const auto recipe = all ? processor.getPitchClassRecipe (selectedKey % 12)
+                                    : processor.getKeyRecipe (selectedKey);
 
             juce::String status;
 
@@ -1309,7 +1463,7 @@ namespace wicky::ui
                     ? "+" + juce::String (recipe.pitchOffset)
                     : juce::String (recipe.pitchOffset);
 
-                status << "CUSTOM  "
+                status << (all ? "CLASS  " : "NOTE  ")
                        << choiceLabel (boilerplate::parameters::chordType, recipe.chordType)
                        << "/"
                        << choiceLabel (boilerplate::parameters::complexity, recipe.complexity)
@@ -1321,11 +1475,14 @@ namespace wicky::ui
             }
             else
             {
-                status = "GLOBAL  (uses matrix)";
+                status = ! all && processor.hasPitchClassRecipe (selectedKey % 12)
+                    ? "CLASS  (inherited)" : "GLOBAL  (uses matrix)";
                 keyStatusLabel.setColour (juce::Label::textColourId,
                                           miami::highlighterYellow.withAlpha (0.85f));
             }
 
+            if (all && processor.hasKeyRecipe (selectedKey))
+                status << "  [NOTE overrides]";
             if (keyStatusLabel.getText() != status)
                 keyStatusLabel.setText (status, juce::dontSendNotification);
 
@@ -1378,6 +1535,7 @@ namespace wicky::ui
         juce::TextButton loadKeyButton;
         juce::TextButton assignKeyButton;
         juce::TextButton clearKeyButton;
+        juce::ToggleButton allOctavesButton;
 
         int selectedKey = 60;
 

@@ -4,6 +4,8 @@
 #include "State/ParameterLayout.h"
 
 #include <cstring>
+#include <algorithm>
+#include <limits>
 
 namespace
 {
@@ -157,6 +159,10 @@ PluginProcessor::PluginProcessor()
     noteOffModeParam = apvts.getRawParameterValue (boilerplate::parameters::noteOffMode);
     strumParam = apvts.getRawParameterValue (boilerplate::parameters::strum);
     strumModeParam = apvts.getRawParameterValue (boilerplate::parameters::strumMode);
+    voicingStyleParam = apvts.getRawParameterValue (boilerplate::parameters::voicingStyle);
+    humanizeTimingParam = apvts.getRawParameterValue (boilerplate::parameters::humanizeTiming);
+    scaleRootParam = apvts.getRawParameterValue (boilerplate::parameters::scaleRoot);
+    scaleModeParam = apvts.getRawParameterValue (boilerplate::parameters::scaleMode);
 
     jassert (gainDbParameter != nullptr);
     jassert (bypassParameter != nullptr);
@@ -210,7 +216,7 @@ bool PluginProcessor::isMidiEffect() const
 
 double PluginProcessor::getTailLengthSeconds() const
 {
-    return 0.0;
+    return 1.0; // Covers the maximum strum plus staggered MIDI release.
 }
 
 juce::AudioProcessorParameter* PluginProcessor::getBypassParameter() const
@@ -271,6 +277,8 @@ void PluginProcessor::queueKeyboardNote (const bool noteOn, const int midiNote,
         keyboardEvents[start1].data[2] = data2;
         keyboardEventFifo.finishedWrite (1);
     }
+    else
+        keyboardOverflow.store (true, std::memory_order_relaxed);
 }
 
 void PluginProcessor::drainKeyboardEvents() noexcept
@@ -292,80 +300,59 @@ void PluginProcessor::drainKeyboardEvents() noexcept
     keyboardEventFifo.finishedRead (size1 + size2);
 }
 
-void PluginProcessor::setInputNoteActive (const int midiNote, const bool active) noexcept
-{
-    if (! juce::isPositiveAndBelow (midiNote, 128))
-        return;
-
-    auto& word = activeInputNotes[midiNote >> 6];
-    const auto bit = static_cast<juce::uint64> (1) << (midiNote & 63);
-
-    if (active)
-        word.fetch_or (bit, std::memory_order_relaxed);
-    else
-        word.fetch_and (~bit, std::memory_order_relaxed);
-}
-
 void PluginProcessor::clearInputNotes() noexcept
 {
+    std::memset (inputNotesByChannel, 0, sizeof (inputNotesByChannel));
     for (auto& word : activeInputNotes)
         word.store (0, std::memory_order_relaxed);
 }
 
-void PluginProcessor::setOutputNoteActive (const int midiNote, const bool active) noexcept
-{
-    if (! juce::isPositiveAndBelow (midiNote, 128))
-        return;
-
-    auto& word = activeOutputNotes[midiNote >> 6];
-    const auto bit = static_cast<juce::uint64> (1) << (midiNote & 63);
-
-    if (active)
-        word.fetch_or (bit, std::memory_order_relaxed);
-    else
-        word.fetch_and (~bit, std::memory_order_relaxed);
-}
-
 void PluginProcessor::clearOutputNotes() noexcept
 {
+    std::memset (outputNotesByChannel, 0, sizeof (outputNotesByChannel));
     for (auto& word : activeOutputNotes)
         word.store (0, std::memory_order_relaxed);
 }
 
-void PluginProcessor::updateInputNoteMask (const juce::uint8* data,
-                                           const int numBytes) noexcept
+void PluginProcessor::updateNoteMask (const juce::uint8* data, int numBytes,
+                                      bool (&notes)[16][128],
+                                      std::atomic<juce::uint64> (&mask)[2]) noexcept
 {
-    if (data == nullptr || numBytes != 3)
+    if (numBytes != 3 || data == nullptr || data[1] > 127 || data[2] > 127)
+        return;
+    const auto status = data[0] & 0xf0;
+    const auto channel = data[0] & 0x0f;
+    if (status == 0x90 || status == 0x80)
+        notes[channel][data[1]] = status == 0x90 && data[2] != 0;
+    else if (status == 0xb0 && (data[1] == 120 || data[1] == 123))
+        std::memset (notes[channel], 0, sizeof (notes[channel]));
+    else
         return;
 
-    const auto status = data[0] & 0xf0;
-    const auto note = static_cast<int> (data[1]);
-    const auto value = static_cast<int> (data[2]);
-
-    if (status == 0x90 && value > 0)
-        setInputNoteActive (note, true);
-    else if (status == 0x80 || (status == 0x90 && value == 0))
-        setInputNoteActive (note, false);
-    else if (status == 0xB0 && (data[1] == 120 || data[1] == 123))
-        clearInputNotes();
+    // A note event only changes one pitch; CC120/123 may change all pitches.
+    const int first = status == 0xb0 ? 0 : data[1];
+    const int last = status == 0xb0 ? 127 : data[1];
+    for (int note = first; note <= last; ++note)
+    {
+        bool held = false;
+        for (int ch = 0; ch < 16; ++ch)
+            held = held || notes[ch][note];
+        const auto bit = juce::uint64 (1) << (note % 64);
+        if (held)
+            mask[note / 64].fetch_or (bit, std::memory_order_relaxed);
+        else
+            mask[note / 64].fetch_and (~bit, std::memory_order_relaxed);
+    }
 }
 
-void PluginProcessor::updateOutputNoteMask (const juce::uint8* data,
-                                            const int numBytes) noexcept
+void PluginProcessor::updateInputNoteMask (const juce::uint8* data, int numBytes) noexcept
 {
-    if (data == nullptr || numBytes != 3)
-        return;
+    updateNoteMask (data, numBytes, inputNotesByChannel, activeInputNotes);
+}
 
-    const auto status = data[0] & 0xf0;
-    const auto note = static_cast<int> (data[1]);
-    const auto value = static_cast<int> (data[2]);
-
-    if (status == 0x90 && value > 0)
-        setOutputNoteActive (note, true);
-    else if (status == 0x80 || (status == 0x90 && value == 0))
-        setOutputNoteActive (note, false);
-    else if (status == 0xB0 && (data[1] == 120 || data[1] == 123))
-        clearOutputNotes();
+void PluginProcessor::updateOutputNoteMask (const juce::uint8* data, int numBytes) noexcept
+{
+    updateNoteMask (data, numBytes, outputNotesByChannel, activeOutputNotes);
 }
 
 //==============================================================================
@@ -398,16 +385,18 @@ void PluginProcessor::changeProgramName (int index, const juce::String& newName)
 //==============================================================================
 void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    juce::ignoreUnused (sampleRate);
+    juce::ignoreUnused (sampleRate, samplesPerBlock);
 
-    // The copy-then-swap pass reuses this buffer every block. Reserving here
-    // keeps the audio callback allocation-free in steady state.
-    midiSwapBuffer.clear();
-    midiSwapBuffer.ensureSize (static_cast<size_t> (juce::jmax (65536, samplesPerBlock * 128)));
+    // This reservation stays owned by the processor for its entire lifetime.
+    midiOutputBuffer.clear();
+    midiOutputBuffer.ensureSize (midiOutputBytes);
+    midiOutputBuffer.data.resize (midiOutputBytes); // Touch reserved pages before rendering.
+    midiOutputBuffer.clear();
 
     keyboardEventBuffer.clear();
     keyboardEventBuffer.ensureSize (keyboardEventBufferBytes);
     keyboardEventFifo.reset();
+    keyboardOverflow.store (false, std::memory_order_relaxed);
 
     // Re-seed the relaxed PRNG at preparation time. The audio thread only ever
     // performs relaxed loads/stores on this atomic, so no lock or allocation is
@@ -422,7 +411,7 @@ void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 
 void PluginProcessor::releaseResources()
 {
-    midiSwapBuffer.clear();
+    midiOutputBuffer.clear();
     resetChordState();
 }
 
@@ -441,6 +430,8 @@ void PluginProcessor::resetChordState() noexcept
         pending = {};
 
     std::memset (noteRefCounts, 0, sizeof (noteRefCounts));
+    std::memset (passThroughNotes, 0, sizeof (passThroughNotes));
+    std::memset (previousVoicingCount, 0, sizeof (previousVoicingCount));
     clearInputNotes();
     clearOutputNotes();
 
@@ -525,6 +516,9 @@ PluginProcessor::ChordRecipe PluginProcessor::getKeyRecipe (int midiNote) const 
 
         if ((packed & keyRecipeOverrideBit) != 0)
             return unpackKeyRecipe (packed);
+        const auto pitchClass = pitchClassRecipes[midiNote % 12].load (std::memory_order_acquire);
+        if ((pitchClass & keyRecipeOverrideBit) != 0)
+            return unpackKeyRecipe (pitchClass);
     }
 
     // Unassigned key: report the current global matrix values.
@@ -541,6 +535,27 @@ PluginProcessor::ChordRecipe PluginProcessor::getKeyRecipe (int midiNote) const 
     return fallback;
 }
 
+void PluginProcessor::setPitchClassRecipe (int pitchClass, ChordRecipe recipe) noexcept
+{
+    if (juce::isPositiveAndBelow (pitchClass, 12))
+        pitchClassRecipes[pitchClass].store (packKeyRecipe (recipe), std::memory_order_release);
+}
+void PluginProcessor::clearPitchClassRecipe (int pitchClass) noexcept
+{
+    if (juce::isPositiveAndBelow (pitchClass, 12))
+        pitchClassRecipes[pitchClass].store (0, std::memory_order_release);
+}
+bool PluginProcessor::hasPitchClassRecipe (int pitchClass) const noexcept
+{
+    return juce::isPositiveAndBelow (pitchClass, 12)
+        && (pitchClassRecipes[pitchClass].load() & keyRecipeOverrideBit) != 0;
+}
+PluginProcessor::ChordRecipe PluginProcessor::getPitchClassRecipe (int pitchClass) const noexcept
+{
+    return hasPitchClassRecipe (pitchClass) ? unpackKeyRecipe (pitchClassRecipes[pitchClass].load())
+                                          : ChordRecipe {};
+}
+
 //==============================================================================
 int PluginProcessor::buildChordNotes (int triggerNote, int chordType, int complexity,
                                       int voicing, int pitchOffset,
@@ -549,22 +564,6 @@ int PluginProcessor::buildChordNotes (int triggerNote, int chordType, int comple
 {
     if (notesOut == nullptr)
         return 0;
-
-    // Per-key assignment: an explicit override wins; otherwise the global UI
-    // matrix values passed in from processBlock are used.
-    if (juce::isPositiveAndBelow (triggerNote, 128))
-    {
-        const auto packed = keyRecipes[triggerNote].load (std::memory_order_acquire);
-
-        if ((packed & keyRecipeOverrideBit) != 0)
-        {
-            const auto recipe = unpackKeyRecipe (packed);
-            chordType = recipe.chordType;
-            complexity = recipe.complexity;
-            voicing = recipe.voicing;
-            pitchOffset = recipe.pitchOffset;
-        }
-    }
 
     chordType = juce::jlimit (0, chordTypeCount - 1, chordType);
     complexity = juce::jlimit (0, complexityCount - 1, complexity);
@@ -591,7 +590,8 @@ int PluginProcessor::buildChordNotes (int triggerNote, int chordType, int comple
 
     // Per-key assignment: the trigger key is the chord root, so different keys
     // and octaves generate different chords from the same matrix state.
-    int base = triggerNote + pitchOffset + voicingOctaveOffset (voicing);
+    int base = triggerNote + pitchOffset
+             + (currentVoicingStyle == 0 ? voicingOctaveOffset (voicing) : 0);
 
     // Keep the whole shape inside the MIDI range by moving it in octaves. This
     // preserves the intervals instead of folding individual notes into a
@@ -608,15 +608,28 @@ int PluginProcessor::buildChordNotes (int triggerNote, int chordType, int comple
         return 0;
 
     int count = 0;
+    int scaledNotes[maxChordTones] {};
 
     for (int i = 0; i < numTones; ++i)
     {
-        const auto note = base + shape.intervals[i] + spreadOffsets[i];
-
-        if (note >= 0 && note <= 127)
-            notesOut[count++] = static_cast<juce::uint8> (note);
+        auto note = base + shape.intervals[i] + spreadOffsets[i];
+        // Map C-major white-note degrees into the selected natural-minor scale.
+        // Accidentals retain their chromatic position; root transposes all notes.
+        if (currentScaleMode == 2)
+        {
+            const auto pc = note % 12;
+            if (pc == 4 || pc == 9 || pc == 11)
+                --note;
+        }
+        note += currentScaleRoot;
+        scaledNotes[count++] = note;
     }
 
+    while (count > 0 && scaledNotes[count - 1] > 127)
+        for (int i = 0; i < count; ++i)
+            scaledNotes[i] -= 12;
+    for (int i = 0; i < count; ++i)
+        notesOut[i] = static_cast<juce::uint8> (scaledNotes[i]);
     return count;
 }
 
@@ -675,12 +688,11 @@ void PluginProcessor::emitNoteOn (int chordIndex, int noteIndex, int note,
 
     auto& refCount = noteRefCounts[channel][note];
 
-    if (refCount == 0)
-        output.addEvent (juce::MidiMessage::noteOn (channel + 1, note, velocity),
+    if (refCount == 0 && ! passThroughNotes[channel][note])
+        appendMidi (output, juce::MidiMessage::noteOn (channel + 1, note, velocity),
                          samplePosition);
 
-    if (refCount < 255)
-        ++refCount;
+    ++refCount;
 }
 
 void PluginProcessor::scheduleNoteOn (int chordIndex, int noteIndex, int note,
@@ -690,22 +702,12 @@ void PluginProcessor::scheduleNoteOn (int chordIndex, int noteIndex, int note,
 {
     targetSample = juce::jmax (0, targetSample);
 
-    // With no strum, preserve the original immediate path exactly. This keeps
-    // sample positions and ref-counting identical for existing presets.
-    if (currentStrumStepSamples <= 0 || targetSample < currentBlockSize)
+    if (currentStrumStepSamples <= 0 && currentHumanizeMaxSamples <= 0)
     {
-        if (currentStrumStepSamples <= 0)
-        {
-            emitNoteOn (chordIndex, noteIndex, note, channel, velocity,
-                        juce::jmin (targetSample, juce::jmax (0, currentBlockSize - 1)),
-                        output);
-            return;
-        }
+        emitNoteOn (chordIndex, noteIndex, note, channel, velocity, targetSample, output);
+        return;
     }
 
-    // Strummed notes are always queued, even when their target lies inside the
-    // current block. This lets a fast note-off in the same block cancel the
-    // remaining notes before any premature note-on reaches the host.
     for (auto& pending : pendingNotes)
     {
         if (pending.active)
@@ -725,7 +727,7 @@ void PluginProcessor::scheduleNoteOn (int chordIndex, int noteIndex, int note,
     // Queue exhausted: fall back to an immediate note so the key is never
     // silently swallowed.
     emitNoteOn (chordIndex, noteIndex, note, channel, velocity,
-                juce::jmax (0, currentBlockSize - 1), output);
+                juce::jlimit (0, juce::jmax (0, currentBlockSize - 1), targetSample), output);
 }
 
 void PluginProcessor::scheduleNoteOff (int channel, int note, int targetSample,
@@ -733,16 +735,6 @@ void PluginProcessor::scheduleNoteOff (int channel, int note, int targetSample,
 {
     if (! juce::isPositiveAndBelow (channel, midiChannels)
         || ! juce::isPositiveAndBelow (note, 128))
-        return;
-
-    // Release ownership immediately, but defer the wire-level note-off. If
-    // another chord still owns the note, no event is needed at all.
-    auto& refCount = noteRefCounts[channel][note];
-
-    if (refCount > 0)
-        --refCount;
-
-    if (refCount != 0)
         return;
 
     targetSample = juce::jmax (0, targetSample);
@@ -763,47 +755,81 @@ void PluginProcessor::scheduleNoteOff (int channel, int note, int targetSample,
         return;
     }
 
-    // Queue exhausted: send the note-off right away rather than leak a note.
-    output.addEvent (juce::MidiMessage::noteOff (channel + 1, note),
-                     juce::jmax (0, currentBlockSize - 1));
+    // Queue pressure: release this ownership immediately rather than leak it.
+    auto& count = noteRefCounts[channel][note];
+    if (count > 0 && --count == 0 && ! passThroughNotes[channel][note])
+        appendMidi (output, juce::MidiMessage::noteOff (channel + 1, note),
+                    juce::jlimit (0, juce::jmax (0, currentBlockSize - 1), targetSample));
 }
 
-void PluginProcessor::processPendingNotes (juce::MidiBuffer& output,
-                                           int numSamples) noexcept
+void PluginProcessor::processPendingNotes (juce::MidiBuffer& output, int endSample) noexcept
 {
-    if (numSamples <= 0)
-        return;
-
-    const auto blockStart = totalSamplesProcessed;
-    const auto blockEnd = blockStart + static_cast<juce::int64> (numSamples);
-
-    for (auto& pending : pendingNotes)
+    // Dispatch strictly before endSample, in timestamp order (stable for ties).
+    const auto end = totalSamplesProcessed + endSample;
+    for (;;)
     {
-        if (! pending.active || pending.dueSample >= blockEnd)
-            continue;
-
-        const auto position = static_cast<int> (
-            juce::jlimit<juce::int64> (0, static_cast<juce::int64> (numSamples - 1),
-                                       pending.dueSample - blockStart));
-
-        if (pending.isNoteOn)
+        PendingNote* next = nullptr;
+        for (auto& pending : pendingNotes)
+            if (pending.active && pending.dueSample < end
+                && (next == nullptr || pending.dueSample < next->dueSample))
+                next = &pending;
+        if (next == nullptr)
+            return;
+        const auto event = *next;
+        next->active = false;
+        const auto position = static_cast<int> (juce::jlimit<juce::int64> (
+            0, juce::jmax (0, currentBlockSize - 1), event.dueSample - totalSamplesProcessed));
+        if (event.isNoteOn)
         {
-            // Bypass may have engaged after this note was scheduled.
             if (! currentBypassState)
-                emitNoteOn (pending.chordIndex, pending.noteIndex, pending.note,
-                            pending.channel, pending.velocity, position, output);
+                emitNoteOn (event.chordIndex, event.noteIndex, event.note, event.channel,
+                            event.velocity, position, output);
         }
         else
         {
-            // The ref-count was already decremented when the release was
-            // scheduled. Only emit the wire note-off if nobody re-took the note
-            // in the meantime.
-            if (noteRefCounts[pending.channel][pending.note] == 0)
-                output.addEvent (
-                    juce::MidiMessage::noteOff (pending.channel + 1, pending.note),
-                    position);
+            auto& count = noteRefCounts[event.channel][event.note];
+            if (count > 0 && --count == 0 && ! passThroughNotes[event.channel][event.note])
+                appendMidi (output, juce::MidiMessage::noteOff (event.channel + 1, event.note), position);
         }
+    }
+}
 
+bool PluginProcessor::appendMidi (juce::MidiBuffer& output, const juce::MidiMessage& message,
+                                  int position) noexcept
+{
+    return appendMidi (output, message.getRawData(), message.getRawDataSize(), position);
+}
+
+bool PluginProcessor::appendMidi (juce::MidiBuffer& output, const juce::uint8* bytes,
+                                  int size, int position) noexcept
+{
+    // JUCE 9 MidiBuffer stores a 32-bit timestamp and 16-bit length per event.
+    constexpr int overhead = sizeof (juce::int32) + sizeof (juce::uint16);
+    if (size <= 0 || size > 65535 - overhead
+        || size > midiOutputBytes - overhead - output.data.size())
+    {
+        midiOverflow = true;
+        return false;
+    }
+    return output.addEvent (bytes, size, position);
+}
+
+void PluginProcessor::flushGeneratedNotes (juce::MidiBuffer& output, int position, int channel) noexcept
+{
+    const auto savedMode = currentNoteOffMode;
+    currentNoteOffMode = 0;
+    releaseAllChords (output, position, channel);
+    currentNoteOffMode = savedMode;
+    for (auto& pending : pendingNotes)
+    {
+        if (! pending.active || (channel >= 0 && pending.channel != channel))
+            continue;
+        if (! pending.isNoteOn)
+        {
+            auto& count = noteRefCounts[pending.channel][pending.note];
+            if (count > 0 && --count == 0 && ! passThroughNotes[pending.channel][pending.note])
+                appendMidi (output, juce::MidiMessage::noteOff (pending.channel + 1, pending.note), position);
+        }
         pending.active = false;
     }
 }
@@ -816,6 +842,59 @@ void PluginProcessor::cancelPendingNotesForChord (int chordIndex) noexcept
 }
 
 //==============================================================================
+void PluginProcessor::applyVoicing (juce::uint8* notes, int count, int voicing, int channel) noexcept
+{
+    if (currentVoicingStyle == 0 || count <= 0)
+        return;
+    int best[8] {};
+    int bestScore = std::numeric_limits<int>::max();
+    const auto selected = currentVoicingStyle == 2 ? static_cast<int> (nextRandom() % 3) : voicing;
+    for (int inversion = 0; inversion < 3; ++inversion)
+    {
+        // 0 = High (first inversion), 1 = Root, 2 = Low (previous inversion).
+        if (currentVoicingStyle != 3 && inversion != selected)
+            continue;
+        int candidate[8] {};
+        for (int i = 0; i < count; ++i)
+            candidate[i] = notes[i];
+        if (inversion == 0 && count > 1)
+            candidate[0] += 12;
+        else if (inversion == 2 && count > 1)
+            while (candidate[count - 1] >= candidate[0])
+                candidate[count - 1] -= 12;
+        std::sort (candidate, candidate + count);
+        for (int shift = -12; shift <= 12; shift += 12)
+        {
+            if (currentVoicingStyle != 3 && shift != 0)
+                continue;
+            if (candidate[0] + shift < 0 || candidate[count - 1] + shift > 127)
+                continue;
+            int score = 0;
+            if (previousVoicingCount[channel] > 0 && currentVoicingStyle == 3)
+                for (int i = 0; i < count; ++i)
+                {
+                    int distance = 128;
+                    for (int j = 0; j < previousVoicingCount[channel]; ++j)
+                        distance = juce::jmin (distance, std::abs (candidate[i] + shift - previousVoicing[channel][j]));
+                    score += distance;
+                }
+            else
+                score = std::abs (candidate[0] + shift - notes[0]);
+            if (score < bestScore)
+            {
+                bestScore = score;
+                for (int i = 0; i < count; ++i)
+                    best[i] = candidate[i] + shift;
+            }
+        }
+    }
+    if (bestScore != std::numeric_limits<int>::max())
+        for (int i = 0; i < count; ++i)
+            notes[i] = static_cast<juce::uint8> (best[i]);
+    previousVoicingCount[channel] = count;
+    std::copy (notes, notes + count, previousVoicing[channel]);
+}
+
 bool PluginProcessor::startChord (int triggerNote, int channel, juce::uint8 velocity,
                                   int chordType, int complexity, int voicing, int pitchOffset,
                                   juce::MidiBuffer& output, int samplePosition) noexcept
@@ -834,9 +913,26 @@ bool PluginProcessor::startChord (int triggerNote, int channel, juce::uint8 velo
         }
     }
 
+    ChordRecipe evaluatedRecipe;
+    evaluatedRecipe.chordType = chordType;
+    evaluatedRecipe.complexity = complexity;
+    evaluatedRecipe.voicing = voicing;
+    evaluatedRecipe.pitchOffset = pitchOffset;
+
+    if (juce::isPositiveAndBelow (triggerNote, 128))
+    {
+        auto packed = keyRecipes[triggerNote].load (std::memory_order_acquire);
+        if ((packed & keyRecipeOverrideBit) == 0)
+            packed = pitchClassRecipes[triggerNote % 12].load (std::memory_order_acquire);
+
+        if ((packed & keyRecipeOverrideBit) != 0)
+            evaluatedRecipe = unpackKeyRecipe (packed);
+    }
+
+
     juce::uint8 notes[maxChordTones] {};
-    const auto numNotes = buildChordNotes (triggerNote, chordType, complexity,
-                                           voicing, pitchOffset,
+    const auto numNotes = buildChordNotes (triggerNote, evaluatedRecipe.chordType, evaluatedRecipe.complexity,
+                                           evaluatedRecipe.voicing, evaluatedRecipe.pitchOffset,
                                            currentSpreadAmount, currentSpreadMode,
                                            notes);
 
@@ -863,6 +959,8 @@ bool PluginProcessor::startChord (int triggerNote, int channel, juce::uint8 velo
         stopChord (*slot, output, samplePosition);
     }
 
+    applyVoicing (notes, numNotes, evaluatedRecipe.voicing, channel);
+
     const auto chordIndex = static_cast<int> (slot - activeChords);
 
     slot->triggerNote = triggerNote;
@@ -878,23 +976,6 @@ bool PluginProcessor::startChord (int triggerNote, int channel, juce::uint8 velo
     soundingChordCount.fetch_add (1, std::memory_order_relaxed);
     lastTriggeredChordNote.store (triggerNote, std::memory_order_relaxed);
 
-    // Preserve the exact evaluated recipe for the editor's symbol readout.
-    // Per-key overrides win over the global matrix exactly as they do when
-    // buildChordNotes constructed the notes above.
-    ChordRecipe evaluatedRecipe;
-    evaluatedRecipe.chordType = chordType;
-    evaluatedRecipe.complexity = complexity;
-    evaluatedRecipe.voicing = voicing;
-    evaluatedRecipe.pitchOffset = pitchOffset;
-
-    if (juce::isPositiveAndBelow (triggerNote, 128))
-    {
-        const auto packed = keyRecipes[triggerNote].load (std::memory_order_acquire);
-
-        if ((packed & keyRecipeOverrideBit) != 0)
-            evaluatedRecipe = unpackKeyRecipe (packed);
-    }
-
     lastTriggeredRecipe.store (packKeyRecipe (evaluatedRecipe),
                                std::memory_order_relaxed);
 
@@ -905,7 +986,9 @@ bool PluginProcessor::startChord (int triggerNote, int channel, juce::uint8 velo
     for (int order = 0; order < numNotes; ++order)
     {
         const auto noteIndex = down ? (numNotes - 1 - order) : order;
-        const auto delaySamples = currentStrumStepSamples * order;
+        const auto jitter = currentHumanizeMaxSamples > 0
+            ? static_cast<int> (nextRandom() % static_cast<juce::uint32> (currentHumanizeMaxSamples + 1)) : 0;
+        const auto delaySamples = currentStrumStepSamples * order + jitter;
 
         scheduleNoteOn (chordIndex, noteIndex, notes[noteIndex], channel,
                         humanizedVelocity (velocity),
@@ -952,8 +1035,8 @@ void PluginProcessor::stopChord (ActiveChord& chord, juce::MidiBuffer& output,
             {
                 --refCount;
 
-                if (refCount == 0)
-                    output.addEvent (juce::MidiMessage::noteOff (channel + 1, note),
+                if (refCount == 0 && ! passThroughNotes[channel][note])
+                    appendMidi (output, juce::MidiMessage::noteOff (channel + 1, note),
                                      samplePosition);
             }
         }
@@ -993,6 +1076,9 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                     juce::MidiBuffer& midiMessages)
 {
     juce::ScopedNoDenormals noDenormals;
+    if (buffer.getNumSamples() <= 0)
+        return; // Leave UI FIFO and scheduler untouched until time advances.
+    midiOverflow = keyboardOverflow.exchange (false, std::memory_order_relaxed);
 
     // Chord Settings Matrix. Relaxed ordering is enough for independent
     // scalars: these values are consumed by the MIDI math below and do not
@@ -1037,6 +1123,11 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     currentSpreadAmount = spreadValue / 100.0f;
     currentHumanizeAmount = humanizeValue / 100.0f;
     currentBypassState = bypassed;
+    currentVoicingStyle = juce::jlimit (0, 3, juce::roundToInt (voicingStyleParam->load()));
+    currentScaleRoot = juce::jlimit (0, 11, juce::roundToInt (scaleRootParam->load()));
+    currentScaleMode = juce::jlimit (0, 2, juce::roundToInt (scaleModeParam->load()));
+    currentHumanizeMaxSamples = humanizeTimingParam->load() > 0.5f
+        ? juce::roundToInt (currentHumanizeAmount * 0.010 * sampleRate) : 0;
 
     currentStrumStepSamples = juce::roundToInt (
         (strumValue / 100.0f) * maxStrumSecondsPerStep * sampleRate);
@@ -1068,114 +1159,110 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     keyboardEventBuffer.clear();
     drainKeyboardEvents();
 
-    // UI-only mirror of the held input notes. It never influences the audio
-    // path; the editor polls it to highlight keys on the virtual keyboard.
-    for (const auto metadata : midiMessages)
-        updateInputNoteMask (metadata.data, metadata.numBytes);
-
-    for (const auto metadata : keyboardEventBuffer)
-        updateInputNoteMask (metadata.data, metadata.numBytes);
-
-    // Copy-then-swap: the source buffers are never mutated while they are
-    // being iterated, so no iterator can be invalidated. Three-byte MIDI
-    // messages are stored inline by juce::MidiMessage, so the per-event path
-    // does not allocate.
-    midiSwapBuffer.clear();
-
-    // Retire every sounding chord on the bypass edge so no generated note can
-    // be orphaned while the input is passed through.
+    midiOutputBuffer.clear();
     if (bypassed && ! wasBypassed)
-        releaseAllChords (midiSwapBuffer, 0);
-
+        flushGeneratedNotes (midiOutputBuffer, 0);
     wasBypassed = bypassed;
 
-    if (bypassed)
+    auto processInput = [&] (const juce::MidiMessageMetadata& metadata)
     {
-        for (int sourceIndex = 0; sourceIndex < 2; ++sourceIndex)
+        const auto* data = metadata.data;
+        const auto size = metadata.numBytes;
+        const auto position = juce::jlimit (0, currentBlockSize - 1, metadata.samplePosition);
+        // Events due at this timestamp precede the incoming event. Thus a
+        // note-off only cancels future tones, never tones already due.
+        processPendingNotes (midiOutputBuffer, position + 1);
+        updateInputNoteMask (data, size);
+        if (size == 3 && data[1] < 128 && data[2] < 128)
         {
-            const juce::MidiBuffer& source = sourceIndex == 0 ? midiMessages
-                                                              : keyboardEventBuffer;
-
-            for (const auto metadata : source)
-                midiSwapBuffer.addEvent (metadata.data, metadata.numBytes,
-                                         metadata.samplePosition);
-        }
-    }
-    else
-    {
-        for (int sourceIndex = 0; sourceIndex < 2; ++sourceIndex)
-        {
-            const juce::MidiBuffer& source = sourceIndex == 0 ? midiMessages
-                                                              : keyboardEventBuffer;
-
-            for (const auto metadata : source)
+            const auto status = data[0] & 0xf0;
+            const auto channel = data[0] & 0x0f;
+            const auto note = static_cast<int> (data[1]);
+            const auto value = static_cast<int> (data[2]);
+            auto& rawHeld = passThroughNotes[channel][note];
+            if (status == 0x90 && value > 0)
             {
-                const auto* data = metadata.data;
-                const auto numBytes = metadata.numBytes;
-                const auto samplePosition = metadata.samplePosition;
-
-                if (numBytes == 3)
+                if (rawHeld)
                 {
-                    const auto status = data[0] & 0xf0;
-                    const auto channel = static_cast<int> (data[0] & 0x0f);
-                    const auto note = static_cast<int> (data[1]);
-                    const auto value = static_cast<int> (data[2]);
-
-                    if (status == 0x90 && value > 0)
-                    {
-                        const auto scaledVelocity = static_cast<juce::uint8> (
-                            juce::jlimit (1, 127,
-                                juce::roundToInt (static_cast<float> (value) * velocityGain)));
-
-                        if (! startChord (note, channel, scaledVelocity,
-                                          chordType, complexity, voicing, pitchOffset,
-                                          midiSwapBuffer, samplePosition))
-                        {
-                            // Safety fallback for an empty/invalid shape: keep the
-                            // original note instead of swallowing the key.
-                            midiSwapBuffer.addEvent (
-                                juce::MidiMessage::noteOn (channel + 1, note, scaledVelocity),
-                                samplePosition);
-                        }
-
-                        continue;
-                    }
-
-                    if (status == 0x80 || (status == 0x90 && value == 0))
-                    {
-                        const auto chordIndex = findActiveChord (note, channel);
-
-                        if (chordIndex >= 0)
-                        {
-                            stopChord (activeChords[chordIndex], midiSwapBuffer, samplePosition);
-                            continue;
-                        }
-
-                        // A note-off aimed at a generated note must not cut a note
-                        // that another chord still owns.
-                        if (isNoteActive (channel, note))
-                            continue;
-
-                        // Otherwise it belongs to a pass-through/bypassed note.
-                    }
-
-                    if (status == 0xB0 && (data[1] == 120 || data[1] == 123))
-                        releaseAllChords (midiSwapBuffer, samplePosition, channel);
+                    rawHeld = false;
+                    if (! isNoteActive (channel, note))
+                        appendMidi (midiOutputBuffer, juce::MidiMessage::noteOff (channel + 1, note), position);
                 }
-
-                midiSwapBuffer.addEvent (data, numBytes, samplePosition);
+                if (bypassed)
+                {
+                    rawHeld = true;
+                    appendMidi (midiOutputBuffer, data, size, position);
+                }
+                else
+                {
+                    const auto velocity = static_cast<juce::uint8> (juce::jlimit (1, 127,
+                        juce::roundToInt (static_cast<float> (value) * velocityGain)));
+                    startChord (note, channel, velocity, chordType, complexity, voicing,
+                                pitchOffset, midiOutputBuffer, position);
+                }
+                return;
+            }
+            if (status == 0x80 || (status == 0x90 && value == 0))
+            {
+                if (rawHeld)
+                {
+                    rawHeld = false;
+                    if (! isNoteActive (channel, note))
+                        appendMidi (midiOutputBuffer, data, size, position);
+                    return;
+                }
+                const auto index = findActiveChord (note, channel);
+                if (index >= 0)
+                {
+                    stopChord (activeChords[index], midiOutputBuffer, position);
+                    return;
+                }
+                if (isNoteActive (channel, note))
+                    return;
+            }
+            if (status == 0xb0 && (note == 120 || note == 123))
+            {
+                flushGeneratedNotes (midiOutputBuffer, position, channel);
+                std::memset (passThroughNotes[channel], 0, sizeof (passThroughNotes[channel]));
             }
         }
-    }
+        appendMidi (midiOutputBuffer, data, size, position);
+    };
 
-    // Dispatch strummed note-ons and staggered note-offs whose sample time has
-    // arrived. This runs after all incoming events so a fast release in the
-    // same block can cancel pending note-ons before they reach the host.
-    processPendingNotes (midiSwapBuffer, currentBlockSize);
+    // UI events have timestamp zero. Process these before the sorted host
+    // stream so ownership and pending events always move forwards in time.
+    for (const auto metadata : keyboardEventBuffer)
+        processInput (metadata);
+    int inputs = 0;
+    for (const auto metadata : midiMessages)
+    {
+        if (++inputs > maxInputEventsPerBlock || midiOverflow)
+        {
+            midiOverflow = true;
+            break;
+        }
+        processInput (metadata);
+    }
+    processPendingNotes (midiOutputBuffer, currentBlockSize);
+    if (midiOverflow)
+    {
+        // Bounded overload policy: abandon the block and silence every channel
+        // rather than drop a release and leave the destination stuck.
+        midiOutputBuffer.clear();
+        resetChordState();
+        for (int channel = 1; channel <= 16; ++channel)
+        {
+            appendMidi (midiOutputBuffer, juce::MidiMessage::allSoundOff (channel), 0);
+            appendMidi (midiOutputBuffer, juce::MidiMessage::allNotesOff (channel), 0);
+        }
+    }
 
     totalSamplesProcessed += static_cast<juce::int64> (currentBlockSize);
 
-    midiMessages.swapWith (midiSwapBuffer);
+    // Preserve our reservation. The host owns this destination; its JUCE
+    // buffer may grow here if the host did not reserve enough for expansion.
+    midiMessages.clear();
+    midiMessages.addEvents (midiOutputBuffer, 0, currentBlockSize, 0);
 
     // Publish the notes that survive in the final, chord-expanded buffer. The
     // virtual keyboard reads this lock-free mask on the message thread, so the
@@ -1219,6 +1306,19 @@ juce::ValueTree PluginProcessor::createKeyRecipeState() const
         root.appendChild (key, nullptr);
     }
 
+    for (int pc = 0; pc < 12; ++pc)
+    {
+        if (! hasPitchClassRecipe (pc))
+            continue;
+        const auto recipe = getPitchClassRecipe (pc);
+        juce::ValueTree key (keyRecipeStateTag);
+        key.setProperty ("pitchClass", pc, nullptr);
+        key.setProperty ("type", recipe.chordType, nullptr);
+        key.setProperty ("complexity", recipe.complexity, nullptr);
+        key.setProperty ("voicing", recipe.voicing, nullptr);
+        key.setProperty ("pitch", recipe.pitchOffset, nullptr);
+        root.appendChild (key, nullptr);
+    }
     return root;
 }
 
@@ -1229,6 +1329,8 @@ void PluginProcessor::restoreKeyRecipeState (const juce::ValueTree& state)
     for (auto& recipe : keyRecipes)
         recipe.store (0, std::memory_order_release);
 
+    for (auto& recipe : pitchClassRecipes)
+        recipe.store (0, std::memory_order_release);
     const auto root = state.getChildWithName (keyRecipesStateTag);
 
     if (! root.isValid())
@@ -1243,7 +1345,8 @@ void PluginProcessor::restoreKeyRecipeState (const juce::ValueTree& state)
 
         const auto note = static_cast<int> (key.getProperty ("note", -1));
 
-        if (! juce::isPositiveAndBelow (note, 128))
+        const auto pc = static_cast<int> (key.getProperty ("pitchClass", -1));
+        if (! juce::isPositiveAndBelow (note, 128) && ! juce::isPositiveAndBelow (pc, 12))
             continue;
 
         ChordRecipe recipe;
@@ -1251,7 +1354,10 @@ void PluginProcessor::restoreKeyRecipeState (const juce::ValueTree& state)
         recipe.complexity = static_cast<int> (key.getProperty ("complexity", 0));
         recipe.voicing = static_cast<int> (key.getProperty ("voicing", 1));
         recipe.pitchOffset = static_cast<int> (key.getProperty ("pitch", 0));
-        setKeyRecipe (note, recipe);
+        if (juce::isPositiveAndBelow (pc, 12))
+            setPitchClassRecipe (pc, recipe);
+        else
+            setKeyRecipe (note, recipe);
     }
 }
 
@@ -1268,6 +1374,7 @@ void PluginProcessor::getStateInformation (juce::MemoryBlock& destData)
     if (existing.isValid())
         state.removeChild (existing, nullptr);
 
+    state.setProperty ("schemaVersion", 2, nullptr);
     state.appendChild (createKeyRecipeState(), nullptr);
 
     juce::MemoryOutputStream stream (destData, false);
@@ -1279,10 +1386,28 @@ void PluginProcessor::setStateInformation (const void* data, int sizeInBytes)
     if (data == nullptr || sizeInBytes <= 0)
         return;
 
-    const auto state = juce::ValueTree::readFromData (data, static_cast<size_t> (sizeInBytes));
+    auto state = juce::ValueTree::readFromData (data, static_cast<size_t> (sizeInBytes));
 
     if (state.isValid() && state.hasType (apvts.state.getType()))
     {
+        // Missing new controls identify pre-v2 sessions. Explicit child values
+        // preserve the released register-only/velocity-only interpretation.
+        for (const auto* id : { boilerplate::parameters::voicingStyle,
+                                boilerplate::parameters::humanizeTiming,
+                                boilerplate::parameters::scaleRoot,
+                                boilerplate::parameters::scaleMode })
+        {
+            bool found = false;
+            for (const auto& child : state)
+                found = found || child.getProperty ("id").toString() == id;
+            if (! found)
+            {
+                juce::ValueTree child ("PARAM");
+                child.setProperty ("id", id, nullptr);
+                child.setProperty ("value", 0.0f, nullptr);
+                state.appendChild (child, nullptr);
+            }
+        }
         apvts.replaceState (state);
         restoreKeyRecipeState (state);
     }

@@ -31,6 +31,8 @@ private:
     void refreshChordReadout();
     void syncKeyboardDisplay();
     void selectPreset (int index);
+    void chooseUserPreset (bool save);
+    void refreshPresetList();
     juce::String currentChordSymbol() const;
     static juce::String chordSymbolFor (int rootNote,
                                         const PluginProcessor::ChordRecipe& recipe);
@@ -45,6 +47,8 @@ private:
     juce::ComboBox presetSelector;
     juce::TextButton presetPreviousButton;
     juce::TextButton presetNextButton;
+    juce::TextButton savePresetButton, loadPresetButton;
+    std::unique_ptr<juce::FileChooser> presetFileChooser;
     juce::Label chordCaption;
     juce::Label chordReadout;
     juce::ToggleButton powerButton;
