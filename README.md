@@ -4,9 +4,12 @@ A JUCE 9 MIDI chord generator for macOS, Windows and Linux. Incoming notes becom
 chords, with per-note or all-octave assignments, inversions, voice leading,
 spread, velocity/timing humanization, free or tempo-synced strumming and
 staggered releases.
+
 Audio passes through unchanged in the default configuration; the Velocity knob
 scales generated MIDI velocities. Route MIDI output to an instrument to hear it.
 The standalone does not contain a synthesizer.
+
+![Project Screenshot](Assets/Images/interface-UI.png)
 
 ## Build
 
@@ -37,11 +40,11 @@ sudo apt-get install -y build-essential cmake pkg-config libasound2-dev libjack-
 Run tests under `xvfb-run -a ctest --preset release` on headless Linux.
 Browser/curl support is disabled. JUCE licensing is the distributor's responsibility.
 
-| Platform | Outputs | Qualification |
-| --- | --- | --- |
-| macOS | AUv2 music effect (`aumf`), VST3, `.app` | Universal arm64/x86_64 CI; local builds native by default |
-| Windows | VST3, `.exe` | Visual Studio 2022 x64 CI |
-| Linux | VST3, executable | Ubuntu 22.04 x86_64 CI baseline |
+| Platform | Outputs                                  | Qualification                                             |
+| -------- | ---------------------------------------- | --------------------------------------------------------- |
+| macOS    | AUv2 music effect (`aumf`), VST3, `.app` | Universal arm64/x86_64 CI; local builds native by default |
+| Windows  | VST3, `.exe`                             | Visual Studio 2022 x64 CI                                 |
+| Linux    | VST3, executable                         | Ubuntu 22.04 x86_64 CI baseline                           |
 
 CI builds/tests all four presets on these platforms, builds universal macOS binaries,
 validates AUs on macOS, and uploads permission-preserving build archives. Tests run
@@ -143,26 +146,26 @@ DAW session state always includes the complete configuration.
 
 ## Parameters and compatibility
 
-| ID | Range / choices | Default |
-| --- | --- | --- |
-| `gain` | Velocity Gain, -60 to +12 dB | 0 dB |
-| `bypass`, `power` | Boolean | off, on |
-| `chord_type` | Major, Minor, Dominant, Other | Major |
-| `complexity` | Triad through 13#11 (11 choices) | Triad |
-| `voicing` | High, Root, Low | Root |
-| `pitch_offset` | -12 to +12 semitones | 0 |
-| `spread`, `humanize`, `strum` | 0–100% | 0% |
-| `spread_mode` | Dense, Sparse | Dense |
-| `note_off_mode` | Simultaneous, Staggered | Simultaneous |
-| `strum_mode` | Up, Down | Up |
-| `strum_timing_mode` | Free, Sync | Free |
-| `strum_division` | 1/8, 1/16, 1/32 plus dotted and triplet forms (9 choices) | 1/16 |
-| `strum_fallback_bpm` | 20–300 BPM | 120 BPM |
-| `strum_pattern` | Legacy Direction, Alternate, Random, Outside-In | Legacy Direction |
-| `voicing_style` | Register, Inversions, Random, Smart | Inversions |
-| `humanize_timing` | Boolean | on |
-| `scale_root` | C through B | C |
-| `scale_mode` | Chromatic, Major, Natural Minor | Chromatic |
+| ID                            | Range / choices                                           | Default          |
+| ----------------------------- | --------------------------------------------------------- | ---------------- |
+| `gain`                        | Velocity Gain, -60 to +12 dB                              | 0 dB             |
+| `bypass`, `power`             | Boolean                                                   | off, on          |
+| `chord_type`                  | Major, Minor, Dominant, Other                             | Major            |
+| `complexity`                  | Triad through 13#11 (11 choices)                          | Triad            |
+| `voicing`                     | High, Root, Low                                           | Root             |
+| `pitch_offset`                | -12 to +12 semitones                                      | 0                |
+| `spread`, `humanize`, `strum` | 0–100%                                                    | 0%               |
+| `spread_mode`                 | Dense, Sparse                                             | Dense            |
+| `note_off_mode`               | Simultaneous, Staggered                                   | Simultaneous     |
+| `strum_mode`                  | Up, Down                                                  | Up               |
+| `strum_timing_mode`           | Free, Sync                                                | Free             |
+| `strum_division`              | 1/8, 1/16, 1/32 plus dotted and triplet forms (9 choices) | 1/16             |
+| `strum_fallback_bpm`          | 20–300 BPM                                                | 120 BPM          |
+| `strum_pattern`               | Legacy Direction, Alternate, Random, Outside-In           | Legacy Direction |
+| `voicing_style`               | Register, Inversions, Random, Smart                       | Inversions       |
+| `humanize_timing`             | Boolean                                                   | on               |
+| `scale_root`                  | C through B                                               | C                |
+| `scale_mode`                  | Chromatic, Major, Natural Minor                           | Chromatic        |
 
 Existing IDs, ranges, choice orders, AU version hints 1–16, and plugin codes are
 preserved. New parameters use hints 17–20. States lacking the new parameters
