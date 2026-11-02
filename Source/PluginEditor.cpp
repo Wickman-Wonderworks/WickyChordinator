@@ -272,10 +272,6 @@ void PluginEditor::paint (juce::Graphics& g)
 
         g.setColour (miami::radicalBlue.withAlpha (0.90f));
         g.drawRoundedRectangle (status.reduced (0.5f), 8.0f, 1.4f);
-
-        g.setColour (miami::highlighterYellow);
-        g.fillRect (status.getX() + 12.0f, status.getBottom() - 2.0f,
-                    juce::jmin (180.0f, status.getWidth() - 24.0f), 2.0f);
     }
 
     // The large chord readout sits in its own neon pill.
@@ -379,7 +375,8 @@ void PluginEditor::layoutStatusBar (juce::Rectangle<int> area)
 
     auto centre = bar;
     chordCaption.setBounds (centre.removeFromTop (scaled (15)));
-    chordReadout.setBounds (centre);
+    centre.removeFromTop (scaled (3)); // breathing room under the caption
+    chordReadout.setBounds (centre.withTrimmedBottom (scaled (10)));
 }
 
 int PluginEditor::scaled (int value) const noexcept
