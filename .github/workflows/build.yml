@@ -25,7 +25,15 @@ jobs:
             libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev \
             libxrender-dev libxi-dev xvfb xauth
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }} -DBOILERPLATE_BUILD_TESTS=ON -DBOILERPLATE_MAX_PARALLEL_JOBS=4
+        shell: bash
+        env:
+          PRESET: ${{ matrix.preset }}
+        run: |
+          options=(-DBOILERPLATE_BUILD_TESTS=ON -DBOILERPLATE_MAX_PARALLEL_JOBS=4)
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            options+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0)
+          fi
+          cmake --preset "$PRESET" "${options[@]}"
       - name: Build all formats and tests
         run: cmake --build --preset ${{ matrix.preset }} --parallel 4
       - name: Test (Linux virtual display)
@@ -42,9 +50,9 @@ jobs:
         run: |
           configuration=Release
           if [[ "$PRESET" == *debug ]]; then configuration=Debug; fi
-          product='JUCE Boilerplate'
+          product='Wicky Chordinator'
           subtype=Jbpl
-          type=aufx
+          type=aumf
           if [[ "$PRESET" == instrument-* ]]; then
             product='JUCE Instrument'
             subtype=Jbpi
@@ -56,6 +64,23 @@ jobs:
           killall AudioComponentRegistrar 2>/dev/null || true
           sleep 3
           auval -v "$type" "$subtype" Wckm
+      - name: Archive builds (preserve executable permissions)
+        shell: bash
+        env:
+          PRESET: ${{ matrix.preset }}
+        run: |
+          configuration=Release
+          if [[ "$PRESET" == *debug ]]; then configuration=Debug; fi
+          cd "build/$PRESET/JUCEBoilerplate_artefacts/$configuration"
+          formats=(Standalone VST3)
+          if [[ "$RUNNER_OS" == macOS ]]; then formats+=(AU); fi
+          cmake -E tar cf "$GITHUB_WORKSPACE/build/$PRESET/products.tar" --format=gnutar "${formats[@]}"
+      - name: Upload builds
+        uses: actions/upload-artifact@v4
+        with:
+          name: builds-${{ matrix.os }}-${{ matrix.preset }}
+          path: build/${{ matrix.preset }}/products.tar
+          if-no-files-found: error
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4

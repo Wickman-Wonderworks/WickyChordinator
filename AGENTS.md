@@ -2,8 +2,9 @@
 
 ## What this is
 
-A JUCE 9 effect/instrument boilerplate (VST3, Standalone, macOS AU) plus a library of
-audio/DSP skills in `skills/`. `Source/` is a real CMake/JUCE project.
+Wicky Chordinator is a JUCE 9 MIDI chord generator (VST3, Standalone, macOS
+AU music effect), with audio/DSP skills in `skills/`. Audio passes through;
+Velocity Gain changes outgoing MIDI velocity. `Source/` is the CMake/JUCE project.
 The original brief and results are tracked under
 `docs/prompts/build-juce-boilerplate/`. See `README.md` for user-facing documentation.
 
@@ -39,11 +40,17 @@ The original brief and results are tracked under
 
 ## Architecture rules
 
-- `PluginProcessor` owns the APVTS and `GainProcessor`. Cache
+- `PluginProcessor` owns the APVTS and chord scheduler. Cache
   `getRawParameterValue()` pointers once and read the atomics in `processBlock`.
-- `processBlock` must stay free of allocation, locks, I/O, `juce::String`,
+- Internal processing must stay free of allocation, locks, I/O, `juce::String`,
   `DBG()`, and `ValueTree` access. It uses `ScopedNoDenormals`; reset DSP state
   unconditionally in `prepareToPlay`.
+  Keep the 64 KiB output reservation owned by the processor. The final copy into
+  a host-owned MidiBuffer can allocate if the host supplies insufficient capacity;
+  JUCE's API cannot guarantee that capacity. Do not claim the entire callback is
+  allocation-free for arbitrary hosts. Overflow emits panic on all 16 channels.
+  Merge pending and input events chronologically. Track generated and pass-through
+  ownership independently and flush generated releases immediately on bypass.
 - `PluginEditor` only lays out controls and uses APVTS attachments. No DSP.
 - `Source/State/ParameterIDs.h` IDs, the AU version hint, and the four-character
   plugin/manufacturer codes are release contracts. Do not rename them after a
@@ -52,8 +59,8 @@ The original brief and results are tracked under
   Hints preserve AU ordering, not semantic/state migration. Preserve released
   parameter ranges/meaning unless an explicit compatibility migration is designed.
 - Instrument rendering belongs at the marked extension point in `processBlock`,
-  after output clearing and before gain. Preallocate voices in preparation and
-  honor MIDI sample offsets. Bypass currently bypasses output gain only.
+  after output clearing. Preallocate voices in preparation and honor MIDI sample
+  offsets. Bypass/power disables chord generation and passes raw MIDI through.
 - New parameter: ID -> layout entry -> cached raw pointer -> `processBlock` ->
   editor attachment.
 
@@ -61,10 +68,10 @@ The original brief and results are tracked under
 
 - AU on macOS: copy the built component to
   `~/Library/Audio/Plug-Ins/Components/`, run `killall AudioComponentRegistrar`,
-  wait a few seconds, then `auval -v aufx Jbpl Wckm` for the effect or
+  wait a few seconds, then `auval -v aumf Jbpl Wckm` for the effect or
   `auval -v aumu Jbpi Wckm` for the instrument presets. Rebranded codes must match.
 - Launch the standalone with
-  `open "build/release/JUCEBoilerplate_artefacts/Release/Standalone/JUCE Boilerplate.app"`.
+  `open "build/release/JUCEBoilerplate_artefacts/Release/Standalone/Wicky Chordinator.app"`.
   If a screenshot is needed, capture the window with
   `screencapture -l <window-id>`. The `WickySnapshot` tool mentioned in
   `docs/prompts/build-juce-boilerplate/main-prompt.md` does not exist in this workspace.

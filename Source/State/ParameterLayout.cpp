@@ -119,6 +119,18 @@ namespace boilerplate::parameters
             StringArray { "Up", "Down" },
             0));
 
+        layout.add (std::make_unique<AudioParameterChoice> (
+            ParameterID { voicingStyle, voicingStyleVersionHint }, "Voicing Style",
+            StringArray { "Register (legacy)", "Inversions", "Random", "Smart" }, 1));
+        layout.add (std::make_unique<AudioParameterBool> (
+            ParameterID { humanizeTiming, humanizeTimingVersionHint }, "Humanize Timing", true));
+        layout.add (std::make_unique<AudioParameterChoice> (
+            ParameterID { scaleRoot, scaleRootVersionHint }, "Scale Root",
+            StringArray { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" }, 0));
+        layout.add (std::make_unique<AudioParameterChoice> (
+            ParameterID { scaleMode, scaleModeVersionHint }, "Scale Mode",
+            StringArray { "Chromatic", "Major", "Natural Minor" }, 0));
+
         return layout;
     }
 }

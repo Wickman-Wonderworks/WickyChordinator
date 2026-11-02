@@ -25,7 +25,7 @@ option(BOILERPLATE_LIMIT_PARALLEL_JOBS "Cap parallel compile jobs to avoid OOM d
 option(BOILERPLATE_WINDOWS_MIDI_SERVICES "Use Windows MIDI Services (Windows only; forces C++20)" OFF)
 option(BOILERPLATE_IS_SYNTH "Build an output-only instrument scaffold with MIDI input" OFF)
 # A true AU MIDI effect (aumi) must declare no audio buses, which would remove
-# the gain/bypass audio path and break the current test contract. Keep this OFF
+# the audio pass-through buses and break the current test contract. Keep this OFF
 # until the plugin is converted to a bus-free MIDI processor; the plugin still
 # accepts and emits MIDI as a music effect (aumf) in the meantime.
 option(BOILERPLATE_IS_MIDI_EFFECT "Build as a bus-free AU MIDI effect (AU MIDI FX slot)" OFF)

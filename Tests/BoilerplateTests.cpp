@@ -11,6 +11,15 @@
 #include <string>
 #include <vector>
 
+class PluginProcessorTestAccess
+{
+public:
+    static const void* outputStorage (PluginProcessor& processor)
+    {
+        return processor.midiOutputBuffer.data.begin();
+    }
+};
+
 namespace
 {
     void require (bool condition, const char* message)
@@ -194,6 +203,9 @@ namespace
     void setChordMatrix (PluginProcessor& processor, int type, int complexity,
                          int voicing, int pitchOffset)
     {
+        // Existing sound-contract tests deliberately exercise legacy register voicing.
+        setParameter (processor, boilerplate::parameters::voicingStyle, 0.0f);
+        setParameter (processor, boilerplate::parameters::humanizeTiming, 0.0f);
         setParameter (processor, boilerplate::parameters::chordType, (float) type);
         setParameter (processor, boilerplate::parameters::complexity, (float) complexity);
         setParameter (processor, boilerplate::parameters::voicing, (float) voicing);
@@ -259,7 +271,7 @@ namespace
         require (hasEvent (bypassed, 0x90, 0, 60, 100), "Bypass changed the note-on");
         require (hasEvent (bypassed, 0xB0, 0, 1, 64), "Bypass dropped a controller");
         require (hasNoteOff (bypassed, 0, 60), "Bypass dropped the note-off");
-        expectSamples (buffer, 0.25f);
+        expectSamples (buffer, JucePlugin_IsSynth ? 0.0f : 0.25f);
 
         setParameter (processor, boilerplate::parameters::bypass, 0.0f);
     }
@@ -887,6 +899,293 @@ namespace
         require (! restored.isBusesLayoutSupported (unsupported), "Accepted surround output");
     }
 
+    void testReviewRegressions()
+    {
+        using namespace boilerplate::parameters;
+        const auto on = [] (int ch, int note) { return juce::MidiMessage::noteOn (ch, note, juce::uint8 (100)); };
+        const auto off = [] (int ch, int note) { return juce::MidiMessage::noteOff (ch, note); };
+        const auto held = [] (PluginProcessor& p, int note)
+        {
+            return (p.getActiveOutputNotes (note / 64) & (juce::uint64 (1) << (note % 64))) != 0;
+        };
+        PluginProcessor p;
+        p.setRateAndBufferSizeDetails (48000.0, 64);
+        p.prepareToPlay (48000.0, 64);
+        setChordMatrix (p, 0, 0, 1, 0);
+        setParameter (p, strum, 100);
+        juce::AudioBuffer<float> audio (2, 64);
+        juce::MidiBuffer midi;
+        midi.ensureSize (65536);
+        midi.addEvent (on (1, 60), 0);
+        midi.addEvent (off (1, 60), 32);
+        p.processBlock (audio, midi);
+        auto events = captureMidi (midi);
+        require (hasNoteOn (events, 0, 60) && hasNoteOff (events, 0, 60), "Short strum swallowed its root");
+        require (countNoteOns (events) == 1, "Short strum played a future tone");
+        require (events[0].position == 0 && events[1].position == 32, "Short strum lost sample offsets");
+        for (int i = 0; i < 100; ++i)
+            require (processMessages (p, {}).empty(), "Cancelled strum resurrected a note");
+
+        // A scheduled note due before the release in a later block must play.
+        p.reset();
+        processMessages (p, { on (1, 60) });
+        for (int i = 0; i < 44; ++i)
+            processMessages (p, {});
+        midi.clear();
+        midi.addEvent (off (1, 60), 32); // E is due at this block's sample zero.
+        p.processBlock (audio, midi);
+        events = captureMidi (midi);
+        require (hasNoteOn (events, 0, 64) && hasNoteOff (events, 0, 64), "Later release swallowed an already-due tone");
+
+        // Identical input timelines must produce identical MIDI at different
+        // host buffer sizes, including note-on and note-off in one large block.
+        const auto renderTimeline = [&] (int blockSize)
+        {
+            PluginProcessor timeline;
+            timeline.setRateAndBufferSizeDetails (48000.0, blockSize);
+            timeline.prepareToPlay (48000.0, blockSize);
+            setChordMatrix (timeline, 0, 0, 1, 0);
+            setParameter (timeline, strum, 100);
+            std::vector<CapturedEvent> result;
+            for (int start = 0; start < 8192; start += blockSize)
+            {
+                juce::AudioBuffer<float> blockAudio (2, blockSize);
+                juce::MidiBuffer input;
+                if (start == 0)
+                    input.addEvent (on (1, 60), 0);
+                if (start <= 2900 && start + blockSize > 2900)
+                    input.addEvent (off (1, 60), 2900 - start);
+                timeline.processBlock (blockAudio, input);
+                for (auto event : captureMidi (input))
+                {
+                    event.position += start;
+                    result.push_back (event);
+                }
+            }
+            return result;
+        };
+        const auto reference = renderTimeline (64);
+        for (const auto blockSize : { 512, 4096 })
+        {
+            const auto rendered = renderTimeline (blockSize);
+            require (rendered.size() == reference.size(), "Strum depends on host block size");
+            for (size_t i = 0; i < reference.size(); ++i)
+                require (rendered[i].position == reference[i].position
+                         && rendered[i].status == reference[i].status
+                         && rendered[i].data1 == reference[i].data1,
+                         "Strum timeline differs across host buffer sizes");
+        }
+
+        // Flush both active and already-retired staggered notes on bypass.
+        for (const auto* switchID : { power, bypass })
+        {
+            p.reset();
+            setParameter (p, strum, 0);
+            setParameter (p, noteOffMode, 1);
+            setParameter (p, power, 1);
+            setParameter (p, bypass, 0);
+            processMessages (p, { on (1, 60) });
+            processMessages (p, { off (1, 60) });
+            setParameter (p, switchID, switchID == power ? 0.0f : 1.0f);
+            events = processMessages (p, { on (1, 64) });
+            require (hasNoteOff (events, 0, 64) && hasNoteOn (events, 0, 64), "Bypass failed to flush old releases first");
+            for (int i = 0; i < 100; ++i)
+                require (! hasNoteOff (processMessages (p, {}), 0, 64), "Old release cut a held pass-through note");
+            setParameter (p, switchID, switchID == power ? 1.0f : 0.0f);
+            processMessages (p, { on (1, 60) }); // Generated E shares the raw E.
+            events = processMessages (p, { off (1, 64) });
+            require (! hasNoteOff (events, 0, 64), "Raw release cut a generated owner");
+            setParameter (p, noteOffMode, 0);
+            events = processMessages (p, { off (1, 60) });
+            require (hasNoteOff (events, 0, 64), "Shared raw/generated ownership leaked a note");
+        }
+
+        p.reset();
+        processMessages (p, { on (1, 60), on (2, 60) });
+        processMessages (p, { off (1, 60) });
+        require (held (p, 60) && held (p, 64), "Display lost another channel's held notes");
+        processMessages (p, { juce::MidiMessage::allNotesOff (1) });
+        require (held (p, 60), "Channel panic cleared another channel's display");
+        processMessages (p, { off (2, 60) });
+        require (! held (p, 60), "Final channel release failed to clear display");
+
+        // Fresh host buffers must never take away internal scratch storage.
+        const auto* storage = PluginProcessorTestAccess::outputStorage (p);
+        for (int i = 0; i < 20; ++i)
+        {
+            processMessages (p, { on (1, 60), off (1, 60) });
+            require (PluginProcessorTestAccess::outputStorage (p) == storage, "Internal output storage was exchanged or resized");
+        }
+        midi.clear();
+        const auto* hostStorage = midi.data.begin();
+        midi.addEvent (on (1, 60), 0);
+        p.processBlock (audio, midi);
+        require (midi.data.begin() == hostStorage, "Preallocated host output storage grew");
+        processMessages (p, { off (1, 60) });
+
+        // Overload silences the destination instead of dropping an arbitrary release.
+        midi.clear();
+        for (int i = 0; i < 4097; ++i)
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 1, 64), 0);
+        p.processBlock (audio, midi);
+        events = captureMidi (midi);
+        require (events.size() == 32 && p.getNumSoundingChords() == 0, "MIDI overload did not panic cleanly");
+        for (int ch = 0; ch < 16; ++ch)
+            require (hasEvent (events, 0xb0, ch, 120, 0) && hasEvent (events, 0xb0, ch, 123, 0), "Overload missed a channel");
+        midi.clear();
+        std::vector<juce::uint8> largeSysEx (65530, 1);
+        largeSysEx.front() = 0xf0;
+        largeSysEx.back() = 0xf7;
+        midi.addEvent (largeSysEx.data(), static_cast<int> (largeSysEx.size()), 0);
+        p.processBlock (audio, midi);
+        require (captureMidi (midi).size() == 32, "Oversized SysEx bypassed the byte bound");
+        for (int i = 0; i < 300; ++i)
+            p.queueKeyboardNote ((i % 2) == 0, 60, 0.8f);
+        midi.clear();
+        p.processBlock (audio, midi);
+        require (captureMidi (midi).size() == 32 && p.getNumSoundingChords() == 0,
+                 "Keyboard FIFO overflow leaked a note");
+    }
+
+    void testExpandedFeatures()
+    {
+        using namespace boilerplate::parameters;
+        PluginProcessor p;
+        p.setRateAndBufferSizeDetails (48000.0, 64);
+        p.prepareToPlay (48000.0, 64);
+        const auto on = [] (int note) { return juce::MidiMessage::noteOn (1, note, juce::uint8 (100)); };
+        const auto off = [] (int note) { return juce::MidiMessage::noteOff (1, note); };
+        setParameter (p, voicingStyle, 1);
+        setParameter (p, voicing, 0);
+        auto events = processMessages (p, { on (60) });
+        require (hasNoteOn (events, 0, 64) && hasNoteOn (events, 0, 67) && hasNoteOn (events, 0, 72), "High is not a first inversion");
+        processMessages (p, { off (60) });
+        setParameter (p, voicing, 2);
+        events = processMessages (p, { on (60) });
+        require (hasNoteOn (events, 0, 55) && hasNoteOn (events, 0, 60) && hasNoteOn (events, 0, 64), "Low is not a lower inversion");
+        processMessages (p, { off (60) });
+        setParameter (p, voicing, 1);
+        for (const auto style : { 2, 3 })
+        {
+            p.reset();
+            setParameter (p, voicingStyle, static_cast<float> (style));
+            bool sawDifferent = false;
+            for (int i = 0; i < 20; ++i)
+            {
+                events = processMessages (p, { on (60) });
+                sawDifferent = sawDifferent || ! hasNoteOn (events, 0, 60);
+                const auto released = processMessages (p, { off (60) });
+                require (countNoteOns (events) == 3 && released.size() == 3, "Automatic inversion leaked notes");
+            }
+            if (style == 2)
+                require (sawDifferent, "Random voicing never chose another inversion");
+        }
+        p.reset();
+        setParameter (p, voicingStyle, 3);
+        processMessages (p, { on (60) });
+        processMessages (p, { off (60) });
+        events = processMessages (p, { on (67) });
+        require (hasNoteOn (events, 0, 59) && hasNoteOn (events, 0, 62) && hasNoteOn (events, 0, 67), "Smart voicing did not minimize movement");
+        processMessages (p, { off (67) });
+        setParameter (p, voicingStyle, 1);
+        setParameter (p, scaleRoot, 2);
+        setParameter (p, scaleMode, 2);
+        events = processMessages (p, { on (60) });
+        require (hasNoteOn (events, 0, 62) && hasNoteOn (events, 0, 65) && hasNoteOn (events, 0, 69), "D-minor scale transformation is incorrect");
+        processMessages (p, { off (60) });
+        setParameter (p, scaleRoot, 0);
+        setParameter (p, scaleMode, 0);
+
+        p.setPitchClassRecipe (0, { 1, 0, 1, 0 });
+        for (const int note : { 48, 60, 72 })
+        {
+            events = processMessages (p, { on (note) });
+            require (hasNoteOn (events, 0, note + 3) && ! hasNoteOn (events, 0, note + 4), "Pitch-class mapping did not apply across octaves");
+            processMessages (p, { off (note) });
+        }
+        p.setKeyRecipe (60, { 0, 0, 1, 0 });
+        events = processMessages (p, { on (60) });
+        require (hasNoteOn (events, 0, 64), "Exact-note override did not take precedence");
+        processMessages (p, { off (60) });
+        p.clearKeyRecipe (60);
+        p.clearPitchClassRecipe (0);
+
+        setParameter (p, humanize, 100);
+        setParameter (p, humanizeTiming, 1);
+        std::vector<CapturedEvent> timed;
+        auto block = processMessages (p, { on (60) });
+        timed.insert (timed.end(), block.begin(), block.end());
+        for (int i = 1; i < 10; ++i)
+        {
+            block = processMessages (p, {});
+            for (auto& event : block)
+                event.position += i * 64;
+            timed.insert (timed.end(), block.begin(), block.end());
+        }
+        require (countNoteOns (timed) == 3, "Humanize timing dropped notes");
+        bool delayed = false;
+        for (const auto& event : timed)
+        {
+            require (event.position >= 0 && event.position <= 480, "Humanize exceeded 10 ms");
+            delayed = delayed || event.position > 0;
+        }
+        require (delayed, "Humanize timing never delayed a note");
+        processMessages (p, { off (60) });
+
+        // Session recall includes scale and both mapping layers.
+        setParameter (p, humanize, 0);
+        p.setPitchClassRecipe (0, { 1, 2, 1, 0 });
+        p.setKeyRecipe (60, { 2, 2, 1, 0 });
+        setParameter (p, scaleRoot, 5);
+        setParameter (p, scaleMode, 2);
+        juce::MemoryBlock saved;
+        p.getStateInformation (saved);
+        PluginProcessor restored;
+        restored.setStateInformation (saved.getData(), static_cast<int> (saved.getSize()));
+        require (restored.hasPitchClassRecipe (0) && restored.hasKeyRecipe (60), "Mapping layers were not recalled");
+        require (juce::roundToInt (restored.getValueTreeState().getRawParameterValue (scaleRoot)->load()) == 5, "Session scale was not recalled");
+
+        // User presets capture maps but preserve the destination's scale.
+        juce::TemporaryFile preset (".wickychord");
+        wicky::ui::PresetManager bank (p);
+        require (bank.saveUserPreset (preset.getFile()), "User preset save failed");
+        p.clearKeyRecipe (60);
+        p.clearPitchClassRecipe (0);
+        setParameter (p, scaleRoot, 7);
+        setParameter (p, scaleMode, 1);
+        require (bank.loadUserPreset (preset.getFile()), "User preset recall failed");
+        require (p.hasPitchClassRecipe (0) && p.hasKeyRecipe (60), "User preset lost mappings");
+        require (juce::roundToInt (p.getValueTreeState().getRawParameterValue (scaleRoot)->load()) == 7
+                 && juce::roundToInt (p.getValueTreeState().getRawParameterValue (scaleMode)->load()) == 1, "Preset changed the selected scale");
+        require (bank.loadPreset (0), "Factory Init failed");
+        require (juce::roundToInt (p.getValueTreeState().getRawParameterValue (scaleRoot)->load()) == 7, "Factory preset changed scale");
+
+        auto legacy = juce::ValueTree::readFromData (saved.getData(), saved.getSize());
+        for (int i = legacy.getNumChildren(); --i >= 0;)
+        {
+            const auto id = legacy.getChild (i).getProperty ("id").toString();
+            if (id == voicingStyle || id == humanizeTiming || id == scaleRoot || id == scaleMode)
+                legacy.removeChild (i, nullptr);
+        }
+        juce::MemoryBlock oldState;
+        juce::MemoryOutputStream stream (oldState, false);
+        legacy.writeToStream (stream);
+        restored.setStateInformation (oldState.getData(), static_cast<int> (oldState.getSize()));
+        require (juce::roundToInt (restored.getValueTreeState().getRawParameterValue (voicingStyle)->load()) == 0
+                 && juce::roundToInt (restored.getValueTreeState().getRawParameterValue (humanizeTiming)->load()) == 0,
+                 "Legacy state changed its sound contract");
+        juce::TemporaryFile oldPreset (".wickychord");
+        require (oldPreset.getFile().replaceWithData (oldState.getData(), oldState.getSize()), "Could not write legacy preset fixture");
+        require (bank.loadUserPreset (oldPreset.getFile()), "Legacy preset import failed");
+        require (juce::roundToInt (p.getValueTreeState().getRawParameterValue (scaleRoot)->load()) == 7,
+                 "Legacy preset import changed the selected scale");
+        juce::TemporaryFile invalid (".wickychord");
+        require (invalid.getFile().replaceWithText ("invalid"), "Could not write invalid preset fixture");
+        require (! bank.loadUserPreset (invalid.getFile()), "Invalid user preset was accepted");
+        for (const auto* id : { voicingStyle, humanizeTiming, scaleRoot, scaleMode })
+            require (p.getValueTreeState().getParameter (id)->getVersionHint() > 12, "New AU hint reused a released value");
+    }
+
     void testEditor()
     {
         PluginProcessor processor;
@@ -923,6 +1222,8 @@ int main (int argc, char** argv)
             testVirtualKeyboardBridge();
             testInteractionEngine();
             testPresetManager();
+            testReviewRegressions();
+            testExpandedFeatures();
             testStateAndProcessing();
         }
         std::cout << "Passed\n";

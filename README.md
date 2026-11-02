@@ -1,235 +1,17 @@
 # Wicky Chordinator
 
-A JUCE 9 audio-effect and software-instrument starter with a decoupled `Source/`
-layout, APVTS-backed parameters, a realtime-safe DSP layer, and a resizable vector UI. One CMake
-target builds VST3, Standalone, and (on macOS) AU. The default is a gain effect;
-instrument presets provide an output-only, MIDI-enabled scaffold.
-
-## Requirements
-
-- CMake 3.22 or newer, and a C++17 compiler.
-- macOS: Xcode command line tools. Windows: Visual Studio 2022. Linux: the
-  development packages listed below.
-- The first configure downloads JUCE **9.0.4** with `FetchContent`. To build
-  offline, point CMake at an existing JUCE 9 checkout (below).
-- JUCE 9 is dual-licensed AGPLv3/commercial. This repository does not vendor
-  JUCE source; you are responsible for a valid JUCE licence.
+A JUCE 9 MIDI chord generator for macOS, Windows and Linux. Incoming notes become
+chords, with per-note or all-octave assignments, inversions, voice leading,
+spread, velocity/timing humanization, strumming and staggered releases.
+Audio passes through unchanged in the default configuration; the Velocity knob
+scales generated MIDI velocities. Route MIDI output to an instrument to hear it.
+The standalone does not contain a synthesizer.
 
 ## Build
 
-The presets use `build/debug` and `build/release`, and cap the build at 6 jobs:
-
-```sh
-cmake --preset release
-cmake --build --preset release
-```
-
-Equivalent without presets (add `--config Release` when building with Visual Studio or Xcode):
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release --parallel 6
-```
-
-To use a local JUCE checkout instead of downloading it:
-
-```sh
-cmake --preset release -DBOILERPLATE_JUCE_SOURCE_DIR=/path/to/JUCE
-cmake --build --preset release
-```
-
-Debug build:
-
-```sh
-cmake --preset debug
-cmake --build --preset debug
-```
-
-### Effect and instrument configurations
-
-`release` / `debug` build the gain effect. `instrument-release` /
-`instrument-debug` enable `BOILERPLATE_IS_SYNTH`, MIDI input, VST3 Instrument/Synth
-categories, and an AU music device (`aumu`). Instruments have no audio input bus
-and support mono/stereo output. They intentionally render silence until you add
-an engine at the marked extension point in `processBlock`; render preallocated
-voices there and honor MIDI event sample offsets. Bypass currently bypasses the
-output gain stage, not the instrument's voice engine.
-
-```sh
-cmake --preset instrument-release
-cmake --build --preset instrument-release
-```
-
-Instrument presets use a separate build directory, product name (`JUCE Instrument`),
-bundle ID, and plugin code (`Jbpi`) so they can coexist with the effect (`Jbpl`).
-When configuring manually, set `-DBOILERPLATE_IS_SYNTH=ON` and assign a distinct
-product identity. Freeze effect/instrument classification before releasing a product.
-
-### Platform targets and Linux dependencies
-
-| Platform | Formats            | Architecture / qualification                                            |
-| -------- | ------------------ | ----------------------------------------------------------------------- |
-| macOS    | AUv2, VST3, `.app` | Native build by default; arm64 + x86_64 universal option below          |
-| Windows  | VST3, `.exe`       | x64 with Visual Studio 2022; qualify Windows 10/11 hosts before release |
-| Linux    | VST3, executable   | x86_64 Ubuntu 22.04 CI baseline; qualify other distributions separately |
-
-CI builds both product configurations in Debug and Release on `macos-latest`,
-`windows-2022`, and `ubuntu-22.04`. These build environments are not minimum runtime
-OS guarantees. Set each product's minimum OS/architecture policy before release;
-test on the oldest supported OS and actual DAWs. Windows/Linux ARM builds are not
-covered by this CI matrix. Linux binaries inherit the build machine's libc baseline.
-
-Ubuntu 22.04/24.04 dependencies for the enabled modules:
-
-```sh
-sudo apt-get update
-sudo apt-get install -y build-essential cmake pkg-config libasound2-dev libjack-jackd2-dev \
-  libfontconfig1-dev libfreetype-dev libx11-dev libxcomposite-dev libxcursor-dev \
-  libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libxi-dev xvfb xauth
-```
-
-Browser and curl support are disabled. Other distributions use different package
-names; see the [pinned JUCE dependency list](https://github.com/juce-framework/JUCE/blob/9.0.4/docs/Linux%20Dependencies.md).
-
-### Build artefacts
-
-With the release preset:
-
-| Format     | Path                                                                              |
-| ---------- | --------------------------------------------------------------------------------- |
-| Standalone | `build/release/JUCEBoilerplate_artefacts/Release/Standalone/JUCE Boilerplate.app` |
-| VST3       | `build/release/JUCEBoilerplate_artefacts/Release/VST3/JUCE Boilerplate.vst3`      |
-| AU (macOS) | `build/release/JUCEBoilerplate_artefacts/Release/AU/JUCE Boilerplate.component`   |
-
-The table shows macOS bundles. Windows Standalone is `JUCE Boilerplate.exe`;
-Linux Standalone is `JUCE Boilerplate` (no suffix). The VST3 bundle suffix remains
-`.vst3` on all three platforms. Debug uses `build/debug/.../Debug/`; instrument
-presets use `build/instrument-<config>/` and `JUCE Instrument` filenames.
-Plain `-B build` builds put the same tree under `build/`. Multi-config
-generators (Xcode, Visual Studio) use the configuration selected with `--config`.
-
-To install into JUCE's plugin folders after each build:
-
-```sh
-cmake --preset release -DBOILERPLATE_COPY_PLUGIN_AFTER_BUILD=ON
-cmake --build --preset release
-```
-
-Defaults are `~/Library/Audio/Plug-Ins/{Components,VST3}` on macOS and
-`~/.vst3` on Linux. JUCE defaults to the system Common Files/VST3 directory on
-Windows, which may require elevation. Override the plugin's `VST3_COPY_DIR` in
-`juce_add_plugin` if you need a different development install location.
-
-## Parameters
-
-| ID              | Name          | Range                              | Default      |
-| --------------- | ------------- | ---------------------------------- | ------------ |
-| `gain`          | Velocity Gain | -60 to +12 dB, 0.1 dB steps        | 0 dB         |
-| `bypass`        | Bypass        | on/off                             | off          |
-| `power`         | Power         | on/off                             | on           |
-| `chord_type`    | Chord Type    | Major / Minor / Dominant / Other   | Major        |
-| `complexity`    | Complexity    | Triad … 13#11                      | Triad        |
-| `voicing`       | Voicing       | High / Root / Low                  | Root         |
-| `pitch_offset`  | Pitch Offset  | -12 to +12 semitones               | 0            |
-| `spread`        | Spread        | 0 to 100%                          | 0%           |
-| `spread_mode`   | Spread Mode   | Dense / Sparse                     | Dense        |
-| `humanize`      | Humanize      | 0 to 100%                          | 0%           |
-| `note_off_mode` | Note Off Mode | Simultaneous / Staggered           | Simultaneous |
-| `strum`         | Strum         | 0 to 100%                          | 0%           |
-| `strum_mode`    | Strum Mode    | Up / Down                          | Up           |
-
-The IDs in `Source/State/ParameterIDs.h` are the automation/preset contract.
-Do not rename them after release. `bypass` is the host-facing bypass parameter;
-`power` is the front-panel ON/OFF switch and is OR-ed with bypass inside the
-processor. New interaction parameters use AU version hints 6–12, above every
-previously released hint.
-
-## Architecture
-
-```
-Source/
-  PluginProcessor.*        APVTS, lock-free parameter cache, chord engine,
-                           strum/humanize scheduler and per-key recipe atomics
-  PluginEditor.*           Status bar, preset navigation, power switch,
-                           chord readout and two-column editor layout
-  ChordSettingsPanel.h     Chord Settings, Global Settings, Key Map and
-                           ValueTree-backed factory preset manager
-  DSP/GainProcessor.*      Smoothed gain/bypass, no allocation after prepare()
-  State/ParameterIDs.h     Stable IDs and AU version hints
-  State/ParameterLayout.*  Parameter definitions
-  UI/BoilerplateLookAndFeel.*  Vector-drawn panel, radial-dot knob and switch
-```
-
-Data flow:
-
-```
-host MIDI -> processBlock -> chord engine (spread/humanize/strum) -> MIDI out
-audio buffer -> transparent pass-through
-APVTS -> cached std::atomic<float>* -> processBlock   (audio thread)
-editor controls -> APVTS attachments                  (message thread)
-```
-
-`processBlock` allocates nothing, takes no locks, performs no I/O, and touches
-no JUCE `String`/`ValueTree` state. Strummed note-ons and staggered note-offs
-use a fixed-size pending-event array with an absolute sample clock, so events
-can cross block boundaries without allocation. Keep it that way when extending
-the boilerplate. The project skills in `skills/` document the relevant rules:
-`audio-dsp-review`, `audio-numerics-review`, `juce-review`, and
-`dsp-algorithm-guide`.
-
-### Adding a parameter
-
-1. Add the ID in `Source/State/ParameterIDs.h`.
-2. Add the definition in `Source/State/ParameterLayout.cpp`.
-3. Cache `apvts.getRawParameterValue(...)` in the processor constructor and read
-   the pointer in `processBlock`.
-4. Attach a control in `PluginEditor`.
-5. Give the new parameter its own version hint in `ParameterIDs.h`. After a
-   release, each existing hint stays unchanged; new parameters use a hint greater
-   than every previously released hint (first release: 1, next additions: 2, etc.).
-   This preserves AU ordering in Logic/GarageBand. Do not remove released parameters.
-
-A version hint is not a state-schema version and does not migrate changed parameter
-semantics. Preserve released ranges/meaning, or design an explicit migration/new
-parameter contract. See [JUCE's version-hint rules](https://docs.juce.com/master/classjuce_1_1AudioProcessorParameter.html).
-
-Use `-DCMAKE_CXX_STANDARD=20` only when required; `-DBOILERPLATE_WINDOWS_MIDI_SERVICES=ON`
-forces C++20 for the Windows MIDI Services backend.
-
-## Rebranding
-
-Override these at configure time (or edit the defaults at the top of
-`CMakeLists.txt`):
-
-| Cache variable                         | Default                                |
-| -------------------------------------- | -------------------------------------- |
-| `BOILERPLATE_PRODUCT_NAME`             | `JUCE Boilerplate`                     |
-| `BOILERPLATE_COMPANY_NAME`             | `Boilerplate Audio`                    |
-| `BOILERPLATE_BUNDLE_ID`                | `com.boilerplateaudio.juceboilerplate` |
-| `BOILERPLATE_PLUGIN_MANUFACTURER_CODE` | `Wckm`                                 |
-| `BOILERPLATE_PLUGIN_CODE`              | `Jbpl`                                 |
-
-Plugin and manufacturer codes must stay stable for the life of a released
-product. Change them before the first release, not after.
-
-The editor title follows `BOILERPLATE_PRODUCT_NAME`; customize the remaining
-subtitle/artwork for each product.
-
-For a universal macOS binary, configure a fresh build directory with
-`-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"`. Set an explicit minimum OS too, for
-example `-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0` for a product targeting macOS 11+,
-and test both architectures. The default leaves these choices to the toolchain.
-
-## Signing and distribution
-
-Local macOS builds are ad-hoc/linker-signed. See
-[Signing and distribution](docs/distribution.md) for Developer ID signing,
-hardened runtime, notarization, installer packaging, and stapling. That guide also
-covers Windows/Linux release checks. CI does not sign or publish releases.
-
-## Validate
-
-Build and run the behavioral tests (tests are opt-in):
+Requires CMake 3.22+, a C++17 compiler and JUCE 9.0.4. The first configure fetches
+JUCE; use `-DBOILERPLATE_JUCE_SOURCE_DIR=/path/to/JUCE` for an existing checkout.
+macOS requires Xcode command-line tools; Windows uses Visual Studio 2022.
 
 ```sh
 cmake --preset release -DBOILERPLATE_BUILD_TESTS=ON
@@ -237,49 +19,163 @@ cmake --build --preset release
 ctest --preset release
 ```
 
-Repeat with `instrument-release`, and the Debug presets when changing code.
-On a headless Linux machine use `xvfb-run -a ctest --preset release`. Tests cover
-state recall, bypass at preparation, smoothing endpoints, gain extremes,
-mono/stereo layouts, varying/empty blocks, silence, and editor construction,
-painting, and destruction. They do not open an audio device.
+Repeat with `debug`, `instrument-release` and `instrument-debug`. Instrument
+presets retain an output-only, silent synthesis extension point and separate
+`JUCE Instrument` / `Jbpi` identity. The default product is the MIDI chord music
+effect. Presets cap compilation at six jobs; use `--parallel 4` on low-memory
+machines. LTO is off by default.
 
-Run the standalone app:
-
-```sh
-open "build/release/JUCEBoilerplate_artefacts/Release/Standalone/JUCE Boilerplate.app"
-```
-
-Validate the AU on macOS (the component must be installed first):
+Linux dependencies (Ubuntu):
 
 ```sh
-mkdir -p ~/Library/Audio/Plug-Ins/Components
-cp -R "build/release/JUCEBoilerplate_artefacts/Release/AU/JUCE Boilerplate.component" \
-      ~/Library/Audio/Plug-Ins/Components/
-killall AudioComponentRegistrar 2>/dev/null
-sleep 2
-auval -v aufx Jbpl Wckm
+sudo apt-get install -y build-essential cmake pkg-config libasound2-dev libjack-jackd2-dev \
+  libfontconfig1-dev libfreetype-dev libx11-dev libxcomposite-dev libxcursor-dev \
+  libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libxi-dev xvfb xauth
 ```
 
-For the instrument use the `instrument-release` component (`JUCE Instrument.component`)
-and `auval -v aumu Jbpi Wckm`. Adjust codes if rebranding. macOS CI runs AU validation
-for each configuration.
+Run tests under `xvfb-run -a ctest --preset release` on headless Linux.
+Browser/curl support is disabled. JUCE licensing is the distributor's responsibility.
 
-Release checks also include pluginval at strictness 5 or higher on VST3 (all
-platforms) and AU (macOS), plus actual DAW and standalone smoke tests. Commands
-and a checklist are in [the distribution guide](docs/distribution.md).
+| Platform | Outputs | Qualification |
+| --- | --- | --- |
+| macOS | AUv2 music effect (`aumf`), VST3, `.app` | Universal arm64/x86_64 CI; local builds native by default |
+| Windows | VST3, `.exe` | Visual Studio 2022 x64 CI |
+| Linux | VST3, executable | Ubuntu 22.04 x86_64 CI baseline |
 
-If the AU does not appear, restart the host and clear the AudioComponent cache
-with `killall AudioComponentRegistrar`. `pluginval` is a good next check for
-both VST3 and AU.
+CI builds/tests all four presets on these platforms, builds universal macOS binaries,
+validates AUs on macOS, and uploads permission-preserving build archives. Tests run
+on each runner's native architecture; Intel runtime/DAW testing remains a release check.
+This is not a guarantee of compatibility with every OS version or DAW. Windows
+and Linux ARM are outside the CI matrix. Qualify the oldest supported OS and
+actual host/MIDI routing on each platform before release.
 
-## Troubleshooting
+For universal macOS builds use a fresh build directory:
 
-- **Compiler killed / out of memory:** lower `BOILERPLATE_MAX_PARALLEL_JOBS`
-  (default 6) for Ninja's compile pool. For Makefiles and Visual Studio, use
-  `cmake --build --preset release --parallel 4` (the preset otherwise requests 6).
-  LTO is off by default; keep it off on low-memory machines.
-- **Changed JUCE source path:** use a fresh build directory. CMake caches the
-  JUCE location.
-- **Plugin not listed in a DAW:** install it with
-  `BOILERPLATE_COPY_PLUGIN_AFTER_BUILD=ON`, restart the host, and rescan
-  plugins.
+```sh
+cmake -S . -B build/universal -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+cmake --build build/universal --parallel 6
+```
+
+Artifacts are under `build/release/JUCEBoilerplate_artefacts/Release/`:
+
+- `Standalone/Wicky Chordinator.app` on macOS (`.exe` on Windows; no suffix on Linux).
+- `VST3/Wicky Chordinator.vst3` on all platforms.
+- `AU/Wicky Chordinator.component` on macOS.
+
+`-DBOILERPLATE_COPY_PLUGIN_AFTER_BUILD=ON` installs plugins in JUCE's default
+locations. Windows' system VST3 directory may require administrator privileges.
+For standalone, open the audio/MIDI settings and select MIDI inputs and an output;
+audio input remains muted. macOS AU is a music effect, not a bus-free MIDI FX
+(`aumi`) plugin; hosts differ in how they expose and route its MIDI output.
+
+## Playing and mapping
+
+Choose a chord family, complexity, High/Root/Low voicing and pitch offset in the
+matrix. Play a controller or click the on-screen keyboard. In Key Map, ASSIGN
+copies the matrix to the selected key. With **All octaves** checked it applies to
+the pitch class (all Cs, for example). Uncheck it for an exact MIDI note. Exact-note
+assignments take precedence over pitch-class assignments. CLEAR affects the selected
+layer; clearing an exact override reveals the pitch-class assignment beneath it.
+LOAD copies that layer's recipe back into the global matrix.
+
+Voicing Style controls how High/Root/Low are interpreted:
+
+- **Register (legacy):** shift the whole chord +12/0/-12 semitones.
+- **Inversions:** raise the bass for High, use root position for Root, or lower the
+  top voice below the root for Low, keeping the same chord tones.
+- **Random:** choose one of those three positions for each trigger.
+- **Smart:** select a position/register minimizing movement from the previous
+  chord on that MIDI channel. Reset/prepare clears this history.
+
+Scale Root transposes the result by 0–11 semitones. Major retains the C-major
+reference degrees; Natural Minor lowers E, A and B reference degrees by one
+semitone before root transposition. Chromatic accidentals keep their chromatic
+position. This is a deterministic transformation of the whole preset, not an
+automatic chord-name/scale detector. The minor-mode readout shows output pitch
+names. Scale Root/Mode persist in DAW sessions and stay unchanged when loading
+factory or user presets.
+
+Spread opens the upper voices by up to two octaves. Humanize varies velocity by
+up to 15 MIDI steps; **Timing** additionally delays individual note-ons by up to
+10 ms, scaled by the Humanize amount. This optional delay is an expressive effect,
+not compensated audio latency. Strum spaces notes by up to 60 ms each. Simultaneous
+release cancels future tones; staggered release delays the releases of tones that
+have sounded. Power OFF and host bypass flush generated notes immediately, then
+pass raw MIDI through. CC120/123 flush the addressed channel only.
+
+SAVE writes a `.wickychord` user preset containing parameters and both mapping
+layers. The default preset directory is `Wickman Wonderworks/Wicky Chordinator/Presets`
+under JUCE's user application-data directory (Application Support on macOS).
+Presets saved there are listed on subsequent editor opens. LOAD opens preset
+files from any folder. Green keyboard dots mark the selected scale. Factory presets update
+global controls and retain mappings; user presets restore their saved mappings.
+DAW session state always includes the complete configuration.
+
+## Parameters and compatibility
+
+| ID | Range / choices | Default |
+| --- | --- | --- |
+| `gain` | Velocity Gain, -60 to +12 dB | 0 dB |
+| `bypass`, `power` | Boolean | off, on |
+| `chord_type` | Major, Minor, Dominant, Other | Major |
+| `complexity` | Triad through 13#11 (11 choices) | Triad |
+| `voicing` | High, Root, Low | Root |
+| `pitch_offset` | -12 to +12 semitones | 0 |
+| `spread`, `humanize`, `strum` | 0–100% | 0% |
+| `spread_mode` | Dense, Sparse | Dense |
+| `note_off_mode` | Simultaneous, Staggered | Simultaneous |
+| `strum_mode` | Up, Down | Up |
+| `voicing_style` | Register, Inversions, Random, Smart | Inversions |
+| `humanize_timing` | Boolean | on |
+| `scale_root` | C through B | C |
+| `scale_mode` | Chromatic, Major, Natural Minor | Chromatic |
+
+Existing IDs, ranges, choice orders, AU version hints 1–12, and plugin codes are
+preserved. New parameters use hints 13–16. States lacking the new parameters
+explicitly restore legacy register voicing, velocity-only humanization and C
+chromatic scale, preserving their prior sound. Old exact-note mappings remain
+exact-note mappings. New state uses schema version 2.
+
+## Architecture and realtime limits
+
+`PluginProcessor` owns APVTS, cached parameter atomics, atomic recipe maps, MIDI
+ownership and the scheduler. `PluginEditor` / `ChordSettingsPanel` handle controls,
+presets and keyboard display on the message thread. `GainProcessor` remains a
+separately tested utility; it is not in the chord processor's audio signal path.
+
+The engine has 128 chord slots, 512 scheduled events, a 256-entry SPSC keyboard
+queue and an owned 64 KiB output buffer. Scratch storage is reserved before
+processing and never swapped with host storage. Incoming and scheduled events are
+merged chronologically. Output expansion is bounded; output/input overflow clears
+engine state and emits All Sound Off plus All Notes Off on every channel. The
+input limit is 4096 host MIDI events per block. Keyboard queue overflow triggers
+the same recovery. Pending-event exhaustion falls back to an immediate event.
+
+Internal processing does not allocate, lock, perform I/O or access ValueTrees.
+**JUCE's final copy into the host-owned MIDI buffer can allocate if that buffer
+has insufficient capacity.** Hosts/wrappers must reserve enough output storage
+for a strict allocation-free callback; the processor cannot guarantee this for an
+arbitrary supplied MidiBuffer. Ordinary MIDI and SysEx share the output byte limit.
+
+## Validation and distribution
+
+Tests cover state migration/recall, legacy gain utility behavior, chord balance,
+layouts, editor lifecycle, sample offsets, short/cross-block strums, bypass with
+pending releases, multi-channel display, bounded output, inversions, scale,
+humanize timing and user presets. They do not open an audio device.
+
+After installing the default AU, validate using:
+
+```sh
+auval -v aumf Jbpl Wckm
+```
+
+The instrument identity uses `auval -v aumu Jbpi Wckm`. Run pluginval strictness 5+
+and actual DAW/standalone smoke tests on every release platform. Test both slices
+of universal macOS binaries. See [distribution](docs/distribution.md) for signing,
+notarization, installers and platform qualification.
+
+Product identity is configurable in `CMakeLists.txt`: the defaults are Wicky
+Chordinator / Wickman Wonderworks, bundle `com.wickyaudio.wickychordinator`,
+manufacturer `Wckm` and plugin `Jbpl`. Never change released IDs or codes.

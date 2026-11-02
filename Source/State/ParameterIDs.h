@@ -22,6 +22,15 @@ namespace boilerplate::parameters
     inline constexpr auto strum = "strum";
     inline constexpr auto strumMode = "strum_mode";
 
+    inline constexpr auto voicingStyle = "voicing_style";
+    inline constexpr auto humanizeTiming = "humanize_timing";
+    inline constexpr auto scaleRoot = "scale_root";
+    inline constexpr auto scaleMode = "scale_mode";
+    inline constexpr int voicingStyleVersionHint = 13;
+    inline constexpr int humanizeTimingVersionHint = 14;
+    inline constexpr int scaleRootVersionHint = 15;
+    inline constexpr int scaleModeVersionHint = 16;
+
     inline constexpr int pitchOffsetMin = -12;
     inline constexpr int pitchOffsetMax = 12;
 

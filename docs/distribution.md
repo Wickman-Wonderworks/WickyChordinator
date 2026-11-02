@@ -31,21 +31,21 @@ artefacts="build/distribution/JUCEBoilerplate_artefacts/Release"
 identity="Developer ID Application: Your Name (TEAMID)"
 
 codesign --force --timestamp --options runtime --sign "$identity" \
-  "$artefacts/AU/JUCE Boilerplate.component"
+  "$artefacts/AU/Wicky Chordinator.component"
 codesign --force --timestamp --options runtime --sign "$identity" \
-  "$artefacts/VST3/JUCE Boilerplate.vst3"
+  "$artefacts/VST3/Wicky Chordinator.vst3"
 codesign --force --timestamp --options runtime --sign "$identity" \
   --entitlements packaging/macos/Standalone.entitlements \
-  "$artefacts/Standalone/JUCE Boilerplate.app"
+  "$artefacts/Standalone/Wicky Chordinator.app"
 
-codesign --verify --deep --strict --verbose=2 "$artefacts/AU/JUCE Boilerplate.component"
-codesign --verify --deep --strict --verbose=2 "$artefacts/VST3/JUCE Boilerplate.vst3"
-codesign --verify --deep --strict --verbose=2 "$artefacts/Standalone/JUCE Boilerplate.app"
+codesign --verify --deep --strict --verbose=2 "$artefacts/AU/Wicky Chordinator.component"
+codesign --verify --deep --strict --verbose=2 "$artefacts/VST3/Wicky Chordinator.vst3"
+codesign --verify --deep --strict --verbose=2 "$artefacts/Standalone/Wicky Chordinator.app"
 ```
 
-The standalone entitlement permits audio input under hardened runtime. JUCE's
-generated effect standalone Info.plist supplies the microphone usage description; adjust
-that text for the product. Plugin bundles run inside a host and do not receive
+The standalone currently keeps audio input muted and disables microphone permission
+requests; MIDI generation does not require microphone access. Enable the usage
+description and required entitlement only if adding audio-input functionality. Plugin bundles run inside a host and do not receive
 the standalone's entitlements. Add other entitlements only when the product needs
 them. Sign after building: rebuilding or regenerating VST3 metadata changes the bundle.
 
@@ -60,14 +60,14 @@ staging="$(mktemp -d /tmp/juce-release.XXXXXX)"
 mkdir -p "$staging/Applications" \
   "$staging/Library/Audio/Plug-Ins/Components" \
   "$staging/Library/Audio/Plug-Ins/VST3"
-ditto "$artefacts/Standalone/JUCE Boilerplate.app" "$staging/Applications/JUCE Boilerplate.app"
-ditto "$artefacts/AU/JUCE Boilerplate.component" "$staging/Library/Audio/Plug-Ins/Components/JUCE Boilerplate.component"
-ditto "$artefacts/VST3/JUCE Boilerplate.vst3" "$staging/Library/Audio/Plug-Ins/VST3/JUCE Boilerplate.vst3"
+ditto "$artefacts/Standalone/Wicky Chordinator.app" "$staging/Applications/Wicky Chordinator.app"
+ditto "$artefacts/AU/Wicky Chordinator.component" "$staging/Library/Audio/Plug-Ins/Components/Wicky Chordinator.component"
+ditto "$artefacts/VST3/Wicky Chordinator.vst3" "$staging/Library/Audio/Plug-Ins/VST3/Wicky Chordinator.vst3"
 mkdir -p build/packages
 pkgbuild --root "$staging" --install-location / \
-  --identifier com.boilerplateaudio.juceboilerplate.pkg --version 0.1.0 \
+  --identifier com.wickyaudio.wickychordinator.pkg --version 0.1.0 \
   --sign "Developer ID Installer: Your Name (TEAMID)" \
-  "build/packages/JUCE Boilerplate.pkg"
+  "build/packages/Wicky Chordinator.pkg"
 ```
 
 Store notarization credentials in a Keychain profile using
@@ -75,13 +75,13 @@ Store notarization credentials in a Keychain profile using
 App Store Connect API credentials. Keep credentials out of the repository.
 
 ```sh
-xcrun notarytool submit "build/packages/JUCE Boilerplate.pkg" \
+xcrun notarytool submit "build/packages/Wicky Chordinator.pkg" \
   --keychain-profile "audio-notary" --wait
 # Continue only after the submission reports Accepted.
-xcrun stapler staple "build/packages/JUCE Boilerplate.pkg"
-xcrun stapler validate "build/packages/JUCE Boilerplate.pkg"
-pkgutil --check-signature "build/packages/JUCE Boilerplate.pkg"
-spctl --assess --type install --verbose=2 "build/packages/JUCE Boilerplate.pkg"
+xcrun stapler staple "build/packages/Wicky Chordinator.pkg"
+xcrun stapler validate "build/packages/Wicky Chordinator.pkg"
+pkgutil --check-signature "build/packages/Wicky Chordinator.pkg"
+spctl --assess --type install --verbose=2 "build/packages/Wicky Chordinator.pkg"
 ```
 
 For a rejected submission, inspect `xcrun notarytool log <submission-id>` using
@@ -110,7 +110,7 @@ and [custom notarization workflow](https://developer.apple.com/documentation/sec
 
 1. Build all formats and run CTest for effect/instrument, Debug/Release. Review
    cross-platform CI results. Test both slices of any universal macOS binary.
-2. Install and run `auval -v aufx Jbpl Wckm` for the default effect, or
+2. Install and run `auval -v aumf Jbpl Wckm` for the default effect, or
    `auval -v aumu Jbpi Wckm` for the instrument preset. Use your released codes
    for rebranded products. Validate the final signed bundles too.
 3. Run [pluginval](https://github.com/Tracktion/pluginval) at strictness 5 or
@@ -118,20 +118,23 @@ and [custom notarization workflow](https://developer.apple.com/documentation/sec
    architecture. Example commands for the default Release build:
 
    ```sh
-   pluginval --strictness-level 5 "build/release/JUCEBoilerplate_artefacts/Release/VST3/JUCE Boilerplate.vst3"
+   pluginval --strictness-level 5 "build/release/JUCEBoilerplate_artefacts/Release/VST3/Wicky Chordinator.vst3"
    # macOS, if pluginval is installed as an application:
    /Applications/pluginval.app/Contents/MacOS/pluginval --strictness-level 5 \
-     "build/release/JUCEBoilerplate_artefacts/Release/AU/JUCE Boilerplate.component"
+     "build/release/JUCEBoilerplate_artefacts/Release/AU/Wicky Chordinator.component"
    ```
 
    On headless Linux prefix the command with `xvfb-run -a`; on Windows use
    `pluginval.exe`. Require a zero exit status and retain the validation log.
 4. In actual target DAWs, scan/load both formats; automate gain and bypass;
    save, close, and reopen a session; resize and repeatedly reopen the editor;
-   change sample rates/buffer sizes; compare offline export with realtime audio.
+   change sample rates/buffer sizes; compare offline export with realtime MIDI.
+   Exercise short strums inside a single buffer, pending events across buffers,
+   staggered release during power/bypass changes, shared notes on multiple channels,
+   scale-preserving preset recall, legacy sessions, and full MIDI queue overload.
    Include Logic for AU and a VST3 host on each supported OS.
 5. Launch standalone on each OS. Select audio devices, confirm microphone
-   permission/input for the effect, MIDI input for instruments, resizing, and
+   settings as applicable, MIDI input/output routing, resizing, and
    clean shutdown. The instrument scaffold is silent until an engine is added;
    validate note timing and voice limits once that engine exists.
 6. Test silence, gain extremes, mono/stereo, rapid bypass changes, and many
