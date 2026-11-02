@@ -39,14 +39,18 @@ namespace wicky::ui
 
     //==========================================================================
     /**
-        A MidiKeyboardComponent that adds two pieces of Chordinator state on top
-        of JUCE's stock keyboard:
+        A MidiKeyboardComponent that draws the plugin's real MIDI output.
 
-        - the key currently selected for per-key recipe editing (fuchsia), and
-        - the notes the host is currently holding (electric blue).
+        The MidiKeyboardState passed in is a display-only mirror: PluginProcessor
+        publishes a lock-free mask of the notes in its final, chord-expanded
+        output buffer and PluginEditor applies that mask to the state on the
+        message thread. The component therefore lights up the generated chord
+        shape, not the raw key that was clicked.
 
-        Clicks still play through the processor, via the lock-free FIFO owned by
-        PluginProcessor. All drawing happens on the message thread.
+        Mouse input is intercepted before it can touch the display state. Clicks
+        are forwarded through onRawNote exactly like hardware MIDI, so they run
+        through the processor's normal chord engine and only become visible once
+        they appear in the processed output.
     */
     class ChordKeyboard final : public juce::MidiKeyboardComponent
     {
@@ -58,8 +62,15 @@ namespace wicky::ui
             setOctaveForMiddleC (4);
             setAvailableRange (48, 84); // C3..C6
             setLowestVisibleKey (48);
-            setVelocity (0.8f, false);
+            setVelocity (noteVelocity, false);
             setMidiChannel (1);
+
+            // The display state is owned by the output, so the stock computer
+            // keyboard mapping (which would write raw notes into that state)
+            // is disabled. Hardware and UI mouse input both go through the
+            // processor's raw MIDI bridge instead.
+            clearKeyMappings();
+            setWantsKeyboardFocus (false);
 
             setColour (whiteNoteColourId, miami::keyWhite);
             setColour (blackNoteColourId, miami::keyBlack);
@@ -85,18 +96,17 @@ namespace wicky::ui
 
         int getSelectedNote() const noexcept { return selectedNote; }
 
-        void setActiveNotes (juce::uint64 lowWord, juce::uint64 highWord)
+        /** Releases any note currently held by the mouse (used on teardown). */
+        void releaseHeldRawNote()
         {
-            if (activeLow == lowWord && activeHigh == highWord)
-                return;
-
-            activeLow = lowWord;
-            activeHigh = highWord;
-            repaint();
+            stopRawNote();
         }
 
         /** Called when the user clicks or drags onto a key. */
         std::function<void (int)> onNoteSelected;
+
+        /** Raw MIDI from the UI, before any chord expansion. */
+        std::function<void (bool noteOn, int midiNote, float velocity)> onRawNote;
 
     protected:
         bool mouseDownOnKey (int midiNoteNumber, const juce::MouseEvent&) override
@@ -104,7 +114,11 @@ namespace wicky::ui
             if (onNoteSelected != nullptr)
                 onNoteSelected (midiNoteNumber);
 
-            return true; // Let JUCE play the note as well.
+            startRawNote (midiNoteNumber);
+
+            // Suppress the stock state update: the display is fed exclusively
+            // by the processor's processed-output mirror.
+            return false;
         }
 
         bool mouseDraggedToKey (int midiNoteNumber, const juce::MouseEvent&) override
@@ -112,7 +126,21 @@ namespace wicky::ui
             if (onNoteSelected != nullptr)
                 onNoteSelected (midiNoteNumber);
 
-            return true;
+            moveRawNote (midiNoteNumber);
+            return false;
+        }
+
+        void mouseUpOnKey (int, const juce::MouseEvent&) override
+        {
+            stopRawNote();
+        }
+
+        void mouseUp (const juce::MouseEvent& e) override
+        {
+            // mouseUpOnKey is only called while the pointer is over a key, so
+            // release here as well to cover releasing outside the keyboard.
+            stopRawNote();
+            MidiKeyboardComponent::mouseUp (e);
         }
 
         void drawWhiteNote (int midiNoteNumber, juce::Graphics& g,
@@ -122,11 +150,9 @@ namespace wicky::ui
             auto fill = findColour (whiteNoteColourId);
 
             if (isDown)
-                fill = miami::highlighterYellow;
+                fill = miami::radicalBlue.brighter (0.35f);
             else if (midiNoteNumber == selectedNote)
                 fill = miami::fluorescentPink;
-            else if (isActive (midiNoteNumber))
-                fill = miami::radicalBlue.brighter (0.35f);
             else if (isOver)
                 fill = fill.brighter (0.04f);
 
@@ -165,11 +191,9 @@ namespace wicky::ui
             auto fill = noteFillColour;
 
             if (isDown)
-                fill = miami::highlighterYellow.darker (0.25f);
+                fill = miami::radicalBlue;
             else if (midiNoteNumber == selectedNote)
                 fill = miami::fluorescentPink;
-            else if (isActive (midiNoteNumber))
-                fill = miami::radicalBlue;
             else if (isOver)
                 fill = fill.brighter (0.20f);
 
@@ -181,18 +205,43 @@ namespace wicky::ui
         }
 
     private:
-        bool isActive (int midiNoteNumber) const noexcept
+        void startRawNote (int midiNoteNumber)
         {
-            if (! juce::isPositiveAndBelow (midiNoteNumber, 128))
-                return false;
+            stopRawNote();
 
-            const auto word = midiNoteNumber < 64 ? activeLow : activeHigh;
-            return (word & (static_cast<juce::uint64> (1) << (midiNoteNumber & 63))) != 0;
+            if (! juce::isPositiveAndBelow (midiNoteNumber, 128)
+                || onRawNote == nullptr)
+                return;
+
+            heldMouseNote = midiNoteNumber;
+            onRawNote (true, heldMouseNote, noteVelocity);
         }
 
+        void moveRawNote (int midiNoteNumber)
+        {
+            if (midiNoteNumber == heldMouseNote || ! juce::isPositiveAndBelow (midiNoteNumber, 128))
+                return;
+
+            stopRawNote();
+            startRawNote (midiNoteNumber);
+        }
+
+        void stopRawNote()
+        {
+            if (heldMouseNote < 0)
+                return;
+
+            const auto note = heldMouseNote;
+            heldMouseNote = -1;
+
+            if (onRawNote != nullptr)
+                onRawNote (false, note, 0.0f);
+        }
+
+        static constexpr float noteVelocity = 0.8f;
+
         int selectedNote = 60;
-        juce::uint64 activeLow = 0;
-        juce::uint64 activeHigh = 0;
+        int heldMouseNote = -1;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ChordKeyboard)
     };

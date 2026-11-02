@@ -67,9 +67,21 @@ PluginEditor::PluginEditor (PluginProcessor& owner)
         chordKeyboard.setSelectedNote (note);
     };
 
+    // UI mouse clicks are raw MIDI, exactly like a hardware controller: they
+    // enter the processor's lock-free bridge and are expanded by the same chord
+    // engine. Nothing is written straight into the display state.
+    chordKeyboard.onRawNote = [this] (bool noteOn, int note, float velocity)
+    {
+        processorRef.queueKeyboardNote (noteOn, note, velocity);
+    };
+
     chordKeyboard.setSelectedNote (keyMapBar.getSelectedKey());
 
-    processorRef.getKeyboardState().addListener (this);
+    // The keyboard state mirrors processed output only. Clear anything left
+    // behind by a previous editor before the first output sync runs.
+    processorRef.getKeyboardState().allNotesOff (1);
+    displayedNoteLow = 0;
+    displayedNoteHigh = 0;
 
     setResizable (true, true);
     setResizeLimits (760, 441, 2000, 1160);
@@ -85,10 +97,13 @@ PluginEditor::~PluginEditor()
 {
     stopTimer();
 
-    // Send note-offs for anything still held when the editor closes so the
-    // processor cannot be left with an orphaned chord.
+    // If the editor is closed mid-click, release the raw note so the engine
+    // cannot leave a chord hanging.
+    chordKeyboard.releaseHeldRawNote();
+
+    // Clear the display mirror; any notes that are still held by the engine
+    // will be mirrored again if a new editor is opened.
     processorRef.getKeyboardState().allNotesOff (1);
-    processorRef.getKeyboardState().removeListener (this);
 
     setLookAndFeel (nullptr);
 }
@@ -380,9 +395,38 @@ int PluginEditor::scaled (int value) const noexcept
 void PluginEditor::timerCallback()
 {
     refreshChordReadout();
+    syncKeyboardDisplay();
+}
 
-    chordKeyboard.setActiveNotes (processorRef.getActiveInputNotes (0),
-                                  processorRef.getActiveInputNotes (1));
+void PluginEditor::syncKeyboardDisplay()
+{
+    const auto outputLow = processorRef.getActiveOutputNotes (0);
+    const auto outputHigh = processorRef.getActiveOutputNotes (1);
+
+    if (outputLow == displayedNoteLow && outputHigh == displayedNoteHigh)
+        return;
+
+    auto& keyboardState = processorRef.getKeyboardState();
+
+    for (int note = 0; note < 128; ++note)
+    {
+        const auto bit = static_cast<juce::uint64> (1) << (note & 63);
+        const auto outputWord = note < 64 ? outputLow : outputHigh;
+        const auto displayedWord = note < 64 ? displayedNoteLow : displayedNoteHigh;
+        const auto isOn = (outputWord & bit) != 0;
+        const auto wasOn = (displayedWord & bit) != 0;
+
+        if (isOn == wasOn)
+            continue;
+
+        if (isOn)
+            keyboardState.noteOn (1, note, 1.0f);
+        else
+            keyboardState.noteOff (1, note, 0.0f);
+    }
+
+    displayedNoteLow = outputLow;
+    displayedNoteHigh = outputHigh;
 }
 
 void PluginEditor::refreshChordReadout()
@@ -463,19 +507,4 @@ juce::String PluginEditor::chordSymbolFor (int rootNote,
     const juce::String suffixString (suffix);
 
     return suffixString.isEmpty() ? root : root + " " + suffixString;
-}
-
-//==============================================================================
-void PluginEditor::handleNoteOn (juce::MidiKeyboardState*, int midiChannel,
-                                 int midiNoteNumber, float velocity)
-{
-    juce::ignoreUnused (midiChannel);
-    processorRef.queueKeyboardNote (true, midiNoteNumber, velocity);
-}
-
-void PluginEditor::handleNoteOff (juce::MidiKeyboardState*, int midiChannel,
-                                  int midiNoteNumber, float velocity)
-{
-    juce::ignoreUnused (midiChannel, velocity);
-    processorRef.queueKeyboardNote (false, midiNoteNumber, 0.0f);
 }

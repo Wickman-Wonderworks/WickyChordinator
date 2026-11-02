@@ -569,6 +569,10 @@ namespace
                  "Virtual keyboard note did not generate a chord");
         require ((processor.getActiveInputNotes (0) & (juce::uint64 (1) << 60)) != 0,
                  "Virtual keyboard note was not mirrored to the UI mask");
+        require ((processor.getActiveOutputNotes (0) & (juce::uint64 (1) << 60)) != 0
+                 && (processor.getActiveOutputNotes (1) & (juce::uint64 (1) << 0)) != 0  // 64
+                 && (processor.getActiveOutputNotes (1) & (juce::uint64 (1) << 3)) != 0, // 67
+                 "Processed chord was not mirrored to the keyboard display mask");
 
         processor.queueKeyboardNote (false, 60, 0.0f);
         midi.clear();
@@ -580,6 +584,10 @@ namespace
                  "Virtual keyboard note-off did not release the chord");
         require ((processor.getActiveInputNotes (0) & (juce::uint64 (1) << 60)) == 0,
                  "Virtual keyboard note-off was not mirrored to the UI mask");
+        require ((processor.getActiveOutputNotes (0) & (juce::uint64 (1) << 60)) == 0
+                 && (processor.getActiveOutputNotes (1) & (juce::uint64 (1) << 0)) == 0  // 64
+                 && (processor.getActiveOutputNotes (1) & (juce::uint64 (1) << 3)) == 0, // 67
+                 "Released chord was not cleared from the keyboard display mask");
     }
 
     void testInteractionEngine()

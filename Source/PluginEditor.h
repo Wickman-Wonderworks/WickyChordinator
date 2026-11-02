@@ -10,8 +10,7 @@
 class PluginProcessor;
 
 class PluginEditor final : public juce::AudioProcessorEditor,
-                           private juce::Timer,
-                           private juce::MidiKeyboardState::Listener
+                           private juce::Timer
 {
 public:
     explicit PluginEditor (PluginProcessor& processor);
@@ -24,17 +23,13 @@ private:
     //==========================================================================
     void timerCallback() override;
 
-    void handleNoteOn (juce::MidiKeyboardState*, int midiChannel,
-                       int midiNoteNumber, float velocity) override;
-    void handleNoteOff (juce::MidiKeyboardState*, int midiChannel,
-                        int midiNoteNumber, float velocity) override;
-
     //==========================================================================
     int scaled (int value) const noexcept;
 
     void configureStatusBar();
     void layoutStatusBar (juce::Rectangle<int> area);
     void refreshChordReadout();
+    void syncKeyboardDisplay();
     void selectPreset (int index);
     juce::String currentChordSymbol() const;
     static juce::String chordSymbolFor (int rootNote,
@@ -74,6 +69,10 @@ private:
 
     bool lastSoundState = false;
     bool updatingPresetSelector = false;
+
+    // Last note mask pushed into the processor's display MidiKeyboardState.
+    juce::uint64 displayedNoteLow = 0;
+    juce::uint64 displayedNoteHigh = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginEditor)
 };

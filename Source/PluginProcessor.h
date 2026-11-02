@@ -50,11 +50,27 @@ public:
     juce::AudioProcessorValueTreeState& getValueTreeState() noexcept { return apvts; }
 
     //==========================================================================
-    /** Message-thread keyboard state used by the editor's virtual keyboard. */
+    /**
+        Display state for the editor's virtual keyboard.
+
+        This state is owned by the processor but is only ever mutated from the
+        message thread. It is continuously reconciled with the notes that the
+        audio thread published from the final, chord-expanded MIDI output so the
+        keyboard mirrors what the plugin actually emits.
+    */
     juce::MidiKeyboardState& getKeyboardState() noexcept { return keyboardState; }
 
-    /** Lock-free snapshot of the notes currently held by the host. */
+    /** Lock-free snapshot of the raw input notes currently held by the host. */
     juce::uint64 getActiveInputNotes (int wordIndex) const noexcept;
+
+    /**
+        Lock-free snapshot of the notes in the final processed MIDI output.
+
+        processBlock refreshes this mask from the chord-expanded buffer that is
+        handed back to the host. The editor polls it to drive the keyboard, so
+        the display can never drift from the real output.
+    */
+    juce::uint64 getActiveOutputNotes (int wordIndex) const noexcept;
 
     /** Queues a virtual-keyboard note for the next processBlock without locking. */
     void queueKeyboardNote (bool noteOn, int midiNote, float velocity) noexcept;
@@ -86,8 +102,9 @@ public:
     ChordRecipe getKeyRecipe (int midiNote) const noexcept;
 
 private:
-    // Message-thread view of the on-screen keyboard. The audio thread never
-    // touches this object; note events cross over through the FIFO below.
+    // Display mirror of the on-screen keyboard. The audio thread never touches
+    // this object; processBlock publishes the final output note mask below and
+    // the editor's timer applies it on the message thread.
     juce::MidiKeyboardState keyboardState;
 
     // Lock-free SPSC bridge from the editor's keyboard to the audio callback.
@@ -106,10 +123,18 @@ private:
     // Two 64-bit words: bit n of word 0/1 means "input note n is held".
     std::atomic<juce::uint64> activeInputNotes[2] {};
 
+    // Two 64-bit words describing the notes present in the final, processed
+    // MIDI output. Written only by the audio thread inside processBlock and
+    // read by the editor to drive the virtual keyboard display.
+    std::atomic<juce::uint64> activeOutputNotes[2] {};
+
     void drainKeyboardEvents() noexcept;
     void updateInputNoteMask (const juce::uint8* data, int numBytes) noexcept;
+    void updateOutputNoteMask (const juce::uint8* data, int numBytes) noexcept;
     void setInputNoteActive (int midiNote, bool active) noexcept;
+    void setOutputNoteActive (int midiNote, bool active) noexcept;
     void clearInputNotes() noexcept;
+    void clearOutputNotes() noexcept;
 
     // Declared before the raw parameter pointers so that it outlives them.
     juce::AudioProcessorValueTreeState apvts;

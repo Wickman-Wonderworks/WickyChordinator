@@ -227,6 +227,14 @@ juce::uint64 PluginProcessor::getActiveInputNotes (const int wordIndex) const no
     return activeInputNotes[wordIndex].load (std::memory_order_relaxed);
 }
 
+juce::uint64 PluginProcessor::getActiveOutputNotes (const int wordIndex) const noexcept
+{
+    if (! juce::isPositiveAndBelow (wordIndex, 2))
+        return 0;
+
+    return activeOutputNotes[wordIndex].load (std::memory_order_relaxed);
+}
+
 int PluginProcessor::getLastTriggeredChordNote() const noexcept
 {
     return lastTriggeredChordNote.load (std::memory_order_relaxed);
@@ -304,6 +312,26 @@ void PluginProcessor::clearInputNotes() noexcept
         word.store (0, std::memory_order_relaxed);
 }
 
+void PluginProcessor::setOutputNoteActive (const int midiNote, const bool active) noexcept
+{
+    if (! juce::isPositiveAndBelow (midiNote, 128))
+        return;
+
+    auto& word = activeOutputNotes[midiNote >> 6];
+    const auto bit = static_cast<juce::uint64> (1) << (midiNote & 63);
+
+    if (active)
+        word.fetch_or (bit, std::memory_order_relaxed);
+    else
+        word.fetch_and (~bit, std::memory_order_relaxed);
+}
+
+void PluginProcessor::clearOutputNotes() noexcept
+{
+    for (auto& word : activeOutputNotes)
+        word.store (0, std::memory_order_relaxed);
+}
+
 void PluginProcessor::updateInputNoteMask (const juce::uint8* data,
                                            const int numBytes) noexcept
 {
@@ -320,6 +348,24 @@ void PluginProcessor::updateInputNoteMask (const juce::uint8* data,
         setInputNoteActive (note, false);
     else if (status == 0xB0 && (data[1] == 120 || data[1] == 123))
         clearInputNotes();
+}
+
+void PluginProcessor::updateOutputNoteMask (const juce::uint8* data,
+                                            const int numBytes) noexcept
+{
+    if (data == nullptr || numBytes != 3)
+        return;
+
+    const auto status = data[0] & 0xf0;
+    const auto note = static_cast<int> (data[1]);
+    const auto value = static_cast<int> (data[2]);
+
+    if (status == 0x90 && value > 0)
+        setOutputNoteActive (note, true);
+    else if (status == 0x80 || (status == 0x90 && value == 0))
+        setOutputNoteActive (note, false);
+    else if (status == 0xB0 && (data[1] == 120 || data[1] == 123))
+        clearOutputNotes();
 }
 
 //==============================================================================
@@ -396,6 +442,7 @@ void PluginProcessor::resetChordState() noexcept
 
     std::memset (noteRefCounts, 0, sizeof (noteRefCounts));
     clearInputNotes();
+    clearOutputNotes();
 
     lastTriggeredChordNote.store (-1, std::memory_order_relaxed);
     lastTriggeredRecipe.store (0, std::memory_order_relaxed);
@@ -1129,6 +1176,13 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     totalSamplesProcessed += static_cast<juce::int64> (currentBlockSize);
 
     midiMessages.swapWith (midiSwapBuffer);
+
+    // Publish the notes that survive in the final, chord-expanded buffer. The
+    // virtual keyboard reads this lock-free mask on the message thread, so the
+    // display always mirrors the plugin's real MIDI output rather than the raw
+    // input that produced it.
+    for (const auto metadata : midiMessages)
+        updateOutputNoteMask (metadata.data, metadata.numBytes);
 }
 
 //==============================================================================
