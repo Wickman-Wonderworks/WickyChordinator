@@ -164,10 +164,13 @@ namespace
 
 PluginProcessor::PluginProcessor()
     : AudioProcessor (BusesProperties()
+         #if ! JucePlugin_IsMidiEffect
          #if ! JucePlugin_IsSynth
           .withInput ("Input", juce::AudioChannelSet::stereo(), true)
          #endif
-          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
+         #endif
+          ),
       apvts (*this, nullptr, "Parameters", boilerplate::parameters::createLayout())
 {
     gainDbParameter = apvts.getRawParameterValue (boilerplate::parameters::gain);
@@ -253,10 +256,9 @@ bool PluginProcessor::isMidiEffect() const
 
 double PluginProcessor::getTailLengthSeconds() const
 {
-    // Free-time strum plus staggered release fit within one second. Synced
-    // steps can exceed this at very slow host tempos; hosts that truncate MIDI
-    // tails for long synced strums are validated separately.
-    return 1.0;
+    // Covers seven bounded synced intervals plus optional 10 ms humanization.
+    // Constant across automation so hosts need no tail-property notification.
+    return (maxChordTones - 1) * boilerplate::dsp::strum::maxStepSeconds + 0.010;
 }
 
 juce::AudioProcessorParameter* PluginProcessor::getBypassParameter() const
@@ -501,6 +503,9 @@ void PluginProcessor::resetChordState() noexcept
 
 bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
+   #if JucePlugin_IsMidiEffect
+    return layouts.inputBuses.isEmpty() && layouts.outputBuses.isEmpty();
+   #else
     const auto outputChannels = layouts.getMainOutputChannelSet();
 
     if (outputChannels != juce::AudioChannelSet::mono()
@@ -511,6 +516,7 @@ bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
     return layouts.inputBuses.isEmpty();
    #else
     return outputChannels == layouts.getMainInputChannelSet();
+   #endif
    #endif
 }
 
@@ -1230,7 +1236,10 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const auto totalNumOutputChannels = getTotalNumOutputChannels();
 
     // Outputs without a matching input may contain garbage; clear them.
-    for (auto channel = totalNumInputChannels; channel < totalNumOutputChannels; ++channel)
+    // MIDI-only renders may provide frames without channel storage. Never
+    // address a nominal output that is absent from this callback's buffer.
+    for (auto channel = totalNumInputChannels;
+         channel < juce::jmin (totalNumOutputChannels, buffer.getNumChannels()); ++channel)
         buffer.clear (channel, 0, buffer.getNumSamples());
 
    #if JucePlugin_IsSynth

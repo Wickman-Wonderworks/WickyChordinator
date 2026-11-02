@@ -31,7 +31,8 @@ namespace
         wicky::standalone::MidiDeviceList result;
 
         for (const auto& device : juce::MidiInput::getAvailableDevices())
-            result.add ({ device.identifier, device.name });
+            if (! wicky::standalone::isWickyVirtualInput (device.name))
+                result.add ({ device.identifier, device.name });
 
         return result;
     }
@@ -42,6 +43,10 @@ namespace
 
         for (const auto& device : juce::MidiOutput::getAvailableDevices())
             result.add ({ device.identifier, device.name });
+
+        if (wicky::standalone::supportsVirtualMidiOutput())
+            result.add ({ wicky::standalone::virtualOutputIdentifier,
+                          wicky::standalone::virtualOutputName });
 
         return result;
     }
@@ -96,7 +101,7 @@ namespace
 
                         if (identifier.isNotEmpty())
                         {
-                            midiOutput = juce::MidiOutput::openDevice (identifier);
+                            midiOutput = wicky::standalone::openStandaloneMidiOutput (identifier);
 
                             if (midiOutput != nullptr)
                             {
@@ -139,13 +144,16 @@ namespace
             every device start. This listener runs after the device callbacks
             have finished and reattaches the routing-panel endpoint.
         */
-        class DeviceWatcher final : public juce::ChangeListener
+        class DeviceWatcher final : public juce::ChangeListener, private juce::Timer
         {
         public:
             explicit DeviceWatcher (ChordinatorPluginHolder& ownerToUse)
                 : owner (ownerToUse)
             {
+                startTimer (500);
             }
+
+            ~DeviceWatcher() override { stopTimer(); }
 
             void changeListenerCallback (juce::ChangeBroadcaster*) override
             {
@@ -156,6 +164,7 @@ namespace
             }
 
         private:
+            void timerCallback() override { owner.reconcileDevices(); }
             ChordinatorPluginHolder& owner;
         };
 
@@ -236,6 +245,40 @@ namespace
             wicky::standalone::sendMidiPanic (*midiOutput);
         }
 
+        void reconcileDevices()
+        {
+            if (routingStore == nullptr)
+                return;
+            const auto saved = wicky::standalone::loadMidiRoutingSettings (*routingStore);
+            const auto inputs = enumerateInputs();
+            juce::StringArray connected;
+            bool lostInput = false;
+            for (const auto& identifier : saved.inputIdentifiers)
+            {
+                const auto present = findDevice (inputs, identifier) != nullptr;
+                if (present)
+                {
+                    deviceManager.setMidiInputDeviceEnabled (identifier, true);
+                    if (deviceManager.isMidiInputDeviceEnabled (identifier))
+                        connected.add (identifier);
+                }
+                else
+                {
+                    lostInput = lostInput || activeInputIdentifiers.contains (identifier);
+                    deviceManager.setMidiInputDeviceEnabled (identifier, false);
+                }
+            }
+            activeInputIdentifiers = connected;
+            if (lostInput)
+            {
+                if (midiOutput != nullptr)
+                    midiOutput->clearAllPendingMessages();
+                proxy.requestPanic();
+            }
+            if (midiOutput != nullptr && findDevice (enumerateOutputs(), saved.outputIdentifier) == nullptr)
+                switchOutput ({}); // Keep the missing ID in preferences.
+        }
+
         void applyPersistedRouting()
         {
             if (routingStore == nullptr || processor == nullptr)
@@ -261,6 +304,7 @@ namespace
                     device.identifier,
                     settings.inputIdentifiers.contains (device.identifier));
 
+            activeInputIdentifiers = settings.inputIdentifiers;
             proxy.setOutputChannel (settings.outputChannel);
 
             if (routeSwitcher != nullptr)
@@ -271,6 +315,7 @@ namespace
         std::unique_ptr<wicky::standalone::MidiRouteSwitcher> routeSwitcher;
         std::unique_ptr<juce::MidiOutput> midiOutput;
         juce::String midiOutputIdentifier;
+        juce::StringArray activeInputIdentifiers;
         DeviceWatcher deviceWatcher { *this };
         wicky::standalone::MidiRoutingProcessorProxy proxy;
     };
@@ -307,6 +352,8 @@ namespace
         void setInputEnabled (const juce::String& identifier, bool enabled) override
         {
             holder.getDeviceManager().setMidiInputDeviceEnabled (identifier, enabled);
+            if (! enabled)
+                sendNoteOffs();
 
             auto settings = getSettings();
 
@@ -360,17 +407,9 @@ namespace
         void sendNoteOffs() override
         {
             // Drop notes already queued for future sample offsets, then let the
-            // input path cancel pending chord tones and panic every channel.
+            // proxy cancel pending chord tones and panic every channel.
             if (auto* output = holder.getMidiOutput())
                 output->clearAllPendingMessages();
-
-            for (int channel = 1; channel <= 16; ++channel)
-            {
-                holder.getPlayer().getMidiMessageCollector().addMessageToQueue (
-                    juce::MidiMessage::allSoundOff (channel));
-                holder.getPlayer().getMidiMessageCollector().addMessageToQueue (
-                    juce::MidiMessage::allNotesOff (channel));
-            }
 
             holder.getProxy().requestPanic();
         }

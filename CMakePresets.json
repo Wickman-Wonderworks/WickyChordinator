@@ -45,6 +45,40 @@
         "BOILERPLATE_BUNDLE_ID": "com.boilerplateaudio.juceinstrument",
         "BOILERPLATE_PLUGIN_CODE": "Jbpi"
       }
+    },
+    {
+      "name": "midi-fx-debug",
+      "inherits": "debug",
+      "displayName": "MIDI FX Debug",
+      "binaryDir": "${sourceDir}/build/midi-fx-debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "BOILERPLATE_IS_MIDI_EFFECT": "ON",
+        "BOILERPLATE_PRODUCT_NAME": "Wicky Chordinator MIDI FX",
+        "BOILERPLATE_BUNDLE_ID": "com.wickyaudio.wickychordinator.midifx",
+        "BOILERPLATE_PLUGIN_CODE": "Wcmf"
+      }
+    },
+    {
+      "name": "midi-fx-release",
+      "inherits": "release",
+      "displayName": "MIDI FX Release",
+      "binaryDir": "${sourceDir}/build/midi-fx-release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "BOILERPLATE_IS_MIDI_EFFECT": "ON",
+        "BOILERPLATE_PRODUCT_NAME": "Wicky Chordinator MIDI FX",
+        "BOILERPLATE_BUNDLE_ID": "com.wickyaudio.wickychordinator.midifx",
+        "BOILERPLATE_PLUGIN_CODE": "Wcmf"
+      }
     }
   ],
   "buildPresets": [
@@ -69,6 +103,18 @@
     {
       "name": "instrument-release",
       "configurePreset": "instrument-release",
+      "configuration": "Release",
+      "jobs": 6
+    },
+    {
+      "name": "midi-fx-debug",
+      "configurePreset": "midi-fx-debug",
+      "configuration": "Debug",
+      "jobs": 6
+    },
+    {
+      "name": "midi-fx-release",
+      "configurePreset": "midi-fx-release",
       "configuration": "Release",
       "jobs": 6
     }
@@ -110,6 +156,28 @@
     {
       "name": "instrument-release",
       "configurePreset": "instrument-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "midi-fx-debug",
+      "configurePreset": "midi-fx-debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "midi-fx-release",
+      "configurePreset": "midi-fx-release",
       "configuration": "Release",
       "output": {
         "outputOnFailure": true

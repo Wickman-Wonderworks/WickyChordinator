@@ -285,22 +285,43 @@ include both mapping layers. DAW session recall also restores the selected scale
   (`1–16`). **Refresh** re-scans the available endpoints.
 - A selected endpoint that disappears is shown as disconnected. The plugin never
   substitutes another endpoint automatically; choose a new one or reconnect it.
-- **Send Note Offs** releases held chord notes and panics the selected output.
+- **Send Note Offs** releases held chord notes, cancels future strum tones and
+  panics the selected output. Disabling or losing an input uses the same global
+  cancellation policy, including chords held from other inputs. Reselect/retrigger
+  those chords after changing the route.
 - Switching the output endpoint flushes the old endpoint before opening the new
   one. Notes already sent to the old endpoint are released there; chord tones
   the scheduler has not emitted yet are generated on the new endpoint.
 - **Audio Settings** in the Options menu keeps JUCE's audio device settings;
   audio input remains muted.
-- This build does not create its own system-wide virtual MIDI output port.
-  Routing to an existing virtual port depends on the OS/backend and your setup;
-  creating a port and connecting to an existing port are separate capabilities.
+- On macOS/CoreMIDI and Linux/ALSA, **Wicky Chordinator Virtual Out** creates a
+  port for other applications. Select it here, then select its suffixed name as
+  an input in the receiving application. The suffix distinguishes instances;
+  switching away closes the port after panic. Re-select the new name in your
+  receiver after an app restart or route recreation. Creation failures show as
+  disconnected and never select another destination automatically.
+- Windows displays that app-created virtual output is unavailable; select an
+  existing external loopback endpoint instead. Windows MIDI Services is not
+  enabled by default. Native Windows virtual-port deployment remains deferred.
+- The app excludes Wicky virtual outputs from its input list to prevent feedback.
+  Device status updates periodically; Refresh reopens the saved output when it
+  returns. Selected inputs reconnect only to their saved identifiers.
+- Native macOS interprocess delivery is checked; Linux hardware/backend delivery
+  and Windows loopback delivery still need platform qualification.
 
 ## 9. Current limitations
 
-These parts of the larger design are not in this build yet:
+Release qualification is still in progress; see
+[the validation matrix](docs/release-qualification.md). App-created Windows
+virtual output is deferred. Real device routing and Logic project workflows
+require manual verification on the target systems.
 
-- An app-created system-wide virtual MIDI output port
-- Dedicated Logic MIDI FX placement through a validated bus-free AU MIDI effect
+The macOS **Wicky Chordinator MIDI FX** product is built separately using the
+`midi-fx-debug` / `midi-fx-release` presets. It declares `aumi` with its own identity
+and a processor with zero audio buses. In Logic, the intended placement is the
+MIDI FX slot before an instrument. Local auval/pluginval checks do not establish
+that Logic placement, automation or saved-project recall have been verified.
+The existing Wicky Chordinator AU remains a music effect (`aumf`).
 
 User-preset save/load and basic library browsing, Scale Root/Mode, inversions,
 Smart/Random voicing, timing humanization, tempo-synced strum with fallback BPM,
@@ -309,9 +330,5 @@ routing, and all-octave assignments are already implemented. The library current
 offers save/load and default-folder discovery; it does not provide tagging,
 search, or rename/delete controls.
 
-The `BOILERPLATE_IS_MIDI_EFFECT` CMake option is scaffolding, not a completed Logic
-MIDI FX configuration: the processor still declares audio buses. Do not enable it
-and assume Logic compatibility without completing bus negotiation and validation.
-
-See [the phased implementation plan](docs/plans/remaining-features.md) for the
-remaining work, task boundaries, and acceptance checks.
+Use the dedicated presets for MIDI FX. Enabling `BOILERPLATE_IS_MIDI_EFFECT`
+with the released effect/instrument identities or with synth mode is rejected.

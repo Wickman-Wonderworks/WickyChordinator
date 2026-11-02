@@ -32,6 +32,37 @@ namespace wicky::standalone
         }
     }
 
+    bool supportsVirtualMidiOutput() noexcept
+    {
+       #if JUCE_MAC || JUCE_LINUX
+        return true;
+       #else
+        // WinMM cannot publish endpoints. Windows MIDI Services deployment is
+        // deliberately not enabled by this product; existing loopbacks work.
+        return false;
+       #endif
+    }
+
+    bool isWickyVirtualInput (const juce::String& name)
+    {
+        return name == virtualOutputName
+            || name.startsWith (juce::String (virtualOutputName) + " (");
+    }
+
+    juce::String makeVirtualOutputName()
+    {
+        return juce::String (virtualOutputName) + " ("
+            + juce::Uuid().toString().substring (0, 8) + ")";
+    }
+
+    std::unique_ptr<juce::MidiOutput> openStandaloneMidiOutput (const juce::String& identifier)
+    {
+        if (identifier == virtualOutputIdentifier)
+            return supportsVirtualMidiOutput()
+                ? juce::MidiOutput::createNewDevice (makeVirtualOutputName()) : nullptr;
+        return identifier.isEmpty() ? nullptr : juce::MidiOutput::openDevice (identifier);
+    }
+
     //==========================================================================
     bool MidiRoutingSettings::isValid() const noexcept
     {
@@ -106,7 +137,8 @@ namespace wicky::standalone
         MidiDeviceList result;
 
         for (const auto& device : juce::MidiInput::getAvailableDevices())
-            result.add ({ device.identifier, device.name });
+            if (! isWickyVirtualInput (device.name))
+                result.add ({ device.identifier, device.name });
 
         return result;
     }
@@ -117,6 +149,9 @@ namespace wicky::standalone
 
         for (const auto& device : juce::MidiOutput::getAvailableDevices())
             result.add ({ device.identifier, device.name });
+
+        if (supportsVirtualMidiOutput())
+            result.add ({ virtualOutputIdentifier, virtualOutputName });
 
         return result;
     }
@@ -164,7 +199,7 @@ namespace wicky::standalone
         if (identifier.isEmpty())
             return false;
 
-        auto newOutput = juce::MidiOutput::openDevice (identifier);
+        auto newOutput = openStandaloneMidiOutput (identifier);
 
         if (newOutput == nullptr)
             return false;
@@ -335,6 +370,8 @@ namespace wicky::standalone
 
             const auto note = static_cast<int> (raw[1]);
             const auto velocity = static_cast<int> (raw[2]);
+            if (note >= 128 || velocity >= 128)
+                return;
             const auto isNoteOn = status == 0x90 && velocity > 0;
 
             if (isNoteOn)
@@ -776,6 +813,7 @@ namespace wicky::standalone
           processor (&processorToUse)
     {
         remappedMidi.ensureSize (65536);
+        panicInputMidi.ensureSize (65536);
     }
 
     MidiRoutingProcessorProxy::~MidiRoutingProcessorProxy() = default;
@@ -826,6 +864,7 @@ namespace wicky::standalone
         }
 
         remappedMidi.ensureSize (65536);
+        panicInputMidi.ensureSize (65536);
         remapper.reset();
 
         const auto channel = pendingOutputChannel.load (std::memory_order_relaxed);
@@ -846,6 +885,9 @@ namespace wicky::standalone
     void MidiRoutingProcessorProxy::processBlock (juce::AudioBuffer<float>& buffer,
                                                   juce::MidiBuffer& midiMessages)
     {
+        if (buffer.getNumSamples() <= 0)
+            return; // Keep panic/reset requests pending until the clock advances.
+
         if (processor == nullptr)
         {
             midiMessages.clear();
@@ -856,6 +898,13 @@ namespace wicky::standalone
         const auto reset = resetRequested.exchange (false, std::memory_order_relaxed);
         const auto channel = pendingOutputChannel.load (std::memory_order_relaxed);
 
+        remappedMidi.clear();
+        ProxySendContext context { &remappedMidi, 0, false };
+
+        // Release old-channel ownership before changing the policy.
+        if (panic || channel != appliedOutputChannel.load (std::memory_order_relaxed))
+            remapper.sendPanic (&appendProxyMessage, &context);
+
         if (reset || channel != appliedOutputChannel.load (std::memory_order_relaxed))
         {
             appliedOutputChannel.store (channel, std::memory_order_relaxed);
@@ -863,19 +912,46 @@ namespace wicky::standalone
             remapper.setOutputChannel (channel);
         }
 
-        remappedMidi.clear();
-        ProxySendContext context { &remappedMidi, 0, false };
-
+        // Inject cancellation at sample zero through a bounded, owned buffer.
+        // This reaches the chord scheduler as well as the output remapper, so
+        // future tones cannot reappear after a panic or input disconnection.
         if (panic)
-            remapper.sendPanic (&appendProxyMessage, &context);
+        {
+            panicInputMidi.clear();
+            for (int ch = 1; ch <= 16; ++ch)
+                panicInputMidi.addEvent (juce::MidiMessage::allSoundOff (ch), 0);
 
-        processor->processBlock (buffer, midiMessages);
+            // If the input cannot fit, discard it as a whole. Accepting only
+            // its prefix could retain a note-on while dropping its note-off.
+            if (midiMessages.data.size() <= 65536 - panicInputMidi.data.size())
+                for (const auto metadata : midiMessages)
+                    panicInputMidi.addEvent (metadata.data, metadata.numBytes, metadata.samplePosition);
+            processor->processBlock (buffer, panicInputMidi);
+        }
+        else
+        {
+            processor->processBlock (buffer, midiMessages);
+        }
 
-        for (const auto metadata : midiMessages)
+        const auto& processed = panic ? panicInputMidi : midiMessages;
+        for (const auto metadata : processed)
         {
             context.position = metadata.samplePosition;
-            context.overflow = false;
-            remapper.process (metadata.getMessage(), &appendProxyMessage, &context);
+            if (metadata.numBytes > 0 && metadata.data[0] >= 0xf0)
+            {
+                // MidiMessage owns large SysEx on the heap. Copy system bytes
+                // directly into reserved storage instead of constructing one.
+                constexpr int overhead = sizeof (juce::int32) + sizeof (juce::uint16);
+                if (metadata.numBytes > 65535 - overhead
+                    || metadata.numBytes > 65536 - overhead - remappedMidi.data.size())
+                    context.overflow = true;
+                else
+                    remappedMidi.addEvent (metadata.data, metadata.numBytes, metadata.samplePosition);
+            }
+            else
+            {
+                remapper.process (metadata.getMessage(), &appendProxyMessage, &context);
+            }
 
             if (context.overflow)
                 break;
@@ -894,6 +970,7 @@ namespace wicky::standalone
             }
 
             remapper.reset();
+            panicRequested.store (true, std::memory_order_relaxed);
         }
         else
         {

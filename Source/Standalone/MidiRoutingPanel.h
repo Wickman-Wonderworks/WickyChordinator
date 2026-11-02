@@ -35,7 +35,7 @@ namespace wicky::standalone
     };
 
     /** Standalone-only MIDI routing panel. Never added to plugin editors. */
-    class MidiRoutingPanel final : public juce::Component
+    class MidiRoutingPanel final : public juce::Component, private juce::Timer
     {
     public:
         explicit MidiRoutingPanel (std::unique_ptr<MidiRoutingPanelModel> modelToUse);
@@ -61,6 +61,7 @@ namespace wicky::standalone
             MidiRoutingPanel& owner;
         };
 
+        void timerCallback() override;
         void rebuildOutputItems();
         void updateStatus();
 

@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include "VirtualMidiProbe.h"
+
 class PluginProcessorTestAccess
 {
 public:
@@ -511,6 +513,8 @@ namespace
     {
         int blockSize = 64;
         int totalSamples = 24000;
+        int audioChannels = 2;
+        double sampleRate = 48000.0;
         int chordType = 0;
         int complexity = 0;
         int voicing = 1;
@@ -548,8 +552,8 @@ namespace
         if (scenario.attachPlayHead)
             processor.setPlayHead (&playHead);
 
-        processor.setRateAndBufferSizeDetails (48000.0, scenario.blockSize);
-        processor.prepareToPlay (48000.0, scenario.blockSize);
+        processor.setRateAndBufferSizeDetails (scenario.sampleRate, scenario.blockSize);
+        processor.prepareToPlay (scenario.sampleRate, scenario.blockSize);
 
         if (scenario.randomSeed != 0)
             PluginProcessorTestAccess::setHumanizeSeed (processor, scenario.randomSeed);
@@ -592,7 +596,7 @@ namespace
                 playHead.timeInSamples = 123456789;
             }
 
-            juce::AudioBuffer<float> audio (2, scenario.blockSize);
+            juce::AudioBuffer<float> audio (scenario.audioChannels, scenario.blockSize);
             juce::MidiBuffer midi;
 
             for (const auto& event : scenario.input)
@@ -1328,6 +1332,14 @@ namespace
 
         require (restored.acceptsMidi(), "Chord plugin must accept MIDI input");
         require (restored.producesMidi(), "Chord plugin must produce MIDI output");
+       #if JucePlugin_IsMidiEffect
+        require (restored.getBusCount (true) == 0 && restored.getBusCount (false) == 0,
+                 "MIDI FX must have no audio buses");
+        require (restored.setBusesLayout ({}), "MIDI FX rejected an empty layout");
+        juce::AudioProcessor::BusesLayout audioLayout;
+        audioLayout.outputBuses.add (juce::AudioChannelSet::stereo());
+        require (! restored.isBusesLayoutSupported (audioLayout), "MIDI FX accepted audio buses");
+       #else
         require (restored.getBusCount (true) == (JucePlugin_IsSynth ? 0 : 1), "Incorrect input buses");
         require (restored.getBusCount (false) == 1, "Incorrect output buses");
 
@@ -1366,6 +1378,7 @@ namespace
         auto unsupported = restored.getBusesLayout();
         unsupported.outputBuses.set (0, juce::AudioChannelSet::create5point1());
         require (! restored.isBusesLayoutSupported (unsupported), "Accepted surround output");
+       #endif
     }
 
     void testReviewRegressions()
@@ -2905,8 +2918,7 @@ namespace
         const auto channelThree = render ({
             { juce::MidiMessage::noteOn (2, 64, juce::uint8 (100)), 10 }
         });
-        require (channelThree.size() == 1 && channelThree[0].channel == 2
-                     && channelThree[0].data1 == 64,
+        require (hasNoteOn (channelThree, 2, 64),
                  "Proxy channel change did not take effect");
 
         proxy.setOutputChannel (1);
@@ -3008,6 +3020,137 @@ namespace
 
         modelPtr->setInputEnabled ("in-a", false);
         require (! modelPtr->isInputEnabled ("in-a"), "Input toggle did not reach the model");
+    }
+
+    void testRoutingRegressions()
+    {
+        using namespace wicky::standalone;
+        using namespace boilerplate::parameters;
+        PluginProcessor processor;
+        MidiRoutingProcessorProxy proxy (processor);
+        proxy.prepareToPlay (48000, 64);
+        setChordMatrix (processor, 0, 0, 1, 0);
+        setParameter (processor, strumTimingMode, 1);
+        juce::AudioBuffer<float> audio (0, 64);
+        juce::MidiBuffer midi;
+        midi.ensureSize (131072);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, juce::uint8 (100)), 0);
+        proxy.processBlock (audio, midi);
+        require (countNoteOns (captureMidi (midi)) == 1, "Panic test did not start a strum");
+        proxy.requestPanic(); // Used by Send Note Offs and disabling an input.
+        midi.clear();
+        juce::AudioBuffer<float> noFrames (0, 0);
+        proxy.processBlock (noFrames, midi); // Must not consume the panic.
+        require (midi.isEmpty(), "Zero-frame proxy emitted MIDI");
+        proxy.processBlock (audio, midi);
+        require (hasNoteOff (captureMidi (midi), 0, 60), "Panic lost the held-note release");
+        for (int block = 0; block < 250; ++block)
+        {
+            midi.clear();
+            proxy.processBlock (audio, midi);
+            require (countNoteOns (captureMidi (midi)) == 0, "Panic left future strum tones scheduled");
+        }
+
+        setParameter (processor, bypass, 1);
+        std::vector<juce::uint8> sysEx (16384, 1);
+        sysEx.front() = 0xf0;
+        sysEx.back() = 0xf7;
+        midi.clear();
+        midi.addEvent (sysEx.data(), static_cast<int> (sysEx.size()), 17);
+        const auto* storage = midi.data.begin();
+        proxy.processBlock (audio, midi);
+        require (midi.getNumEvents() == 1, "Proxy lost SysEx");
+        const auto event = *midi.begin();
+        require (event.samplePosition == 17 && event.numBytes == static_cast<int> (sysEx.size())
+                 && std::equal (sysEx.begin(), sysEx.end(), event.data), "Proxy corrupted SysEx or its offset");
+        require (storage == midi.data.begin(), "SysEx unexpectedly grew the reserved destination");
+
+        // The same cancellation path remains bounded with saturated input.
+        midi.clear();
+        for (int i = 0; i < 8000; ++i)
+            midi.addEvent (juce::MidiMessage::noteOn (1, i % 128, juce::uint8 (100)), 0);
+        proxy.requestPanic();
+        proxy.processBlock (audio, midi);
+        require (countNoteOns (captureMidi (midi)) == 0, "Saturated panic admitted a partial input stream");
+        require (processor.getTailLengthSeconds() >= 70.01, "Synced tail declaration is too short");
+    }
+
+    void testVirtualOutputSettings()
+    {
+        using namespace wicky::standalone;
+        const auto first = makeVirtualOutputName();
+        const auto second = makeVirtualOutputName();
+        require (first != second, "Virtual endpoint names collide");
+        require (isWickyVirtualInput (first) && isWickyVirtualInput (virtualOutputName),
+                 "Own virtual output can feed the input selector");
+        require (! isWickyVirtualInput ("External Loopback"), "External loopback was excluded");
+        FakeRoutingStore store;
+        FakeMidiBackend backend;
+        backend.outputs.add ({ virtualOutputIdentifier, virtualOutputName });
+        MidiRoutingSettings settings;
+        settings.outputIdentifier = virtualOutputIdentifier;
+        saveMidiRoutingSettings (store, settings);
+        MidiRouting routing (backend, store);
+        require (routing.getSettings().outputIdentifier == virtualOutputIdentifier,
+                 "Virtual route preference did not survive restart");
+        backend.failOutputOpen = true;
+        require (! routing.openConfiguredRoute() && routing.getStatus().outputOpenFailed,
+                 "Virtual creation failure was not reported");
+        backend.failOutputOpen = false;
+        require (routing.openConfiguredRoute(), "Virtual route did not recover");
+        routing.send (juce::MidiMessage::noteOn (1, 60, juce::uint8 (100)));
+        backend.sent.clear();
+        routing.closeRoute();
+        require (! backend.outputOpen && backend.sent.size() >= 33,
+                 "Virtual route did not panic before closing");
+    }
+
+    void testMidiOnlyTimeline()
+    {
+        for (const auto sampleRate : { 44100.0, 48000.0, 96000.0 })
+            for (const auto blockSize : { 64, 512, 4096 })
+                for (const auto staggered : { 0, 1 })
+                {
+                    TempoScenario scenario;
+                    scenario.sampleRate = sampleRate;
+                    scenario.blockSize = blockSize;
+                    scenario.noteOffMode = staggered;
+                    scenario.totalSamples = static_cast<int> (sampleRate * 2);
+                    scenario.input = {
+                        { 0, juce::MidiMessage::noteOn (1, 60, juce::uint8 (100)) },
+                        { static_cast<int> (sampleRate / 2), juce::MidiMessage::noteOff (1, 60) }
+                    };
+                    const auto normal = renderScenario (scenario);
+                    scenario.audioChannels = 0;
+                    const auto midiOnly = renderScenario (scenario);
+                    require (sameTimeline (normal, midiOnly), "Zero-bus MIDI timeline differs");
+                    require (noteOnPositions (midiOnly).size() == 3
+                             && noteOffPositions (midiOnly).size() == 3,
+                             "Zero-bus strum did not balance notes");
+                }
+
+        PluginProcessor processor;
+        processor.prepareToPlay (48000, 64);
+        setChordMatrix (processor, 0, 0, 1, 0);
+        setParameter (processor, boilerplate::parameters::strumTimingMode, 1);
+        juce::AudioBuffer<float> empty (0, 0);
+        juce::MidiBuffer midi;
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, juce::uint8 (100)), 0);
+        processor.processBlock (empty, midi);
+        require (midi.getNumEvents() == 1, "Zero-frame processing consumed MIDI");
+        juce::AudioBuffer<float> frames (0, 64);
+        processor.processBlock (frames, midi);
+        require (countNoteOns (captureMidi (midi)) == 1, "Zero-channel buffer lost frame count");
+        setParameter (processor, boilerplate::parameters::bypass, 1);
+        midi.clear();
+        processor.processBlock (frames, midi);
+        require (hasNoteOff (captureMidi (midi), 0, 60), "Zero-bus bypass failed to release notes");
+        for (int block = 0; block < 250; ++block)
+        {
+            midi.clear();
+            processor.processBlock (frames, midi);
+            require (countNoteOns (captureMidi (midi)) == 0, "Zero-bus bypass resurrected pending tones");
+        }
     }
 
     void testHostTempoScheduling()
@@ -3505,6 +3648,8 @@ int main (int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI juceInitialiser;
     try
     {
+        if (argc > 1 && juce::String (argv[1]).startsWith ("--virtual-midi"))
+            return runVirtualMidiProbe (argc, argv);
         if (argc > 1 && std::string (argv[1]) == "--editor")
             testEditor();
         else
@@ -3531,6 +3676,9 @@ int main (int argc, char** argv)
             testMidiRoutingProcessorProxy();
             testMidiRoutingPanel();
             testHostTempoScheduling();
+            testMidiOnlyTimeline();
+            testRoutingRegressions();
+            testVirtualOutputSettings();
             testGlobalSettingsPanel();
             testStateAndProcessing();
         }

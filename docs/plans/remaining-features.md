@@ -1,5 +1,18 @@
 # Remaining feature plan for Wicky Chordinator
 
+## Implementation status (2026-11-02)
+
+The current branch implements Phases 1–3, native macOS/Linux virtual-output
+selection with Windows loopback fallback (Phase 4), and the dedicated macOS
+MIDI FX build and zero-channel scheduler path (Phase 5). Phase 6 is **not release
+qualified**: Logic, real hardware, Linux delivery, Windows loopback, Intel runtime,
+updated cross-platform CI and distribution-signed package checks remain pending.
+App-created Windows output remains explicitly deferred under Unit 4B.
+See [the evidence and handoff](../release-qualification.md) for actual checks,
+backend constraints and review fixes. The unit-by-unit instructions below remain
+useful for future scoped work; they do not override a user's request to complete
+multiple units together.
+
 ## Start here — instructions for DeepSeek
 
 This document is the full context for DeepSeek v4.1 Flash. It is not an instruction

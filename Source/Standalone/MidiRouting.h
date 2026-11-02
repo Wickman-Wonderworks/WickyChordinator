@@ -24,6 +24,15 @@ namespace wicky::standalone
 
     using MidiDeviceList = juce::Array<MidiDeviceDescription>;
 
+    // Stable preference value: the native endpoint ID is new on each creation.
+    inline constexpr const char* virtualOutputIdentifier = "wicky:virtual-output";
+    inline constexpr const char* virtualOutputName = "Wicky Chordinator Virtual Out";
+    bool supportsVirtualMidiOutput() noexcept;
+    bool isWickyVirtualInput (const juce::String& name);
+    juce::String makeVirtualOutputName();
+    std::unique_ptr<juce::MidiOutput> openStandaloneMidiOutput (const juce::String& identifier);
+
+
     /**
         Standalone-only MIDI routing preferences.
 
@@ -305,7 +314,7 @@ namespace wicky::standalone
         void setOutputChannel (int channel) noexcept;
         int getOutputChannel() const noexcept;
 
-        /** Requests a panic at the start of the next rendered block. */
+        /** Cancels processor notes/tails and panics the route at the next block. */
         void requestPanic() noexcept;
 
         /** Requests a remapper ownership reset at the next rendered block. */
@@ -348,6 +357,7 @@ namespace wicky::standalone
         juce::AudioProcessor* processor = nullptr;
         MidiChannelRemapper remapper;
         juce::MidiBuffer remappedMidi;
+        juce::MidiBuffer panicInputMidi;
         std::atomic<int> pendingOutputChannel { 0 };
         std::atomic<int> appliedOutputChannel { 0 };
         std::atomic<bool> panicRequested { false };

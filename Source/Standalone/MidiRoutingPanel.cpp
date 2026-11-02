@@ -175,9 +175,15 @@ namespace wicky::standalone
         };
 
         refreshFromModel();
+        startTimer (500);
     }
 
-    MidiRoutingPanel::~MidiRoutingPanel() = default;
+    MidiRoutingPanel::~MidiRoutingPanel() { stopTimer(); }
+
+    void MidiRoutingPanel::timerCallback()
+    {
+        updateStatus();
+    }
 
     //==========================================================================
     void MidiRoutingPanel::paint (juce::Graphics& g)
@@ -229,6 +235,9 @@ namespace wicky::standalone
         outputIdentifiers.add ({});
 
         outputSelector.addItem ("No Output", 1);
+        outputSelector.setTooltip (supportsVirtualMidiOutput()
+            ? "Select Wicky Chordinator Virtual Out to publish a port for other applications."
+            : "App-created virtual output is unavailable on this backend. Select an existing external loopback port.");
 
         if (model == nullptr)
             return;
@@ -248,6 +257,13 @@ namespace wicky::standalone
                 selectedId = i + 2;
                 selectedFound = true;
             }
+        }
+
+        if (! supportsVirtualMidiOutput())
+        {
+            const auto unavailableId = outputs.size() + 100;
+            outputSelector.addItem ("Virtual output unavailable - use an existing loopback", unavailableId);
+            outputSelector.setItemEnabled (unavailableId, false);
         }
 
         if (! selectedFound)

@@ -71,9 +71,23 @@ endpoint, Preserve/1–16 channel routing, connection status and Send Note Offs.
 The **Options** menu keeps the JUCE audio settings (audio input remains muted) and
 state save/load. Standalone MIDI routing preferences are stored in the application
 settings, not in plugin presets or DAW sessions. The standalone has no DAW
-transport, so Sync strum timing uses the Fallback BPM control. macOS AU is a music
-effect, not a bus-free MIDI FX (`aumi`) plugin; hosts differ in how they expose and
-route its MIDI output.
+transport, so Sync strum timing uses the Fallback BPM control.
+
+The default macOS AU remains a music effect (`aumf`). A separate
+**Wicky Chordinator MIDI FX** AU (`aumi`, subtype `Wcmf`, manufacturer `Wckm`)
+is available through the `midi-fx-debug` / `midi-fx-release` presets on macOS.
+Its processor has no audio buses and shares the chord scheduler and state format.
+Build with `cmake --preset midi-fx-release -DBOILERPLATE_BUILD_TESTS=ON`, then
+`cmake --build --preset midi-fx-release` and `ctest --preset midi-fx-release`.
+These presets build only AU; they preserve the existing effect/instrument identities.
+Logic placement and project recall still require manual qualification.
+
+On macOS and Linux, select **Wicky Chordinator Virtual Out** in standalone to
+create an output other applications can receive. Each selected-route lifetime
+gets a unique name suffix. Wicky virtual outputs are excluded from the app's
+input list to prevent feedback. Windows uses existing physical/loopback endpoints;
+app-created Windows ports are deferred. See [release qualification](docs/release-qualification.md)
+for backend evidence and remaining platform checks.
 
 ## Playing and mapping
 
@@ -186,6 +200,13 @@ pending releases, multi-channel display, bounded output, inversions, scale,
 humanize timing, user presets, tempo-synced timelines, host tempo/fallback
 behavior, the timing controls, all finite strum patterns, standalone routing
 settings/remapping and safe route switching. They do not open an audio device.
+
+For local/CI AU validation, `bash scripts/validate-au.sh <preset>` applies an
+ad-hoc development signature, installs the component into the user AU directory,
+waits for registration and runs auval. This is separate from distribution signing.
+An optional native integration check, `build/debug/BoilerplateTests --virtual-midi`,
+creates two virtual ports and uses a second process to record and verify a processed
+MIDI timeline. It requires OS MIDI-service access and is not part of CTest.
 
 After installing the default AU, validate using:
 
