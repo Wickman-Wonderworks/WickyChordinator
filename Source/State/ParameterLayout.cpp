@@ -1,4 +1,6 @@
 #include "State/ParameterLayout.h"
+#include "DSP/StrumOrder.h"
+#include "DSP/StrumTiming.h"
 #include "State/ParameterIDs.h"
 
 #include <memory>
@@ -130,6 +132,41 @@ namespace boilerplate::parameters
         layout.add (std::make_unique<AudioParameterChoice> (
             ParameterID { scaleMode, scaleModeVersionHint }, "Scale Mode",
             StringArray { "Chromatic", "Major", "Natural Minor" }, 0));
+
+        // Phase 1 tempo-synced strum. Appended so every released parameter keeps
+        // its position and meaning. Free (the default) preserves the existing
+        // percentage mapping exactly; Sync interprets the division as the full
+        // step between chord tones.
+        layout.add (std::make_unique<AudioParameterChoice> (
+            ParameterID { strumTimingMode, strumTimingModeVersionHint },
+            "Strum Timing",
+            StringArray { "Free", "Sync" },
+            0));
+
+        layout.add (std::make_unique<AudioParameterChoice> (
+            ParameterID { strumDivision, strumDivisionVersionHint },
+            "Strum Division",
+            boilerplate::dsp::strum::divisionNames(),
+            boilerplate::dsp::strum::defaultDivisionIndex));
+
+        layout.add (std::make_unique<AudioParameterInt> (
+            ParameterID { strumFallbackBpm, strumFallbackBpmVersionHint },
+            "Fallback Tempo",
+            strumFallbackBpmMin,
+            strumFallbackBpmMax,
+            strumFallbackBpmDefault,
+            AudioParameterIntAttributes()
+                .withLabel ("BPM")
+                .withStringFromValueFunction ([] (int value, int)
+                {
+                    return String (value) + " BPM";
+                })));
+
+        layout.add (std::make_unique<AudioParameterChoice> (
+            ParameterID { strumPattern, strumPatternVersionHint },
+            "Strum Pattern",
+            boilerplate::dsp::strum::patternNames(),
+            boilerplate::dsp::strum::defaultPatternIndex));
 
         return layout;
     }

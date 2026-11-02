@@ -12,6 +12,11 @@ jobs:
       matrix:
         os: [macos-latest, windows-2022, ubuntu-22.04]
         preset: [debug, release, instrument-debug, instrument-release]
+        include:
+          - os: macos-latest
+            preset: midi-fx-debug
+          - os: macos-latest
+            preset: midi-fx-release
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -47,23 +52,7 @@ jobs:
         shell: bash
         env:
           PRESET: ${{ matrix.preset }}
-        run: |
-          configuration=Release
-          if [[ "$PRESET" == *debug ]]; then configuration=Debug; fi
-          product='Wicky Chordinator'
-          subtype=Jbpl
-          type=aumf
-          if [[ "$PRESET" == instrument-* ]]; then
-            product='JUCE Instrument'
-            subtype=Jbpi
-            type=aumu
-          fi
-          mkdir -p "$HOME/Library/Audio/Plug-Ins/Components"
-          cp -R "build/$PRESET/JUCEBoilerplate_artefacts/$configuration/AU/$product.component" \
-            "$HOME/Library/Audio/Plug-Ins/Components/"
-          killall AudioComponentRegistrar 2>/dev/null || true
-          sleep 3
-          auval -v "$type" "$subtype" Wckm
+        run: bash scripts/validate-au.sh "$PRESET"
       - name: Archive builds (preserve executable permissions)
         shell: bash
         env:
@@ -74,6 +63,7 @@ jobs:
           cd "build/$PRESET/JUCEBoilerplate_artefacts/$configuration"
           formats=(Standalone VST3)
           if [[ "$RUNNER_OS" == macOS ]]; then formats+=(AU); fi
+          if [[ "$PRESET" == midi-fx-* ]]; then formats=(AU); fi
           cmake -E tar cf "$GITHUB_WORKSPACE/build/$PRESET/products.tar" --format=gnutar "${formats[@]}"
       - name: Upload builds
         uses: actions/upload-artifact@v4

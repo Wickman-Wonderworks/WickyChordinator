@@ -24,11 +24,17 @@ option(BOILERPLATE_COPY_PLUGIN_AFTER_BUILD "Install plugins to the user plugin f
 option(BOILERPLATE_LIMIT_PARALLEL_JOBS "Cap parallel compile jobs to avoid OOM during JUCE module builds" ON)
 option(BOILERPLATE_WINDOWS_MIDI_SERVICES "Use Windows MIDI Services (Windows only; forces C++20)" OFF)
 option(BOILERPLATE_IS_SYNTH "Build an output-only instrument scaffold with MIDI input" OFF)
-# A true AU MIDI effect (aumi) must declare no audio buses, which would remove
-# the audio pass-through buses and break the current test contract. Keep this OFF
-# until the plugin is converted to a bus-free MIDI processor; the plugin still
-# accepts and emits MIDI as a music effect (aumf) in the meantime.
-option(BOILERPLATE_IS_MIDI_EFFECT "Build as a bus-free AU MIDI effect (AU MIDI FX slot)" OFF)
+# Dedicated AU-only MIDI FX product; released effect/instrument identities stay intact.
+option(BOILERPLATE_IS_MIDI_EFFECT "Build the dedicated bus-free AU MIDI FX product" OFF)
+if(BOILERPLATE_IS_MIDI_EFFECT)
+    if(NOT APPLE OR BOILERPLATE_IS_SYNTH)
+        message(FATAL_ERROR "MIDI FX requires macOS and cannot be combined with IS_SYNTH")
+    endif()
+    if(BOILERPLATE_PLUGIN_CODE STREQUAL "Jbpl" OR BOILERPLATE_PLUGIN_CODE STREQUAL "Jbpi"
+       OR BOILERPLATE_BUNDLE_ID STREQUAL "com.wickyaudio.wickychordinator")
+        message(FATAL_ERROR "MIDI FX requires its own plugin code and bundle ID; use midi-fx presets")
+    endif()
+endif()
 option(BOILERPLATE_BUILD_TESTS "Build behavioral and editor lifecycle tests" OFF)
 set(BOILERPLATE_MAX_PARALLEL_JOBS 6 CACHE STRING "Maximum parallel compile jobs when limiting is enabled")
 
@@ -110,7 +116,9 @@ juce_add_binary_data(WickyChordinatorAssets
 #===============================================================================
 set(BOILERPLATE_PLUGIN_FORMATS VST3 Standalone)
 
-if(APPLE)
+if(BOILERPLATE_IS_MIDI_EFFECT)
+    set(BOILERPLATE_PLUGIN_FORMATS AU)
+elseif(APPLE)
     list(APPEND BOILERPLATE_PLUGIN_FORMATS AU)
 endif()
 
@@ -156,7 +164,19 @@ if("Standalone" IN_LIST BOILERPLATE_PLUGIN_FORMATS)
 
     target_sources(JUCEBoilerplate_Standalone
         PRIVATE
-            Source/Standalone/StandaloneApp.cpp)
+            Source/Standalone/StandaloneApp.cpp
+            Source/Standalone/MidiRouting.cpp
+            Source/Standalone/MidiRouting.h
+            Source/Standalone/MidiRoutingPanel.cpp
+            Source/Standalone/MidiRoutingPanel.h)
+
+    target_include_directories(JUCEBoilerplate_Standalone PRIVATE Source)
+
+    target_link_libraries(JUCEBoilerplate_Standalone
+        PRIVATE
+            juce::juce_audio_devices
+            juce::juce_data_structures
+            juce::juce_gui_basics)
 endif()
 
 target_sources(JUCEBoilerplate
@@ -168,6 +188,8 @@ target_sources(JUCEBoilerplate
         Source/ChordSettingsPanel.h
         Source/DSP/GainProcessor.cpp
         Source/DSP/GainProcessor.h
+        Source/DSP/StrumOrder.h
+        Source/DSP/StrumTiming.h
         Source/State/ParameterIDs.h
         Source/State/ParameterLayout.cpp
         Source/State/ParameterLayout.h
@@ -213,8 +235,18 @@ endif()
 
 if(BOILERPLATE_BUILD_TESTS)
     enable_testing()
-    add_executable(BoilerplateTests Tests/BoilerplateTests.cpp)
-    target_link_libraries(BoilerplateTests PRIVATE JUCEBoilerplate WickyChordinatorAssets)
+    add_executable(BoilerplateTests
+        Tests/BoilerplateTests.cpp
+        Tests/VirtualMidiProbe.cpp
+        Source/Standalone/MidiRouting.cpp
+        Source/Standalone/MidiRoutingPanel.cpp)
+    target_link_libraries(BoilerplateTests
+        PRIVATE
+            JUCEBoilerplate
+            WickyChordinatorAssets
+            juce::juce_audio_devices
+            juce::juce_data_structures
+            juce::juce_gui_basics)
     # Reuse the shared code's module settings/headers without compiling JUCE again.
     target_include_directories(BoilerplateTests PRIVATE
         $<TARGET_PROPERTY:JUCEBoilerplate,INCLUDE_DIRECTORIES>)

@@ -1,15 +1,23 @@
 #include "PluginProcessor.h"
 #include "ChordSettingsPanel.h"
 #include "DSP/GainProcessor.h"
+#include "DSP/StrumOrder.h"
+#include "DSP/StrumTiming.h"
+#include "Standalone/MidiRouting.h"
+#include "Standalone/MidiRoutingPanel.h"
 #include "State/ParameterIDs.h"
 #include "UI/OxaniumFonts.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "VirtualMidiProbe.h"
 
 class PluginProcessorTestAccess
 {
@@ -17,6 +25,11 @@ public:
     static const void* outputStorage (PluginProcessor& processor)
     {
         return processor.midiOutputBuffer.data.begin();
+    }
+
+    static void setHumanizeSeed (PluginProcessor& processor, juce::uint32 seed)
+    {
+        processor.humanizeSeed.store (seed, std::memory_order_relaxed);
     }
 };
 
@@ -27,6 +40,260 @@ namespace
         if (! condition)
             throw std::runtime_error (message);
     }
+
+    juce::Component* findComponentByName (juce::Component& root, const juce::String& name)
+    {
+        if (root.getName() == name)
+            return &root;
+
+        for (int i = 0; i < root.getNumChildComponents(); ++i)
+            if (auto* child = root.getChildComponent (i))
+                if (auto* found = findComponentByName (*child, name))
+                    return found;
+
+        return nullptr;
+    }
+
+    //==========================================================================
+    struct FakeMidiBackend final : public wicky::standalone::MidiRoutingBackend
+    {
+        wicky::standalone::MidiDeviceList inputs;
+        wicky::standalone::MidiDeviceList outputs;
+        juce::StringArray openInputIds;
+        juce::String openOutputId;
+        bool outputOpen = false;
+        bool failInputOpen = false;
+        bool failOutputOpen = false;
+        bool failSends = false;
+        juce::Array<juce::MidiMessage> sent;
+        int inputEnumerationCount = 0;
+        int outputEnumerationCount = 0;
+        juce::MidiInputCallback* inputCallback = nullptr;
+
+        static bool contains (const wicky::standalone::MidiDeviceList& list,
+                              const juce::String& identifier)
+        {
+            for (const auto& device : list)
+                if (device.identifier == identifier)
+                    return true;
+
+            return false;
+        }
+
+        wicky::standalone::MidiDeviceList getInputDevices() override
+        {
+            ++inputEnumerationCount;
+            return inputs;
+        }
+
+        wicky::standalone::MidiDeviceList getOutputDevices() override
+        {
+            ++outputEnumerationCount;
+            return outputs;
+        }
+
+        bool openInput (const juce::String& identifier,
+                        juce::MidiInputCallback* callback) override
+        {
+            if (failInputOpen || ! contains (inputs, identifier))
+                return false;
+
+            inputCallback = callback;
+            openInputIds.addIfNotAlreadyThere (identifier);
+            return true;
+        }
+
+        void closeInputs() override
+        {
+            openInputIds.clear();
+            inputCallback = nullptr;
+        }
+
+        juce::StringArray getOpenInputIdentifiers() const override
+        {
+            return openInputIds;
+        }
+
+        bool openOutput (const juce::String& identifier) override
+        {
+            if (failOutputOpen || ! contains (outputs, identifier))
+                return false;
+
+            openOutputId = identifier;
+            outputOpen = true;
+            return true;
+        }
+
+        void closeOutput() override
+        {
+            openOutputId.clear();
+            outputOpen = false;
+        }
+
+        bool send (const juce::MidiMessage& message) override
+        {
+            if (! outputOpen || failSends)
+                return false;
+
+            sent.add (message);
+            return true;
+        }
+
+        bool isOutputOpen() const override
+        {
+            return outputOpen;
+        }
+
+        juce::String getOpenOutputIdentifier() const override
+        {
+            return openOutputId;
+        }
+
+        void injectInput (const juce::MidiMessage& message)
+        {
+            if (inputCallback != nullptr)
+                inputCallback->handleIncomingMidiMessage (nullptr, message);
+        }
+    };
+
+    struct FakeRoutingStore final : public wicky::standalone::MidiRoutingSettingsStore
+    {
+        juce::PropertySet values;
+        int saveCount = 0;
+
+        juce::String getValue (const juce::String& key) const override
+        {
+            return values.getValue (key);
+        }
+
+        bool containsKey (const juce::String& key) const override
+        {
+            return values.containsKey (key);
+        }
+
+        void setValue (const juce::String& key, const juce::String& value) override
+        {
+            values.setValue (key, value);
+        }
+
+        void saveIfNeeded() override
+        {
+            ++saveCount;
+        }
+    };
+
+    class FakeMidiSourceProcessor final : public juce::AudioProcessor
+    {
+    public:
+        struct Pending
+        {
+            juce::MidiMessage message;
+            int position = 0;
+        };
+
+        FakeMidiSourceProcessor()
+            : juce::AudioProcessor (BusesProperties()
+                  .withInput ("Input", juce::AudioChannelSet::stereo(), true)
+                  .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
+        {
+        }
+
+        void prepareToPlay (double, int) override {}
+        void releaseResources() override {}
+
+        void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer& midi) override
+        {
+            for (const auto& event : pending)
+                midi.addEvent (event.message, event.position);
+
+            pending.clear();
+        }
+
+        const juce::String getName() const override { return "Fake MIDI Source"; }
+        bool acceptsMidi() const override { return true; }
+        bool producesMidi() const override { return true; }
+        double getTailLengthSeconds() const override { return 0.0; }
+        bool hasEditor() const override { return false; }
+        juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+        int getNumPrograms() override { return 1; }
+        int getCurrentProgram() override { return 0; }
+        void setCurrentProgram (int) override {}
+        const juce::String getProgramName (int) override { return {}; }
+        void changeProgramName (int, const juce::String&) override {}
+        void getStateInformation (juce::MemoryBlock&) override {}
+        void setStateInformation (const void*, int) override {}
+
+        std::vector<Pending> pending;
+    };
+
+    class FakeMidiRoutingPanelModel final : public wicky::standalone::MidiRoutingPanelModel
+    {
+    public:
+        wicky::standalone::MidiDeviceList inputs;
+        wicky::standalone::MidiDeviceList outputs;
+        wicky::standalone::MidiRoutingSettings settings;
+        juce::StringArray enabledInputs;
+        int refreshCount = 0;
+        int panicCount = 0;
+        int lastChannel = -1;
+        juce::String lastOutput;
+        bool outputOpen = true;
+
+        wicky::standalone::MidiDeviceList getInputDevices() override { return inputs; }
+        wicky::standalone::MidiDeviceList getOutputDevices() override { return outputs; }
+        wicky::standalone::MidiRoutingSettings getSettings() const override { return settings; }
+
+        bool isInputEnabled (const juce::String& identifier) const override
+        {
+            return enabledInputs.contains (identifier);
+        }
+
+        void setInputEnabled (const juce::String& identifier, bool enabled) override
+        {
+            if (enabled)
+            {
+                enabledInputs.addIfNotAlreadyThere (identifier);
+                settings.inputIdentifiers.addIfNotAlreadyThere (identifier);
+            }
+            else
+            {
+                enabledInputs.removeString (identifier);
+                settings.inputIdentifiers.removeString (identifier);
+            }
+        }
+
+        bool setOutput (const juce::String& identifier) override
+        {
+            lastOutput = identifier;
+            settings.outputIdentifier = identifier;
+            return outputOpen;
+        }
+
+        void setOutputChannel (int channel) override
+        {
+            lastChannel = channel;
+            settings.outputChannel = channel;
+        }
+
+        void refresh() override { ++refreshCount; }
+        void sendNoteOffs() override { ++panicCount; }
+
+        wicky::standalone::MidiRouting::Status getStatus() const override
+        {
+            wicky::standalone::MidiRouting::Status status;
+            status.outputIdentifier = settings.outputIdentifier;
+            status.outputSelected = settings.outputIdentifier.isNotEmpty();
+            status.outputConnected = outputOpen && status.outputSelected;
+            status.outputName = "Output A";
+            status.selectedInputIdentifiers = settings.inputIdentifiers;
+
+            for (const auto& identifier : settings.inputIdentifiers)
+                if (isInputEnabled (identifier))
+                    status.connectedInputIdentifiers.add (identifier);
+
+            return status;
+        }
+    };
 
     void expectSamples (const juce::AudioBuffer<float>& buffer, float expected)
     {
@@ -212,6 +479,196 @@ namespace
         setParameter (processor, boilerplate::parameters::pitchOffset, (float) pitchOffset);
         setParameter (processor, boilerplate::parameters::gain, 0.0f);
         setParameter (processor, boilerplate::parameters::bypass, 0.0f);
+    }
+
+    /** Controllable host playhead for tempo and transport-position tests. */
+    class TestPlayHead final : public juce::AudioPlayHead
+    {
+    public:
+        juce::Optional<PositionInfo> getPosition() const override
+        {
+            if (! positionAvailable)
+                return {};
+
+            PositionInfo info;
+
+            if (tempoAvailable)
+                info.setBpm (tempoBpm);
+
+            info.setPpqPosition (ppqPosition);
+            info.setTimeInSamples (timeInSamples);
+            info.setIsPlaying (playing);
+            return info;
+        }
+
+        bool positionAvailable = true;
+        bool tempoAvailable = true;
+        double tempoBpm = 120.0;
+        double ppqPosition = 0.0;
+        juce::int64 timeInSamples = 0;
+        bool playing = false;
+    };
+
+    struct TempoScenario
+    {
+        int blockSize = 64;
+        int totalSamples = 24000;
+        int audioChannels = 2;
+        double sampleRate = 48000.0;
+        int chordType = 0;
+        int complexity = 0;
+        int voicing = 1;
+        int pitchOffset = 0;
+        int division = 3;
+        int fallbackBpm = 120;
+        int noteOffMode = 0;
+        int strumMode = 0;
+        int pattern = 0;
+        juce::uint32 randomSeed = 0;
+        bool sync = true;
+        bool attachPlayHead = true;
+        bool positionAvailable = true;
+        bool tempoAvailable = true;
+        bool playing = false;
+        double initialBpm = 120.0;
+        float strumPercent = 0.0f;
+        int positionJumpAt = -1;
+        double positionJumpPpq = 1000.0;
+        std::vector<std::pair<int, juce::MidiMessage>> input;
+        std::vector<std::pair<int, double>> tempoChanges; // absolute sample -> BPM
+    };
+
+    std::vector<CapturedEvent> renderScenario (const TempoScenario& scenario,
+                                               std::vector<CapturedEvent>* firstBlock = nullptr)
+    {
+        TestPlayHead playHead;
+        playHead.positionAvailable = scenario.positionAvailable;
+        playHead.tempoAvailable = scenario.tempoAvailable;
+        playHead.tempoBpm = scenario.initialBpm;
+        playHead.playing = scenario.playing;
+
+        PluginProcessor processor;
+
+        if (scenario.attachPlayHead)
+            processor.setPlayHead (&playHead);
+
+        processor.setRateAndBufferSizeDetails (scenario.sampleRate, scenario.blockSize);
+        processor.prepareToPlay (scenario.sampleRate, scenario.blockSize);
+
+        if (scenario.randomSeed != 0)
+            PluginProcessorTestAccess::setHumanizeSeed (processor, scenario.randomSeed);
+
+        setChordMatrix (processor, scenario.chordType, scenario.complexity,
+                        scenario.voicing, scenario.pitchOffset);
+        setParameter (processor, boilerplate::parameters::strum, scenario.strumPercent);
+        setParameter (processor, boilerplate::parameters::strumMode,
+                      static_cast<float> (scenario.strumMode));
+        setParameter (processor, boilerplate::parameters::strumTimingMode,
+                      scenario.sync ? 1.0f : 0.0f);
+        setParameter (processor, boilerplate::parameters::strumDivision,
+                      static_cast<float> (scenario.division));
+        setParameter (processor, boilerplate::parameters::strumFallbackBpm,
+                      static_cast<float> (scenario.fallbackBpm));
+        setParameter (processor, boilerplate::parameters::strumPattern,
+                      static_cast<float> (scenario.pattern));
+        setParameter (processor, boilerplate::parameters::noteOffMode,
+                      static_cast<float> (scenario.noteOffMode));
+
+        std::vector<CapturedEvent> result;
+        size_t nextChange = 0;
+
+        for (int start = 0; start < scenario.totalSamples; start += scenario.blockSize)
+        {
+            // A host tempo change is visible from the next block boundary. The
+            // processor reads the playhead once at the start of each block.
+            while (nextChange < scenario.tempoChanges.size()
+                   && scenario.tempoChanges[nextChange].first <= start)
+            {
+                playHead.tempoAvailable = true;
+                playHead.tempoBpm = scenario.tempoChanges[nextChange].second;
+                ++nextChange;
+            }
+
+            if (scenario.positionJumpAt >= start
+                && scenario.positionJumpAt < start + scenario.blockSize)
+            {
+                playHead.ppqPosition = scenario.positionJumpPpq;
+                playHead.timeInSamples = 123456789;
+            }
+
+            juce::AudioBuffer<float> audio (scenario.audioChannels, scenario.blockSize);
+            juce::MidiBuffer midi;
+
+            for (const auto& event : scenario.input)
+                if (event.first >= start && event.first < start + scenario.blockSize)
+                    midi.addEvent (event.second, event.first - start);
+
+            processor.processBlock (audio, midi);
+            auto events = captureMidi (midi);
+
+            if (start == 0 && firstBlock != nullptr)
+                *firstBlock = events;
+
+            for (auto& event : events)
+            {
+                event.position += start;
+                result.push_back (event);
+            }
+        }
+
+        return result;
+    }
+
+    std::vector<int> noteOnPositions (const std::vector<CapturedEvent>& events)
+    {
+        std::vector<int> positions;
+
+        for (const auto& event : events)
+            if (event.status == 0x90 && event.data2 > 0)
+                positions.push_back (event.position);
+
+        return positions;
+    }
+
+    std::vector<int> noteOnNotes (const std::vector<CapturedEvent>& events,
+                                  int channel = -1)
+    {
+        std::vector<int> notes;
+
+        for (const auto& event : events)
+            if (event.status == 0x90 && event.data2 > 0
+                && (channel < 0 || event.channel == channel))
+                notes.push_back (event.data1);
+
+        return notes;
+    }
+
+    std::vector<int> noteOffPositions (const std::vector<CapturedEvent>& events)
+    {
+        std::vector<int> positions;
+
+        for (const auto& event : events)
+            if (event.status == 0x80 || (event.status == 0x90 && event.data2 == 0))
+                positions.push_back (event.position);
+
+        return positions;
+    }
+
+    bool sameTimeline (const std::vector<CapturedEvent>& a,
+                       const std::vector<CapturedEvent>& b)
+    {
+        if (a.size() != b.size())
+            return false;
+
+        for (size_t i = 0; i < a.size(); ++i)
+            if (a[i].position != b[i].position
+                || a[i].status != b[i].status
+                || a[i].channel != b[i].channel
+                || a[i].data1 != b[i].data1
+                || a[i].data2 != b[i].data2)
+                return false;
+
+        return true;
     }
 
     void testMidiVelocityGain()
@@ -742,6 +1199,13 @@ namespace
         require (presets.getNumPresets() > 1, "Preset bank is empty");
         require (presets.getName (0) == "Init", "First preset is not Init");
 
+        // Factory presets are built from every parameter's default, so loading
+        // one must also reset the tempo-synced strum controls.
+        setParameter (processor, boilerplate::parameters::strumTimingMode, 1.0f);
+        setParameter (processor, boilerplate::parameters::strumDivision, 4.0f);
+        setParameter (processor, boilerplate::parameters::strumFallbackBpm, 90.0f);
+        setParameter (processor, boilerplate::parameters::strumPattern, 3.0f);
+
         require (presets.loadPreset (1), "Could not load the second preset");
         require (presets.getCurrentIndex() == 1, "Preset index did not advance");
 
@@ -752,6 +1216,15 @@ namespace
         require (std::abs (parameters.getRawParameterValue (
                                boilerplate::parameters::strum)->load() - 22.0f) < 0.01f,
                  "Preset did not apply Strum");
+        require (juce::roundToInt (parameters.getRawParameterValue (
+                                    boilerplate::parameters::strumTimingMode)->load()) == 0
+                     && juce::roundToInt (parameters.getRawParameterValue (
+                                    boilerplate::parameters::strumDivision)->load()) == 3
+                     && juce::roundToInt (parameters.getRawParameterValue (
+                                    boilerplate::parameters::strumFallbackBpm)->load()) == 120
+                     && juce::roundToInt (parameters.getRawParameterValue (
+                                    boilerplate::parameters::strumPattern)->load()) == 0,
+                 "Factory preset did not restore the timing defaults");
 
         // Loading a global preset must not erase per-key recipes.
         const auto recipe = processor.getKeyRecipe (60);
@@ -859,6 +1332,14 @@ namespace
 
         require (restored.acceptsMidi(), "Chord plugin must accept MIDI input");
         require (restored.producesMidi(), "Chord plugin must produce MIDI output");
+       #if JucePlugin_IsMidiEffect
+        require (restored.getBusCount (true) == 0 && restored.getBusCount (false) == 0,
+                 "MIDI FX must have no audio buses");
+        require (restored.setBusesLayout ({}), "MIDI FX rejected an empty layout");
+        juce::AudioProcessor::BusesLayout audioLayout;
+        audioLayout.outputBuses.add (juce::AudioChannelSet::stereo());
+        require (! restored.isBusesLayoutSupported (audioLayout), "MIDI FX accepted audio buses");
+       #else
         require (restored.getBusCount (true) == (JucePlugin_IsSynth ? 0 : 1), "Incorrect input buses");
         require (restored.getBusCount (false) == 1, "Incorrect output buses");
 
@@ -897,6 +1378,7 @@ namespace
         auto unsupported = restored.getBusesLayout();
         unsupported.outputBuses.set (0, juce::AudioChannelSet::create5point1());
         require (! restored.isBusesLayoutSupported (unsupported), "Accepted surround output");
+       #endif
     }
 
     void testReviewRegressions()
@@ -1186,6 +1668,1902 @@ namespace
             require (p.getValueTreeState().getParameter (id)->getVersionHint() > 12, "New AU hint reused a released value");
     }
 
+    void testStrumTiming()
+    {
+        namespace strum = boilerplate::dsp::strum;
+
+        // The division table is a shipped state contract: three straight bases,
+        // each followed by dotted and triplet forms, in this exact order.
+        require (strum::numDivisions == 9, "Unexpected strum division count");
+
+        const double bases[] = { 0.5, 0.25, 0.125 };
+
+        for (int group = 0; group < 3; ++group)
+        {
+            const auto offset = group * 3;
+            const auto base = bases[group];
+
+            require (std::abs (strum::divisions[offset].quarterNoteBeats - base) < 1.0e-12,
+                     "Straight division value is wrong");
+            require (std::abs (strum::divisions[offset + 1].quarterNoteBeats - base * 1.5) < 1.0e-12,
+                     "Dotted division value is wrong");
+            require (std::abs (strum::divisions[offset + 2].quarterNoteBeats - base * 2.0 / 3.0) < 1.0e-12,
+                     "Triplet division value is wrong");
+        }
+
+        require (strum::defaultDivisionIndex == 3, "Default division is not the sixteenth note");
+        require (std::abs (strum::divisions[strum::defaultDivisionIndex].quarterNoteBeats - 0.25) < 1.0e-12,
+                 "Default division is not a quarter-note beat value");
+
+        // Acceptance values at 48 kHz / 120 BPM.
+        require (strum::syncStepSamples (48000.0, 120.0, 3) == 6000, "Sixteenth note step is wrong");
+        require (strum::syncStepSamples (48000.0, 120.0, 0) == 12000, "Eighth note step is wrong");
+        require (strum::syncStepSamples (48000.0, 120.0, 4) == 9000, "Dotted sixteenth step is wrong");
+        require (strum::syncStepSamples (48000.0, 120.0, 5) == 4000, "Triplet sixteenth step is wrong");
+
+        // The pure conversion matches the documented formula at every division,
+        // sample rate and ordinary tempo.
+        const double rates[] = { 22050.0, 44100.0, 48000.0, 88200.0, 96000.0, 192000.0 };
+        const auto expectedStep = [] (double rate, double bpm, double beats)
+        {
+            return juce::roundToInt (60.0 / bpm * beats * rate);
+        };
+
+        for (const auto rate : rates)
+            for (const auto bpm : { 40.0, 90.0, 120.0, 200.0 })
+                for (int index = 0; index < strum::numDivisions; ++index)
+                    require (strum::syncStepSamples (rate, bpm, index)
+                                 == expectedStep (rate, bpm,
+                                                  strum::divisions[index].quarterNoteBeats),
+                             "Synced step does not match the documented formula");
+
+        // Sample-rate scaling for the default division at 120 BPM.
+        require (strum::syncStepSamples (44100.0, 120.0, 3) == 5512,
+                 "44.1 kHz sixteenth rounding changed");
+        require (strum::syncStepSamples (96000.0, 120.0, 3) == 12000,
+                 "96 kHz sixteenth step is wrong");
+        require (strum::syncStepSamples (192000.0, 120.0, 3) == 24000,
+                 "192 kHz sixteenth step is wrong");
+
+        // Absent, zero and non-finite tempos use the 120 BPM fallback.
+        const auto fallback = strum::syncStepSamples (48000.0, strum::fallbackBpm, 3);
+        const double invalidTempos[] =
+        {
+            0.0,
+            -120.0,
+            std::nan (""),
+            std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity()
+        };
+
+        for (const auto bpm : invalidTempos)
+            require (strum::syncStepSamples (48000.0, bpm, 3) == fallback,
+                     "Invalid tempo did not use the 120 BPM fallback");
+
+        // Host tempo bounds are separate from the 20-300 BPM manual range.
+        require (strum::syncStepSamples (48000.0, 0.5, 3) == 480000,
+                 "Very slow host tempo was not clamped to the maximum step");
+        require (strum::syncStepSamples (48000.0, 1.0e9, 3) == 720,
+                 "Very fast host tempo was not clamped to the host maximum");
+
+        // Invalid sample clocks produce no delay instead of undefined conversion.
+        const double invalidRates[] =
+        {
+            0.0,
+            -48000.0,
+            std::nan (""),
+            std::numeric_limits<double>::infinity()
+        };
+
+        for (const auto rate : invalidRates)
+        {
+            require (strum::syncStepSamples (rate, 120.0, 3) == 0,
+                     "Invalid sample rate produced a synced step");
+            require (strum::freeStepSamples (rate, 100.0f) == 0,
+                     "Invalid sample rate produced a free-time step");
+        }
+
+        // Out-of-range division indices stay inside the frozen table.
+        require (strum::syncStepSamples (48000.0, 120.0, -5)
+                     == strum::syncStepSamples (48000.0, 120.0, 0),
+                 "Low division index was not clamped");
+        require (strum::syncStepSamples (48000.0, 120.0, 99)
+                     == strum::syncStepSamples (48000.0, 120.0, strum::numDivisions - 1),
+                 "High division index was not clamped");
+
+        // Free mode must remain bit-identical to the released Strum formula.
+        for (const auto rate : rates)
+            for (int percent = 0; percent <= 100; ++percent)
+            {
+                const auto legacy = juce::roundToInt (
+                    (static_cast<float> (percent) / 100.0f) * 0.060f * rate);
+                require (strum::freeStepSamples (rate, static_cast<float> (percent)) == legacy,
+                         "Free-time strum mapping changed");
+            }
+
+        require (strum::freeStepSamples (48000.0, 100.0f) == 2880,
+                 "Free-time maximum changed");
+        require (strum::freeStepSamples (48000.0, 0.0f) == 0,
+                 "Free-time zero changed");
+        require (strum::freeStepSamples (48000.0, 500.0f) == 2880,
+                 "Free-time maximum did not clamp");
+        require (strum::freeStepSamples (48000.0, -10.0f) == 0,
+                 "Free-time minimum did not clamp");
+
+        // The mode dispatcher keeps the two mappings separate.
+        require (strum::stepSamples (false, 48000.0, 100.0f, 120.0, 3) == 2880,
+                 "Free dispatch used the synced division");
+        require (strum::stepSamples (true, 48000.0, 100.0f, 120.0, 3) == 6000,
+                 "Sync dispatch used the free-time percentage");
+    }
+
+    void testStrumTimingParameters()
+    {
+        namespace strum = boilerplate::dsp::strum;
+        using namespace boilerplate::parameters;
+
+        PluginProcessor processor;
+        auto& state = processor.getValueTreeState();
+
+        auto* timing = dynamic_cast<juce::AudioParameterChoice*> (
+            state.getParameter (strumTimingMode));
+        auto* division = dynamic_cast<juce::AudioParameterChoice*> (
+            state.getParameter (strumDivision));
+        auto* fallback = dynamic_cast<juce::AudioParameterInt*> (
+            state.getParameter (strumFallbackBpm));
+
+        require (timing != nullptr && division != nullptr && fallback != nullptr,
+                 "Tempo-synced strum parameters are missing");
+
+        require (timing->choices == juce::StringArray { "Free", "Sync" },
+                 "Timing mode choices are wrong");
+        require (division->choices == strum::divisionNames(),
+                 "Division choices do not match the frozen table");
+        require (timing->getIndex() == 0, "Timing mode does not default to Free");
+        require (division->getIndex() == strum::defaultDivisionIndex,
+                 "Division does not default to the sixteenth note");
+        require (fallback->get() == strumFallbackBpmDefault,
+                 "Fallback tempo does not default to 120 BPM");
+        require (fallback->getRange() == juce::Range<int> { strumFallbackBpmMin, strumFallbackBpmMax },
+                 "Fallback tempo range is wrong");
+
+        require (timing->getVersionHint() == 17
+                     && division->getVersionHint() == 18
+                     && fallback->getVersionHint() == 19,
+                 "Tempo-synced strum AU hints are wrong");
+
+        // Non-default values survive a full session round-trip.
+        setParameter (processor, strumTimingMode, 1.0f);
+        setParameter (processor, strumDivision, 4.0f);
+        setParameter (processor, strumFallbackBpm, 90.0f);
+
+        juce::MemoryBlock saved;
+        processor.getStateInformation (saved);
+
+        PluginProcessor restored;
+        restored.setStateInformation (saved.getData(), static_cast<int> (saved.getSize()));
+        auto& restoredState = restored.getValueTreeState();
+
+        require (juce::roundToInt (restoredState.getRawParameterValue (strumTimingMode)->load()) == 1
+                     && juce::roundToInt (restoredState.getRawParameterValue (strumDivision)->load()) == 4
+                     && juce::roundToInt (restoredState.getRawParameterValue (strumFallbackBpm)->load()) == 90,
+                 "Tempo-synced strum session recall failed");
+
+        // A state written before these controls existed must recall the same
+        // Free/sixteenth/120 defaults, even when the destination instance was
+        // changed first. This keeps old sessions sounding unchanged.
+        auto legacy = juce::ValueTree::readFromData (saved.getData(), saved.getSize());
+
+        for (int i = legacy.getNumChildren(); --i >= 0;)
+        {
+            const auto id = legacy.getChild (i).getProperty ("id").toString();
+            if (id == strumTimingMode || id == strumDivision || id == strumFallbackBpm)
+                legacy.removeChild (i, nullptr);
+        }
+
+        juce::MemoryBlock legacyState;
+        {
+            juce::MemoryOutputStream stream (legacyState, false);
+            legacy.writeToStream (stream);
+        }
+
+        PluginProcessor legacyTarget;
+        setParameter (legacyTarget, strumTimingMode, 1.0f);
+        setParameter (legacyTarget, strumDivision, 0.0f);
+        setParameter (legacyTarget, strumFallbackBpm, 240.0f);
+        legacyTarget.setStateInformation (legacyState.getData(),
+                                          static_cast<int> (legacyState.getSize()));
+
+        auto& legacyParameters = legacyTarget.getValueTreeState();
+        require (juce::roundToInt (legacyParameters.getRawParameterValue (strumTimingMode)->load()) == 0
+                     && juce::roundToInt (legacyParameters.getRawParameterValue (strumDivision)->load())
+                            == strum::defaultDivisionIndex
+                     && juce::roundToInt (legacyParameters.getRawParameterValue (strumFallbackBpm)->load())
+                            == strumFallbackBpmDefault,
+                 "Legacy state did not recall the free-time defaults");
+
+        // User presets round-trip the timing controls through the normal state.
+        juce::TemporaryFile timingPreset (".wickychord");
+        wicky::ui::PresetManager timingBank (processor);
+        require (timingBank.saveUserPreset (timingPreset.getFile()),
+                 "User timing preset save failed");
+
+        setParameter (processor, strumTimingMode, 0.0f);
+        setParameter (processor, strumDivision, 0.0f);
+        setParameter (processor, strumFallbackBpm, 240.0f);
+
+        require (timingBank.loadUserPreset (timingPreset.getFile()),
+                 "User timing preset recall failed");
+
+        auto& timingParameters = processor.getValueTreeState();
+        require (juce::roundToInt (timingParameters.getRawParameterValue (strumTimingMode)->load()) == 1
+                     && juce::roundToInt (timingParameters.getRawParameterValue (strumDivision)->load()) == 4
+                     && juce::roundToInt (timingParameters.getRawParameterValue (strumFallbackBpm)->load()) == 90,
+                 "User preset did not recall the timing controls");
+    }
+
+    void testStrumOrder()
+    {
+        namespace strum = boilerplate::dsp::strum;
+
+        const auto isPermutation = [] (const int* order, int size)
+        {
+            bool seen[strum::maxChordTones] {};
+
+            for (int i = 0; i < size; ++i)
+            {
+                if (order[i] < 0 || order[i] >= size || seen[order[i]])
+                    return false;
+
+                seen[order[i]] = true;
+            }
+
+            return true;
+        };
+
+        // Legacy Direction follows the released Up/Down choice for every size.
+        for (int size = 1; size <= strum::maxChordTones; ++size)
+        {
+            int order[strum::maxChordTones] {};
+            bool alternateDown = false;
+            juce::uint32 randomState = 0x12345678u;
+
+            strum::buildOrder (order, size, strum::legacyDirectionPattern, false,
+                               alternateDown, randomState);
+
+            for (int i = 0; i < size; ++i)
+                require (order[i] == i, "Legacy Up order is wrong");
+
+            strum::buildOrder (order, size, strum::legacyDirectionPattern, true,
+                               alternateDown, randomState);
+
+            for (int i = 0; i < size; ++i)
+                require (order[i] == size - 1 - i, "Legacy Down order is wrong");
+        }
+
+        // Every pattern produces a valid permutation for every chord size.
+        for (int pattern = 0; pattern < strum::numPatterns; ++pattern)
+        {
+            for (int size = 1; size <= strum::maxChordTones; ++size)
+            {
+                for (int trial = 0; trial < 32; ++trial)
+                {
+                    int order[strum::maxChordTones] {};
+                    bool alternateDown = (trial & 1) != 0;
+                    juce::uint32 randomState = 0x9e3779b9u
+                        + static_cast<juce::uint32> (trial) * 2654435761u;
+
+                    strum::buildOrder (order, size, pattern, (trial & 2) != 0,
+                                       alternateDown, randomState);
+
+                    require (isPermutation (order, size),
+                             "Order generator produced an invalid permutation");
+                }
+            }
+        }
+
+        // Alternate starts Up, toggles on each trigger, and keeps per-channel
+        // state independent.
+        {
+            bool channelOneDown = false;
+            bool channelTwoDown = false;
+            juce::uint32 randomState = 0x12345678u;
+            int order[strum::maxChordTones] {};
+
+            strum::buildOrder (order, 4, strum::alternatePattern, false,
+                               channelOneDown, randomState);
+            require (order[0] == 0 && order[3] == 3,
+                     "Alternate did not start Up");
+            require (channelOneDown, "Alternate did not toggle after Up");
+
+            strum::buildOrder (order, 4, strum::alternatePattern, false,
+                               channelTwoDown, randomState);
+            require (order[0] == 0 && order[3] == 3,
+                     "Another channel did not start Up");
+            require (channelTwoDown, "Another channel did not toggle after Up");
+
+            strum::buildOrder (order, 4, strum::alternatePattern, false,
+                               channelOneDown, randomState);
+            require (order[0] == 3 && order[3] == 0,
+                     "Alternate did not follow Up with Down");
+            require (! channelOneDown, "Alternate did not toggle back to Up");
+
+            strum::buildOrder (order, 4, strum::alternatePattern, false,
+                               channelTwoDown, randomState);
+            require (order[0] == 3 && order[3] == 0,
+                     "Independent channel did not reach Down");
+
+            channelOneDown = false;
+            strum::buildOrder (order, 4, strum::alternatePattern, false,
+                               channelOneDown, randomState);
+            require (order[0] == 0 && order[3] == 3,
+                     "Alternate did not reset to Up");
+        }
+
+        // Outside-In emits low, high, second-low, second-high, ...
+        for (int size = 1; size <= strum::maxChordTones; ++size)
+        {
+            int order[strum::maxChordTones] {};
+            bool alternateDown = false;
+            juce::uint32 randomState = 0;
+
+            strum::buildOrder (order, size, strum::outsideInPattern, false,
+                               alternateDown, randomState);
+
+            int low = 0;
+            int high = size - 1;
+
+            for (int i = 0; i < size; ++i)
+            {
+                const auto expected = (i & 1) == 0 ? low++ : high--;
+                require (order[i] == expected, "Outside-In order is wrong");
+            }
+        }
+
+        // Random is a fixed Fisher-Yates sequence for a known seed.
+        {
+            juce::uint32 randomState = 0x12345678u;
+            bool alternateDown = false;
+            int order[strum::maxChordTones] {};
+
+            strum::buildOrder (order, 8, strum::randomPattern, false,
+                               alternateDown, randomState);
+
+            const int expectedFirst[strum::maxChordTones] = { 3, 1, 7, 0, 2, 4, 6, 5 };
+
+            for (int i = 0; i < 8; ++i)
+                require (order[i] == expectedFirst[i],
+                         "Random order changed for the test seed");
+
+            strum::buildOrder (order, 8, strum::randomPattern, false,
+                               alternateDown, randomState);
+
+            const int expectedSecond[strum::maxChordTones] = { 6, 7, 5, 4, 0, 3, 2, 1 };
+
+            for (int i = 0; i < 8; ++i)
+                require (order[i] == expectedSecond[i],
+                         "Random state did not advance deterministically");
+        }
+
+        // Resetting the state reproduces the same sequence.
+        {
+            juce::uint32 firstState = 0x9e3779b9u;
+            juce::uint32 secondState = 0x9e3779b9u;
+            bool firstDown = false;
+            bool secondDown = false;
+            int first[strum::maxChordTones] {};
+            int second[strum::maxChordTones] {};
+
+            strum::buildOrder (first, 6, strum::randomPattern, false,
+                               firstDown, firstState);
+            strum::buildOrder (second, 6, strum::randomPattern, false,
+                               secondDown, secondState);
+
+            for (int i = 0; i < 6; ++i)
+                require (first[i] == second[i],
+                         "Random sequence did not repeat after reset");
+
+            require (firstState == secondState,
+                     "Random state did not repeat after reset");
+        }
+
+        // Deterministic patterns leave the random state untouched.
+        {
+            juce::uint32 randomState = 0x12345678u;
+            const auto before = randomState;
+            bool alternateDown = false;
+            int order[strum::maxChordTones] {};
+
+            strum::buildOrder (order, 4, strum::legacyDirectionPattern, false,
+                               alternateDown, randomState);
+            strum::buildOrder (order, 4, strum::alternatePattern, false,
+                               alternateDown, randomState);
+            strum::buildOrder (order, 4, strum::outsideInPattern, false,
+                               alternateDown, randomState);
+
+            require (randomState == before,
+                     "A deterministic pattern advanced the random state");
+        }
+
+        // Non-legacy patterns ignore the released Up/Down selector.
+        {
+            bool alternateDown = false;
+            juce::uint32 randomState = 0x12345678u;
+            int up[8] {};
+            int down[8] {};
+
+            strum::buildOrder (up, 6, strum::alternatePattern, false,
+                               alternateDown, randomState);
+            alternateDown = false;
+            strum::buildOrder (down, 6, strum::alternatePattern, true,
+                               alternateDown, randomState);
+
+            for (int i = 0; i < 6; ++i)
+                require (up[i] == down[i], "Alternate did not override Up/Down");
+
+            juce::uint32 upState = 0x12345678u;
+            juce::uint32 downState = 0x12345678u;
+
+            strum::buildOrder (up, 8, strum::randomPattern, false,
+                               alternateDown, upState);
+            strum::buildOrder (down, 8, strum::randomPattern, true,
+                               alternateDown, downState);
+
+            for (int i = 0; i < 8; ++i)
+                require (up[i] == down[i], "Random did not override Up/Down");
+
+            strum::buildOrder (up, 7, strum::outsideInPattern, false,
+                               alternateDown, randomState);
+            strum::buildOrder (down, 7, strum::outsideInPattern, true,
+                               alternateDown, randomState);
+
+            for (int i = 0; i < 7; ++i)
+                require (up[i] == down[i], "Outside-In did not override Up/Down");
+        }
+
+        // Defensive bounds: null pointers and empty chords are harmless, and
+        // oversized requests clamp to the fixed eight-tone array.
+        {
+            bool alternateDown = false;
+            juce::uint32 randomState = 0x12345678u;
+            int order[16] {};
+            order[8] = 77;
+
+            strum::buildOrder (nullptr, 8, strum::randomPattern, false,
+                               alternateDown, randomState);
+            strum::buildOrder (order, 0, strum::randomPattern, false,
+                               alternateDown, randomState);
+            require (order[8] == 77, "Empty chord wrote outside its range");
+
+            strum::buildOrder (order, 12, strum::randomPattern, false,
+                               alternateDown, randomState);
+            require (order[8] == 77, "Oversized chord wrote past eight tones");
+
+            for (int i = 0; i < strum::maxChordTones; ++i)
+            {
+                require (order[i] >= 0 && order[i] < strum::maxChordTones,
+                         "Oversized chord produced an out-of-range index");
+
+                for (int j = 0; j < i; ++j)
+                    require (order[i] != order[j],
+                             "Oversized chord duplicated an index");
+            }
+        }
+    }
+
+    void testStrumPatternParameters()
+    {
+        namespace strum = boilerplate::dsp::strum;
+        using namespace boilerplate::parameters;
+
+        PluginProcessor processor;
+        auto& state = processor.getValueTreeState();
+        auto* pattern = dynamic_cast<juce::AudioParameterChoice*> (
+            state.getParameter (strumPattern));
+
+        require (pattern != nullptr, "Strum Pattern parameter is missing");
+        require (pattern->choices == strum::patternNames(),
+                 "Strum Pattern choices do not match the frozen table");
+        require (pattern->getIndex() == strum::defaultPatternIndex,
+                 "Strum Pattern does not default to Legacy Direction");
+        require (pattern->getVersionHint() == 20,
+                 "Strum Pattern AU hint is wrong");
+
+        // Session round-trip.
+        setParameter (processor, strumPattern, 3.0f);
+
+        juce::MemoryBlock saved;
+        processor.getStateInformation (saved);
+
+        PluginProcessor restored;
+        restored.setStateInformation (saved.getData(), static_cast<int> (saved.getSize()));
+        require (juce::roundToInt (restored.getValueTreeState()
+                                       .getRawParameterValue (strumPattern)->load()) == 3,
+                 "Strum Pattern session recall failed");
+
+        // Legacy state without the new control falls back to Legacy Direction.
+        auto legacy = juce::ValueTree::readFromData (saved.getData(), saved.getSize());
+
+        for (int i = legacy.getNumChildren(); --i >= 0;)
+            if (legacy.getChild (i).getProperty ("id").toString() == strumPattern)
+                legacy.removeChild (i, nullptr);
+
+        juce::MemoryBlock legacyState;
+        {
+            juce::MemoryOutputStream stream (legacyState, false);
+            legacy.writeToStream (stream);
+        }
+
+        PluginProcessor legacyTarget;
+        setParameter (legacyTarget, strumPattern, 2.0f);
+        legacyTarget.setStateInformation (legacyState.getData(),
+                                          static_cast<int> (legacyState.getSize()));
+        require (juce::roundToInt (legacyTarget.getValueTreeState()
+                                       .getRawParameterValue (strumPattern)->load()) == 0,
+                 "Legacy state did not recall Legacy Direction");
+
+        // A user preset preserves the selected pattern.
+        juce::TemporaryFile patternPreset (".wickychord");
+        wicky::ui::PresetManager patternBank (processor);
+        require (patternBank.saveUserPreset (patternPreset.getFile()),
+                 "User pattern preset save failed");
+
+        setParameter (processor, strumPattern, 1.0f);
+
+        require (patternBank.loadUserPreset (patternPreset.getFile()),
+                 "User pattern preset recall failed");
+        require (juce::roundToInt (processor.getValueTreeState()
+                                       .getRawParameterValue (strumPattern)->load()) == 3,
+                 "User preset did not recall the strum pattern");
+    }
+
+    void testStrumPatternEngine()
+    {
+        namespace strum = boilerplate::dsp::strum;
+
+        const auto noteOn = [] (int channel, int note)
+        {
+            return juce::MidiMessage::noteOn (channel, note, juce::uint8 (100));
+        };
+
+        const auto noteOff = [] (int channel, int note)
+        {
+            return juce::MidiMessage::noteOff (channel, note);
+        };
+
+        const std::vector<int> up { 60, 64, 67 };
+        const std::vector<int> down { 67, 64, 60 };
+        const std::vector<int> outsideIn { 60, 67, 64 };
+
+        const auto makeScenario = [&] (int pattern, bool sync, int strumMode = 0,
+                                       juce::uint32 seed = 0)
+        {
+            TempoScenario scenario;
+            scenario.pattern = pattern;
+            scenario.strumMode = strumMode;
+            scenario.sync = sync;
+            scenario.strumPercent = 100.0f;
+            scenario.division = 3;
+            scenario.initialBpm = 120.0;
+            scenario.blockSize = 4096;
+            scenario.randomSeed = seed;
+            scenario.totalSamples = sync ? 24000 : 12000;
+            scenario.input =
+            {
+                { 0, noteOn (1, 60) },
+                { sync ? 20000 : 10000, noteOff (1, 60) }
+            };
+            return scenario;
+        };
+
+        // Legacy Direction reproduces the released Up/Down behavior in both
+        // timing modes and across host block sizes.
+        for (const auto sync : { false, true })
+        {
+            const auto render = [&] (int blockSize, int strumMode)
+            {
+                auto scenario = makeScenario (strum::legacyDirectionPattern, sync, strumMode);
+                scenario.blockSize = blockSize;
+                return renderScenario (scenario);
+            };
+
+            const auto referenceUp = render (64, 0);
+            require (noteOnNotes (referenceUp) == up, "Legacy Up engine order is wrong");
+            require (countNoteOns (referenceUp) == 3, "Legacy Up emitted extra note-ons");
+            require (noteOffPositions (referenceUp).size() == 3, "Legacy Up lost note-offs");
+
+            const auto referenceDown = render (64, 1);
+            require (noteOnNotes (referenceDown) == down, "Legacy Down engine order is wrong");
+            require (countNoteOns (referenceDown) == 3, "Legacy Down emitted extra note-ons");
+            require (noteOffPositions (referenceDown).size() == 3, "Legacy Down lost note-offs");
+
+            for (const auto blockSize : { 512, 4096 })
+            {
+                require (sameTimeline (render (blockSize, 0), referenceUp),
+                         "Legacy Up depends on host block size");
+                require (sameTimeline (render (blockSize, 1), referenceDown),
+                         "Legacy Down depends on host block size");
+            }
+        }
+
+        // Outside-In is low, high, second-low, second-high, ...
+        for (const auto sync : { false, true })
+        {
+            const auto render = [&] (int blockSize)
+            {
+                auto scenario = makeScenario (strum::outsideInPattern, sync);
+                scenario.blockSize = blockSize;
+                return renderScenario (scenario);
+            };
+
+            const auto reference = render (64);
+            require (noteOnNotes (reference) == outsideIn,
+                     "Outside-In engine order is wrong");
+            require (countNoteOns (reference) == 3, "Outside-In emitted extra note-ons");
+            require (noteOffPositions (reference).size() == 3, "Outside-In lost note-offs");
+
+            for (const auto blockSize : { 512, 4096 })
+                require (sameTimeline (render (blockSize), reference),
+                         "Outside-In depends on host block size");
+        }
+
+        // Alternate starts Up and uses the next direction on the next trigger.
+        for (const auto sync : { false, true })
+        {
+            const auto render = [&] (int blockSize)
+            {
+                auto scenario = makeScenario (strum::alternatePattern, sync);
+                scenario.blockSize = blockSize;
+                scenario.totalSamples = sync ? 52000 : 27000;
+                scenario.input =
+                {
+                    { 0, noteOn (1, 60) },
+                    { sync ? 20000 : 10000, noteOff (1, 60) },
+                    { sync ? 30000 : 15000, noteOn (1, 60) },
+                    { sync ? 50000 : 25000, noteOff (1, 60) }
+                };
+                return renderScenario (scenario);
+            };
+
+            const auto reference = render (64);
+            const auto notes = noteOnNotes (reference);
+            require (notes.size() == 6, "Alternate lost a trigger");
+            require (std::equal (up.begin(), up.end(), notes.begin()),
+                     "Alternate did not start Up");
+            require (std::equal (down.begin(), down.end(), notes.begin() + 3),
+                     "Alternate did not follow Up with Down");
+            require (countNoteOns (reference) == 6, "Alternate emitted extra note-ons");
+            require (noteOffPositions (reference).size() == 6, "Alternate lost note-offs");
+
+            for (const auto blockSize : { 512, 4096 })
+                require (sameTimeline (render (blockSize), reference),
+                         "Alternate depends on host block size");
+        }
+
+        // Alternate state is independent per MIDI channel.
+        {
+            auto scenario = makeScenario (strum::alternatePattern, true);
+            scenario.totalSamples = 72000;
+            scenario.input =
+            {
+                { 0, noteOn (1, 60) }, { 20000, noteOff (1, 60) },
+                { 25000, noteOn (2, 60) }, { 45000, noteOff (2, 60) },
+                { 50000, noteOn (1, 60) }, { 70000, noteOff (1, 60) }
+            };
+
+            const auto events = renderScenario (scenario);
+            const auto channelOne = noteOnNotes (events, 0);
+            const auto channelTwo = noteOnNotes (events, 1);
+
+            require (channelOne.size() == 6, "Alternate lost a channel-one trigger");
+            require (std::equal (up.begin(), up.end(), channelOne.begin()),
+                     "Channel one did not start Up");
+            require (std::equal (down.begin(), down.end(), channelOne.begin() + 3),
+                     "Channel one did not alternate to Down");
+            require (channelTwo == up, "Channel two inherited channel one's direction");
+        }
+
+        // Random plays a permutation and stays block-size independent with a
+        // fixed engine seed.
+        for (const auto sync : { false, true })
+        {
+            const auto render = [&] (int blockSize)
+            {
+                auto scenario = makeScenario (strum::randomPattern, sync, 0, 0x9e3779b9u);
+                scenario.blockSize = blockSize;
+                return renderScenario (scenario);
+            };
+
+            const auto reference = render (64);
+            const auto notes = noteOnNotes (reference);
+            require (notes.size() == 3, "Random lost a chord tone");
+            require (std::is_permutation (notes.begin(), notes.end(),
+                                          up.begin(), up.end()),
+                     "Random did not play each chord tone once");
+            require (countNoteOns (reference) == 3, "Random emitted extra note-ons");
+            require (noteOffPositions (reference).size() == 3, "Random lost note-offs");
+
+            for (const auto blockSize : { 512, 4096 })
+                require (sameTimeline (render (blockSize), reference),
+                         "Random depends on host block size");
+        }
+
+        // Re-triggering a held key starts the next Alternate direction and
+        // releases the old chord first.
+        {
+            auto scenario = makeScenario (strum::alternatePattern, false);
+            scenario.totalSamples = 22000;
+            scenario.input =
+            {
+                { 0, noteOn (1, 60) },
+                { 10000, noteOn (1, 60) },
+                { 20000, noteOff (1, 60) }
+            };
+
+            const auto events = renderScenario (scenario);
+            const auto notes = noteOnNotes (events);
+            require (notes.size() == 6, "Alternate retrigger lost a chord");
+            require (std::equal (up.begin(), up.end(), notes.begin()),
+                     "Alternate retrigger did not start Up");
+            require (std::equal (down.begin(), down.end(), notes.begin() + 3),
+                     "Alternate retrigger did not use Down");
+            require (countNoteOns (events) == 6, "Alternate retrigger duplicated a tone");
+            require (noteOffPositions (events).size() == 6,
+                     "Alternate retrigger lost a release");
+        }
+
+        // Shared tones still use the released ref-count ownership with a
+        // non-legacy pattern.
+        {
+            PluginProcessor processor;
+            processor.prepareToPlay (48000.0, 64);
+            setChordMatrix (processor, 0, 0, 1, 0);
+            setParameter (processor, boilerplate::parameters::strumPattern,
+                          static_cast<float> (strum::outsideInPattern));
+            setParameter (processor, boilerplate::parameters::strum, 0.0f);
+
+            const auto c = processMessages (processor, { noteOn (1, 60) });
+            require (hasNoteOn (c, 0, 60) && hasNoteOn (c, 0, 64) && hasNoteOn (c, 0, 67),
+                     "Outside-In chord notes are wrong");
+
+            const auto e = processMessages (processor, { noteOn (1, 64) });
+            require (hasNoteOn (e, 0, 68) && hasNoteOn (e, 0, 71)
+                         && ! hasNoteOn (e, 0, 64),
+                     "Shared note was retriggered with Outside-In");
+
+            const auto releaseC = processMessages (processor, { noteOff (1, 60) });
+            require (hasNoteOff (releaseC, 0, 60) && hasNoteOff (releaseC, 0, 67)
+                         && ! hasNoteOff (releaseC, 0, 64),
+                     "Shared note was cut early with Outside-In");
+
+            const auto releaseE = processMessages (processor, { noteOff (1, 64) });
+            require (hasNoteOff (releaseE, 0, 64) && hasNoteOff (releaseE, 0, 68)
+                         && hasNoteOff (releaseE, 0, 71),
+                     "Shared note release failed with Outside-In");
+        }
+
+        // Bypass flushes a generated pattern chord and cancels future tones.
+        {
+            PluginProcessor processor;
+            processor.prepareToPlay (48000.0, 64);
+            setChordMatrix (processor, 0, 0, 1, 0);
+            setParameter (processor, boilerplate::parameters::strumPattern,
+                          static_cast<float> (strum::outsideInPattern));
+            setParameter (processor, boilerplate::parameters::strum, 100.0f);
+
+            const auto first = processMessages (processor, { noteOn (1, 60) });
+            require (hasNoteOn (first, 0, 60) && ! hasNoteOn (first, 0, 64),
+                     "Pattern first block emitted a future tone");
+
+            setParameter (processor, boilerplate::parameters::bypass, 1.0f);
+
+            const auto bypassed = processMessages (processor, { noteOn (1, 62) });
+            require (hasNoteOff (bypassed, 0, 60),
+                     "Pattern bypass did not flush the generated tone");
+            require (hasNoteOn (bypassed, 0, 62),
+                     "Pattern bypass did not pass the input through");
+            require (! hasNoteOn (bypassed, 0, 64) && ! hasNoteOn (bypassed, 0, 67),
+                     "Pattern bypass left a future tone");
+
+            for (int block = 0; block < 120; ++block)
+                require (processMessages (processor, {}).empty(),
+                         "Pattern bypass left a pending tone");
+
+            setParameter (processor, boilerplate::parameters::bypass, 0.0f);
+            processMessages (processor, { noteOff (1, 62) });
+        }
+    }
+
+    void testMidiRoutingSettings()
+    {
+        using namespace wicky::standalone;
+
+        FakeRoutingStore store;
+        MidiRoutingSettings settings;
+        settings.inputIdentifiers.add ("in-a");
+        settings.inputIdentifiers.add ("in-b");
+        settings.outputIdentifier = "out-a";
+        settings.outputChannel = 5;
+
+        saveMidiRoutingSettings (store, settings);
+        require (store.saveCount == 1, "Routing settings were not saved");
+
+        const auto loaded = loadMidiRoutingSettings (store);
+        require (loaded.inputIdentifiers == settings.inputIdentifiers,
+                 "Routing input identifiers did not survive the round-trip");
+        require (loaded.outputIdentifier == "out-a",
+                 "Routing output identifier did not survive the round-trip");
+        require (loaded.outputChannel == 5,
+                 "Routing channel did not survive the round-trip");
+
+        store.setValue (outputChannelKey, "99");
+        require (loadMidiRoutingSettings (store).outputChannel == 16,
+                 "Routing channel was not clamped to 16");
+        store.setValue (outputChannelKey, "-4");
+        require (loadMidiRoutingSettings (store).outputChannel == 0,
+                 "Routing channel was not clamped to Preserve");
+
+        store.setValue (inputIdentifiersKey, "in-a\n\nin-b\nin-a");
+        const auto cleaned = loadMidiRoutingSettings (store);
+        require (cleaned.inputIdentifiers.size() == 2
+                     && cleaned.inputIdentifiers[0] == "in-a"
+                     && cleaned.inputIdentifiers[1] == "in-b",
+                 "Routing identifiers were not de-duplicated");
+
+        // A restart sees the same persisted selection.
+        FakeMidiBackend backend;
+        MidiRouting routing (backend, store);
+        require (routing.getSettings().inputIdentifiers == cleaned.inputIdentifiers,
+                 "Routing owner did not load persisted inputs");
+        require (routing.getSettings().outputIdentifier == "out-a",
+                 "Routing owner did not load the persisted output");
+    }
+
+    void testMidiChannelRemapper()
+    {
+        using namespace wicky::standalone;
+
+        const auto collect = +[] (void* context, const juce::MidiMessage& message)
+        {
+            static_cast<std::vector<juce::MidiMessage>*> (context)->push_back (message);
+        };
+
+        const auto noteOn = [] (int channel, int note, int velocity = 100)
+        {
+            return juce::MidiMessage::noteOn (channel, note,
+                                              static_cast<juce::uint8> (velocity));
+        };
+
+        const auto noteOff = [] (int channel, int note)
+        {
+            return juce::MidiMessage::noteOff (channel, note);
+        };
+
+        std::vector<juce::MidiMessage> sent;
+        MidiChannelRemapper remapper;
+        remapper.setOutputChannel (1);
+
+        remapper.process (noteOn (2, 60), collect, &sent);
+        require (sent.size() == 1 && sent[0].isNoteOn()
+                     && sent[0].getChannel() == 1 && sent[0].getNoteNumber() == 60,
+                 "Fixed channel did not remap a note-on");
+
+        sent.clear();
+        remapper.process (noteOn (3, 60), collect, &sent);
+        require (sent.empty(), "A shared output note was retriggered");
+
+        remapper.process (noteOff (2, 60), collect, &sent);
+        require (sent.empty(), "A shared output note was released too early");
+
+        remapper.process (noteOff (3, 60), collect, &sent);
+        require (sent.size() == 1 && sent[0].isNoteOff()
+                     && sent[0].getChannel() == 1,
+                 "The final shared-note owner did not release the note");
+
+        sent.clear();
+        remapper.process (juce::MidiMessage::controllerEvent (2, 1, 64), collect, &sent);
+        require (sent.size() == 1 && sent[0].getChannel() == 1
+                     && sent[0].isController(),
+                 "Fixed channel did not remap a controller message");
+
+        // Preserve leaves channels untouched.
+        MidiChannelRemapper preserve;
+        sent.clear();
+        preserve.process (noteOn (5, 64), collect, &sent);
+        require (sent.size() == 1 && sent[0].getChannel() == 5,
+                 "Preserve changed the output channel");
+
+        sent.clear();
+        preserve.process (juce::MidiMessage::controllerEvent (5, 1, 64), collect, &sent);
+        require (sent.size() == 1 && sent[0].getChannel() == 5
+                     && sent[0].isController(),
+                 "Preserve did not forward a controller message");
+
+        // Retriggering the same source releases and restarts the note.
+        sent.clear();
+        remapper.process (noteOn (1, 72), collect, &sent);
+        remapper.process (noteOn (1, 72), collect, &sent);
+        require (sent.size() == 3
+                     && sent[0].isNoteOn (true)
+                     && sent[1].isNoteOff()
+                     && sent[2].isNoteOn (true),
+                 "Same-source retrigger did not release first");
+
+        // CC123 from one merged source must not cut another source's note.
+        MidiChannelRemapper panicRemapper;
+        panicRemapper.setOutputChannel (1);
+        sent.clear();
+        panicRemapper.process (noteOn (1, 60), collect, &sent);
+        panicRemapper.process (noteOn (2, 60), collect, &sent);
+        sent.clear();
+        panicRemapper.process (juce::MidiMessage::allNotesOff (1), collect, &sent);
+        require (sent.empty(),
+                 "CC123 from one source cut another source's shared note");
+
+        panicRemapper.process (juce::MidiMessage::allNotesOff (2), collect, &sent);
+        require (sent.size() == 2
+                     && sent[0].isNoteOff()
+                     && sent[1].isAllNotesOff(),
+                 "The final owner did not release and forward CC123");
+
+        // Panic releases all tracked notes and sends channel safety messages.
+        MidiChannelRemapper panic;
+        panic.setOutputChannel (1);
+        sent.clear();
+        panic.process (noteOn (1, 60), collect, &sent);
+        panic.process (noteOn (1, 64), collect, &sent);
+        sent.clear();
+        panic.sendPanic (collect, &sent);
+        require (! panic.hasActiveNotes(), "Panic left tracked notes active");
+        require (sent.size() >= 34, "Panic did not send all safety messages");
+        require (sent[0].isNoteOff() && sent[1].isNoteOff(),
+                 "Panic did not send explicit note-offs");
+        require (sent[sent.size() - 2].isAllSoundOff()
+                     && sent[sent.size() - 1].isAllNotesOff(),
+                 "Panic did not end with channel safety messages");
+
+        // An unmatched release passes through.
+        sent.clear();
+        MidiChannelRemapper unmatched;
+        unmatched.setOutputChannel (1);
+        unmatched.process (noteOff (1, 80), collect, &sent);
+        require (sent.size() == 1 && sent[0].isNoteOff(),
+                 "Unmatched note-off was not forwarded");
+    }
+
+    void testMidiRoutingRoute()
+    {
+        using namespace wicky::standalone;
+
+        const auto noteOn = [] (int channel, int note)
+        {
+            return juce::MidiMessage::noteOn (channel, note, juce::uint8 (100));
+        };
+
+        const MidiDeviceDescription inputA { "in-a", "Input A" };
+        const MidiDeviceDescription outputA { "out-a", "Output A" };
+        const MidiDeviceDescription outputB { "out-b", "Output B" };
+
+        FakeMidiBackend backend;
+        backend.inputs.add (inputA);
+        backend.outputs.add (outputA);
+        backend.outputs.add (outputB);
+
+        FakeRoutingStore store;
+        MidiRoutingSettings settings;
+        settings.inputIdentifiers.add ("in-a");
+        settings.outputIdentifier = "out-a";
+        settings.outputChannel = 1;
+        saveMidiRoutingSettings (store, settings);
+
+        MidiRouting routing (backend, store);
+        routing.refreshInputDevices();
+        routing.refreshOutputDevices();
+
+        // Enumeration alone is not a connection.
+        require (! routing.isConnected(), "Enumeration was treated as a connection");
+        require (! routing.send (noteOn (1, 60)),
+                 "Routing sent before an output was opened");
+        require (backend.sent.isEmpty(), "Enumeration produced MIDI output");
+
+        // Successful open and send.
+        require (routing.openConfiguredRoute(), "Configured route did not open");
+        require (routing.isConnected(), "Opened route did not report connected");
+        require (backend.openOutputId == "out-a", "Wrong output was opened");
+        require (backend.openInputIds.contains ("in-a"), "Selected input was not opened");
+        require (routing.send (noteOn (2, 60)), "Connected routing refused a send");
+        require (backend.sent.size() == 1 && backend.sent[0].getChannel() == 1,
+                 "Routing did not apply the output channel");
+
+        // Input callback uses the routing boundary.
+        juce::Array<juce::MidiMessage> received;
+        routing.setInputMessageCallback ([&] (const juce::MidiMessage& message)
+        {
+            received.add (message);
+        });
+        backend.injectInput (noteOn (3, 72));
+        require (received.size() == 1 && received[0].getNoteNumber() == 72,
+                 "Input callback was not forwarded");
+
+        // Panic clears shared ownership and sends safety messages.
+        routing.send (noteOn (2, 64));
+        backend.sent.clear();
+        routing.sendPanic();
+        require (backend.sent.size() >= 34, "Panic did not flush the route");
+        require (backend.sent[0].isNoteOff(), "Panic did not release the held note");
+
+        // Missing output never falls back to another endpoint.
+        FakeMidiBackend missingBackend;
+        missingBackend.inputs.add (inputA);
+        missingBackend.outputs.add (outputB);
+        MidiRouting missingRouting (missingBackend, store);
+        missingRouting.refreshInputDevices();
+        missingRouting.refreshOutputDevices();
+        require (! missingRouting.openConfiguredRoute(),
+                 "Missing output was reported as connected");
+        require (missingRouting.getStatus().outputMissing,
+                 "Missing output was not reported");
+        require (missingBackend.openOutputId.isEmpty(),
+                 "Missing output silently opened a substitute");
+        require (! missingRouting.send (noteOn (1, 60)),
+                 "Missing output accepted a send");
+        require (missingBackend.sent.isEmpty(), "Missing output sent a message");
+
+        // Failed output open is reported and not retried elsewhere.
+        FakeMidiBackend failingBackend;
+        failingBackend.inputs.add (inputA);
+        failingBackend.outputs.add (outputA);
+        failingBackend.failOutputOpen = true;
+        MidiRouting failingRouting (failingBackend, store);
+        failingRouting.refreshInputDevices();
+        failingRouting.refreshOutputDevices();
+        require (! failingRouting.openConfiguredRoute(),
+                 "Failed output open was reported as connected");
+        require (failingRouting.getStatus().outputOpenFailed,
+                 "Failed output open was not reported");
+        require (failingBackend.openOutputId.isEmpty(),
+                 "Failed output open left a handle open");
+
+        // Missing and failed inputs are reported while the output still works.
+        MidiRoutingSettings missingInputSettings;
+        missingInputSettings.inputIdentifiers.add ("in-a");
+        missingInputSettings.inputIdentifiers.add ("in-missing");
+        missingInputSettings.outputIdentifier = "out-a";
+
+        FakeRoutingStore missingInputStore;
+        saveMidiRoutingSettings (missingInputStore, missingInputSettings);
+
+        FakeMidiBackend partialBackend;
+        partialBackend.inputs.add (inputA);
+        partialBackend.outputs.add (outputA);
+        MidiRouting partialRouting (partialBackend, missingInputStore);
+        partialRouting.refreshInputDevices();
+        partialRouting.refreshOutputDevices();
+        require (! partialRouting.openConfiguredRoute(),
+                 "Route with a missing input was reported as fully connected");
+        require (partialRouting.getStatus().outputConnected,
+                 "Output did not stay connected with a missing input");
+        require (partialRouting.getStatus().missingInputIdentifiers.contains ("in-missing"),
+                 "Missing input was not reported");
+        require (partialBackend.openInputIds.contains ("in-a"),
+                 "Available input was not opened");
+        require (partialRouting.send (noteOn (1, 60)),
+                 "Missing input blocked the connected output");
+
+        FakeMidiBackend inputFailBackend;
+        inputFailBackend.inputs.add (inputA);
+        inputFailBackend.outputs.add (outputA);
+        inputFailBackend.failInputOpen = true;
+        MidiRouting inputFailRouting (inputFailBackend, store);
+        inputFailRouting.refreshInputDevices();
+        inputFailRouting.refreshOutputDevices();
+        require (! inputFailRouting.openConfiguredRoute(),
+                 "Failed input open was reported as fully connected");
+        require (inputFailRouting.getStatus().failedInputIdentifiers.contains ("in-a"),
+                 "Failed input open was not reported");
+        require (inputFailRouting.getStatus().outputConnected,
+                 "Output did not stay connected after an input failure");
+
+        // An endpoint that disappears after opening is flushed and reported
+        // missing rather than being silently replaced.
+        FakeMidiBackend disappearingBackend;
+        disappearingBackend.inputs.add (inputA);
+        disappearingBackend.outputs.add (outputA);
+        MidiRouting disappearingRouting (disappearingBackend, store);
+        disappearingRouting.refreshInputDevices();
+        disappearingRouting.refreshOutputDevices();
+        require (disappearingRouting.openConfiguredRoute(),
+                 "Disappearing-output route did not open");
+        require (disappearingRouting.send (noteOn (1, 60)),
+                 "Disappearing-output route refused a send");
+        disappearingBackend.sent.clear();
+        disappearingBackend.outputs.clear();
+        disappearingRouting.refreshOutputDevices();
+        require (! disappearingRouting.isConnected(),
+                 "Disappeared output still reported connected");
+        require (disappearingRouting.getStatus().outputMissing,
+                 "Disappeared output was not reported missing");
+        require (! disappearingBackend.isOutputOpen(),
+                 "Disappeared output handle was left open");
+        require (disappearingBackend.sent.size() >= 33,
+                 "Disappeared output was not flushed before closing");
+
+        // Replugging the same endpoint reconnects it explicitly. It is never
+        // substituted for a different endpoint while missing.
+        disappearingBackend.outputs.add (outputA);
+        disappearingBackend.sent.clear();
+        require (disappearingRouting.openConfiguredRoute(),
+                 "Replugged output did not reopen");
+        require (disappearingRouting.isConnected(),
+                 "Replugged output did not report connected");
+        require (disappearingBackend.sent.isEmpty(),
+                 "Reconnecting an idle route emitted MIDI");
+
+        // Shutdown closes inputs and flushes held notes before the endpoint
+        // handle goes away.
+        FakeMidiBackend shutdownBackend;
+        shutdownBackend.inputs.add (inputA);
+        shutdownBackend.outputs.add (outputA);
+
+        {
+            MidiRouting shutdownRouting (shutdownBackend, store);
+            shutdownRouting.refreshInputDevices();
+            shutdownRouting.refreshOutputDevices();
+            require (shutdownRouting.openConfiguredRoute(),
+                     "Shutdown-test route did not open");
+            require (shutdownRouting.send (noteOn (1, 72)),
+                     "Shutdown-test route refused a send");
+            shutdownBackend.sent.clear();
+        }
+
+        require (! shutdownBackend.isOutputOpen(),
+                 "Shutdown left the output open");
+        require (shutdownBackend.openInputIds.isEmpty(),
+                 "Shutdown left inputs open");
+        require (shutdownBackend.sent.size() >= 33,
+                 "Shutdown did not flush held notes");
+
+        // A send failure disconnects the route instead of silently continuing.
+        backend.sent.clear();
+        backend.failSends = true;
+        require (! routing.send (noteOn (1, 64)),
+                 "Send failure was reported as success");
+        require (! routing.isConnected(), "Send failure left the route connected");
+        require (! backend.isOutputOpen(), "Send failure left the output open");
+    }
+
+    void testMidiRouteSwitcher()
+    {
+        using namespace wicky::standalone;
+
+        juce::StringArray order;
+        bool openResult = true;
+        bool held = false;
+
+        MidiRouteSwitcher switcher (MidiRouteSwitcher::Callbacks {
+            [&] { order.add ("detach"); },
+            [&] { order.add ("flush"); held = false; },
+            [&] (const juce::String& identifier)
+            {
+                order.add (juce::String ("open:") + identifier);
+                return openResult;
+            },
+            [&] { order.add ("attach"); },
+            [&] { order.add ("reset"); }
+        });
+
+        held = true;
+        require (switcher.switchTo ("out-a"), "Safe switch failed to open out-a");
+        require (! held, "Safe switch did not flush held notes");
+        require (order.joinIntoString ("|") == "detach|flush|open:out-a|attach|reset",
+                 "Safe switch order is wrong");
+
+        order.clear();
+        openResult = false;
+        require (! switcher.switchTo ("out-missing"),
+                 "Failed output open was reported as success");
+        require (order.joinIntoString ("|") == "detach|flush|open:out-missing|attach|reset",
+                 "Failed switch did not run its recovery steps");
+
+        order.clear();
+        openResult = true;
+        require (switcher.switchTo ("out-b"), "Recovery switch failed");
+        require (order.joinIntoString ("|") == "detach|flush|open:out-b|attach|reset",
+                 "Repeated switch order is wrong");
+
+        order.clear();
+        openResult = false;
+        require (! switcher.switchTo ({}), "Closing the route was reported as success");
+        require (order.joinIntoString ("|") == "detach|flush|open:|attach|reset",
+                 "Closing the route did not detach and reset");
+
+        MidiRouteSwitcher empty { MidiRouteSwitcher::Callbacks {} };
+        require (! empty.switchTo ("out-a"), "Empty switcher reported success");
+    }
+
+    void testMidiRoutingProcessorProxy()
+    {
+        using namespace wicky::standalone;
+
+        FakeMidiSourceProcessor source;
+        MidiRoutingProcessorProxy proxy (source);
+        proxy.setOutputChannel (1);
+        proxy.prepareToPlay (48000.0, 512);
+
+        const auto render = [&] (std::vector<FakeMidiSourceProcessor::Pending> events,
+                                 int blockSize = 512)
+        {
+            source.pending = std::move (events);
+            juce::AudioBuffer<float> audio (2, blockSize);
+            juce::MidiBuffer midi;
+            midi.ensureSize (131072);
+            proxy.processBlock (audio, midi);
+            return captureMidi (midi);
+        };
+
+        auto events = render ({
+            { juce::MidiMessage::noteOn (2, 60, juce::uint8 (100)), 100 }
+        });
+        require (events.size() == 1, "Proxy lost a note-on");
+        require (events[0].status == 0x90 && events[0].channel == 0
+                     && events[0].data1 == 60 && events[0].position == 100,
+                 "Proxy did not remap the note-on or preserve its offset");
+
+        const auto released = render ({
+            { juce::MidiMessage::noteOff (2, 60), 0 }
+        });
+        require (hasNoteOff (released, 0, 60), "Proxy lost a held note release");
+
+        proxy.setOutputChannel (3);
+        const auto channelThree = render ({
+            { juce::MidiMessage::noteOn (2, 64, juce::uint8 (100)), 10 }
+        });
+        require (hasNoteOn (channelThree, 2, 64),
+                 "Proxy channel change did not take effect");
+
+        proxy.setOutputChannel (1);
+        proxy.prepareToPlay (48000.0, 512);
+        render ({ { juce::MidiMessage::noteOn (2, 72, juce::uint8 (100)), 0 } });
+        proxy.requestPanic();
+
+        const auto panic = render ({});
+        require (panic.size() >= 33, "Proxy panic did not send safety messages");
+        require (hasNoteOff (panic, 0, 72), "Proxy panic did not release the held note");
+
+        for (int channel = 0; channel < 16; ++channel)
+            require (hasEvent (panic, 0xb0, channel, 120)
+                         && hasEvent (panic, 0xb0, channel, 123),
+                     "Proxy panic missed a channel");
+
+        proxy.setProcessor (nullptr);
+        require (render ({ { juce::MidiMessage::noteOn (1, 60, juce::uint8 (100)), 0 } }).empty(),
+                 "Detached proxy emitted MIDI");
+
+        proxy.setProcessor (&source);
+        proxy.prepareToPlay (48000.0, 512);
+
+        // The remap buffer is bounded; a block that expands past it must
+        // abandon the partial expansion and panic every channel.
+        std::vector<FakeMidiSourceProcessor::Pending> manyEvents;
+        manyEvents.reserve (15000);
+
+        for (int i = 0; i < 15000; ++i)
+            manyEvents.push_back ({
+                juce::MidiMessage::controllerEvent (2, 1, i & 0x7f),
+                i % 512
+            });
+
+        source.pending = std::move (manyEvents);
+
+        juce::AudioBuffer<float> audio (2, 512);
+        juce::MidiBuffer midi;
+        midi.ensureSize (200000);
+        proxy.processBlock (audio, midi);
+
+        const auto overflow = captureMidi (midi);
+        require (overflow.size() == 32, "Remap overflow did not panic");
+        for (int channel = 0; channel < 16; ++channel)
+            require (hasEvent (overflow, 0xb0, channel, 120)
+                         && hasEvent (overflow, 0xb0, channel, 123),
+                     "Remap overflow missed a channel");
+    }
+
+    void testMidiRoutingPanel()
+    {
+        using namespace wicky::standalone;
+
+        auto model = std::make_unique<FakeMidiRoutingPanelModel>();
+        auto* modelPtr = model.get();
+        model->inputs.add ({ "in-a", "Input A" });
+        model->outputs.add ({ "out-a", "Output A" });
+        model->settings.inputIdentifiers.add ("in-a");
+        model->enabledInputs.add ("in-a");
+        model->settings.outputIdentifier = "out-a";
+        model->settings.outputChannel = 0;
+
+        MidiRoutingPanel panel (std::move (model));
+        panel.setSize (560, 460);
+
+        juce::Image image (juce::Image::ARGB, 560, 460, true);
+        juce::Graphics graphics (image);
+        panel.paintEntireComponent (graphics, true);
+
+        auto* output = dynamic_cast<juce::ComboBox*> (findComponentByName (panel, "Output"));
+        auto* channel = dynamic_cast<juce::ComboBox*> (findComponentByName (panel, "Channel"));
+        auto* refresh = dynamic_cast<juce::Button*> (findComponentByName (panel, "Refresh"));
+        auto* panic = dynamic_cast<juce::Button*> (findComponentByName (panel, "Send Note Offs"));
+        auto* status = dynamic_cast<juce::Label*> (findComponentByName (panel, "Status"));
+        auto* inputs = findComponentByName (panel, "Inputs");
+
+        require (output != nullptr && channel != nullptr && refresh != nullptr
+                     && panic != nullptr && status != nullptr && inputs != nullptr,
+                 "MIDI routing panel is missing controls");
+        require (output->getNumItems() == 2, "Output list was not populated");
+        require (channel->getNumItems() == 17, "Channel list was not populated");
+        require (status->getText().contains ("connected"),
+                 "Status did not show the connected output");
+
+        output->setSelectedId (1, juce::sendNotificationSync);
+        require (modelPtr->lastOutput.isEmpty(), "No Output did not clear the output");
+
+        output->setSelectedId (2, juce::sendNotificationSync);
+        require (modelPtr->lastOutput == "out-a", "Output selection did not reach the model");
+
+        channel->setSelectedId (3, juce::sendNotificationSync);
+        require (modelPtr->lastChannel == 2, "Channel selection did not reach the model");
+
+        refresh->onClick();
+        require (modelPtr->refreshCount == 1, "Refresh did not reach the model");
+
+        panic->onClick();
+        require (modelPtr->panicCount == 1, "Send Note Offs did not reach the model");
+
+        modelPtr->setInputEnabled ("in-a", false);
+        require (! modelPtr->isInputEnabled ("in-a"), "Input toggle did not reach the model");
+    }
+
+    void testRoutingRegressions()
+    {
+        using namespace wicky::standalone;
+        using namespace boilerplate::parameters;
+        PluginProcessor processor;
+        MidiRoutingProcessorProxy proxy (processor);
+        proxy.prepareToPlay (48000, 64);
+        setChordMatrix (processor, 0, 0, 1, 0);
+        setParameter (processor, strumTimingMode, 1);
+        juce::AudioBuffer<float> audio (0, 64);
+        juce::MidiBuffer midi;
+        midi.ensureSize (131072);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, juce::uint8 (100)), 0);
+        proxy.processBlock (audio, midi);
+        require (countNoteOns (captureMidi (midi)) == 1, "Panic test did not start a strum");
+        proxy.requestPanic(); // Used by Send Note Offs and disabling an input.
+        midi.clear();
+        juce::AudioBuffer<float> noFrames (0, 0);
+        proxy.processBlock (noFrames, midi); // Must not consume the panic.
+        require (midi.isEmpty(), "Zero-frame proxy emitted MIDI");
+        proxy.processBlock (audio, midi);
+        require (hasNoteOff (captureMidi (midi), 0, 60), "Panic lost the held-note release");
+        for (int block = 0; block < 250; ++block)
+        {
+            midi.clear();
+            proxy.processBlock (audio, midi);
+            require (countNoteOns (captureMidi (midi)) == 0, "Panic left future strum tones scheduled");
+        }
+
+        setParameter (processor, bypass, 1);
+        std::vector<juce::uint8> sysEx (16384, 1);
+        sysEx.front() = 0xf0;
+        sysEx.back() = 0xf7;
+        midi.clear();
+        midi.addEvent (sysEx.data(), static_cast<int> (sysEx.size()), 17);
+        const auto* storage = midi.data.begin();
+        proxy.processBlock (audio, midi);
+        require (midi.getNumEvents() == 1, "Proxy lost SysEx");
+        const auto event = *midi.begin();
+        require (event.samplePosition == 17 && event.numBytes == static_cast<int> (sysEx.size())
+                 && std::equal (sysEx.begin(), sysEx.end(), event.data), "Proxy corrupted SysEx or its offset");
+        require (storage == midi.data.begin(), "SysEx unexpectedly grew the reserved destination");
+
+        // The same cancellation path remains bounded with saturated input.
+        midi.clear();
+        for (int i = 0; i < 8000; ++i)
+            midi.addEvent (juce::MidiMessage::noteOn (1, i % 128, juce::uint8 (100)), 0);
+        proxy.requestPanic();
+        proxy.processBlock (audio, midi);
+        require (countNoteOns (captureMidi (midi)) == 0, "Saturated panic admitted a partial input stream");
+        require (processor.getTailLengthSeconds() >= 70.01, "Synced tail declaration is too short");
+    }
+
+    void testVirtualOutputSettings()
+    {
+        using namespace wicky::standalone;
+        const auto first = makeVirtualOutputName();
+        const auto second = makeVirtualOutputName();
+        require (first != second, "Virtual endpoint names collide");
+        require (isWickyVirtualInput (first) && isWickyVirtualInput (virtualOutputName),
+                 "Own virtual output can feed the input selector");
+        require (! isWickyVirtualInput ("External Loopback"), "External loopback was excluded");
+        FakeRoutingStore store;
+        FakeMidiBackend backend;
+        backend.outputs.add ({ virtualOutputIdentifier, virtualOutputName });
+        MidiRoutingSettings settings;
+        settings.outputIdentifier = virtualOutputIdentifier;
+        saveMidiRoutingSettings (store, settings);
+        MidiRouting routing (backend, store);
+        require (routing.getSettings().outputIdentifier == virtualOutputIdentifier,
+                 "Virtual route preference did not survive restart");
+        backend.failOutputOpen = true;
+        require (! routing.openConfiguredRoute() && routing.getStatus().outputOpenFailed,
+                 "Virtual creation failure was not reported");
+        backend.failOutputOpen = false;
+        require (routing.openConfiguredRoute(), "Virtual route did not recover");
+        routing.send (juce::MidiMessage::noteOn (1, 60, juce::uint8 (100)));
+        backend.sent.clear();
+        routing.closeRoute();
+        require (! backend.outputOpen && backend.sent.size() >= 33,
+                 "Virtual route did not panic before closing");
+    }
+
+    void testMidiOnlyTimeline()
+    {
+        for (const auto sampleRate : { 44100.0, 48000.0, 96000.0 })
+            for (const auto blockSize : { 64, 512, 4096 })
+                for (const auto staggered : { 0, 1 })
+                {
+                    TempoScenario scenario;
+                    scenario.sampleRate = sampleRate;
+                    scenario.blockSize = blockSize;
+                    scenario.noteOffMode = staggered;
+                    scenario.totalSamples = static_cast<int> (sampleRate * 2);
+                    scenario.input = {
+                        { 0, juce::MidiMessage::noteOn (1, 60, juce::uint8 (100)) },
+                        { static_cast<int> (sampleRate / 2), juce::MidiMessage::noteOff (1, 60) }
+                    };
+                    const auto normal = renderScenario (scenario);
+                    scenario.audioChannels = 0;
+                    const auto midiOnly = renderScenario (scenario);
+                    require (sameTimeline (normal, midiOnly), "Zero-bus MIDI timeline differs");
+                    require (noteOnPositions (midiOnly).size() == 3
+                             && noteOffPositions (midiOnly).size() == 3,
+                             "Zero-bus strum did not balance notes");
+                }
+
+        PluginProcessor processor;
+        processor.prepareToPlay (48000, 64);
+        setChordMatrix (processor, 0, 0, 1, 0);
+        setParameter (processor, boilerplate::parameters::strumTimingMode, 1);
+        juce::AudioBuffer<float> empty (0, 0);
+        juce::MidiBuffer midi;
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, juce::uint8 (100)), 0);
+        processor.processBlock (empty, midi);
+        require (midi.getNumEvents() == 1, "Zero-frame processing consumed MIDI");
+        juce::AudioBuffer<float> frames (0, 64);
+        processor.processBlock (frames, midi);
+        require (countNoteOns (captureMidi (midi)) == 1, "Zero-channel buffer lost frame count");
+        setParameter (processor, boilerplate::parameters::bypass, 1);
+        midi.clear();
+        processor.processBlock (frames, midi);
+        require (hasNoteOff (captureMidi (midi), 0, 60), "Zero-bus bypass failed to release notes");
+        for (int block = 0; block < 250; ++block)
+        {
+            midi.clear();
+            processor.processBlock (frames, midi);
+            require (countNoteOns (captureMidi (midi)) == 0, "Zero-bus bypass resurrected pending tones");
+        }
+    }
+
+    void testHostTempoScheduling()
+    {
+        using namespace boilerplate::parameters;
+
+        const auto noteOn = [] (int channel, int note)
+        {
+            return juce::MidiMessage::noteOn (channel, note, juce::uint8 (100));
+        };
+
+        const auto noteOff = [] (int channel, int note)
+        {
+            return juce::MidiMessage::noteOff (channel, note);
+        };
+
+        // --- A synced timeline is independent of host block size, transport
+        // position and the free-time percentage.
+        const auto renderBasic = [&] (int blockSize, float strumPercent)
+        {
+            TempoScenario scenario;
+            scenario.blockSize = blockSize;
+            scenario.totalSamples = 24000;
+            scenario.sync = true;
+            scenario.division = 3; // Straight sixteenth.
+            scenario.initialBpm = 120.0;
+            scenario.playing = false; // Manual notes must work while stopped.
+            scenario.positionJumpAt = 7000;
+            scenario.strumPercent = strumPercent;
+            scenario.input = { { 0, noteOn (1, 60) }, { 20000, noteOff (1, 60) } };
+            return renderScenario (scenario);
+        };
+
+        const auto synced = renderBasic (64, 0.0f);
+        const auto syncedOns = noteOnPositions (synced);
+        require (syncedOns.size() == 3, "Synced chord did not produce three note-ons");
+        require (syncedOns[0] == 0 && syncedOns[1] == 6000 && syncedOns[2] == 12000,
+                 "Synced sixteenth steps are wrong");
+        require (hasNoteOn (synced, 0, 60) && hasNoteOn (synced, 0, 64)
+                     && hasNoteOn (synced, 0, 67),
+                 "Synced chord notes are wrong");
+
+        const auto syncedOffs = noteOffPositions (synced);
+        require (syncedOffs.size() == 3, "Synced chord did not release three notes");
+
+        for (const auto position : syncedOffs)
+            require (position == 20000, "Synced release ignored the host timeline");
+
+        for (const auto blockSize : { 512, 4096 })
+            require (sameTimeline (renderBasic (blockSize, 0.0f), synced),
+                     "Synced strum depends on host block size");
+
+        // Sync uses the division as the full step and ignores the free-time knob.
+        require (sameTimeline (renderBasic (64, 100.0f), synced),
+                 "Sync mode still used the free-time percentage");
+
+        // --- Tempo changes: already-scheduled tones keep their absolute due
+        // samples; chords triggered later use the new tempo.
+        const auto renderTempoChange = [&] (int blockSize)
+        {
+            TempoScenario scenario;
+            scenario.blockSize = blockSize;
+            scenario.totalSamples = 70000;
+            scenario.sync = true;
+            scenario.division = 3;
+            scenario.initialBpm = 120.0;
+            scenario.tempoChanges = { { 3000, 60.0 } };
+            scenario.input =
+            {
+                { 0, noteOn (1, 60) },
+                { 20000, noteOff (1, 60) },
+                { 30000, noteOn (1, 62) },
+                { 60000, noteOff (1, 62) }
+            };
+            return renderScenario (scenario);
+        };
+
+        const auto tempoChange = renderTempoChange (64);
+        const auto tempoOns = noteOnPositions (tempoChange);
+        require (tempoOns.size() == 6, "Tempo-change scenario lost a chord");
+        require (tempoOns[0] == 0 && tempoOns[1] == 6000 && tempoOns[2] == 12000,
+                 "Existing chord followed the new tempo");
+        require (tempoOns[3] == 30000 && tempoOns[4] == 42000 && tempoOns[5] == 54000,
+                 "New chord did not use the new tempo");
+        require (hasNoteOn (tempoChange, 0, 62) && hasNoteOn (tempoChange, 0, 66)
+                     && hasNoteOn (tempoChange, 0, 69),
+                 "New-tempo chord notes are wrong");
+
+        for (const auto blockSize : { 512, 4096 })
+            require (sameTimeline (renderTempoChange (blockSize), tempoChange),
+                     "Tempo-change timeline depends on host block size");
+
+        // --- Absent and invalid host tempo use the manual fallback.
+        for (const auto mode : { 0, 1, 2, 3, 4, 5 })
+        {
+            TempoScenario scenario;
+            scenario.totalSamples = 24000;
+            scenario.division = 3;
+            scenario.fallbackBpm = 120;
+            scenario.input = { { 0, noteOn (1, 60) }, { 20000, noteOff (1, 60) } };
+
+            switch (mode)
+            {
+                case 0: scenario.tempoAvailable = false; break;
+                case 1: scenario.positionAvailable = false; break;
+                case 2: scenario.initialBpm = 0.0; break;
+                case 3: scenario.initialBpm = std::nan (""); break;
+                case 4: scenario.initialBpm = -120.0; break;
+                case 5: scenario.attachPlayHead = false; break;
+            }
+
+            const auto ons = noteOnPositions (renderScenario (scenario));
+            require (ons.size() == 3 && ons[0] == 0 && ons[1] == 6000 && ons[2] == 12000,
+                     "Unavailable or invalid host tempo did not use the fallback");
+        }
+
+        // The fallback parameter applies when tempo is unavailable, and a valid
+        // host tempo overrides it when present.
+        {
+            TempoScenario noTempo;
+            noTempo.totalSamples = 32000;
+            noTempo.division = 3;
+            noTempo.tempoAvailable = false;
+            noTempo.fallbackBpm = 60;
+            noTempo.input = { { 0, noteOn (1, 60) }, { 30000, noteOff (1, 60) } };
+
+            const auto ons = noteOnPositions (renderScenario (noTempo));
+            require (ons.size() == 3 && ons[0] == 0 && ons[1] == 12000 && ons[2] == 24000,
+                     "Fallback BPM was not used");
+
+            TempoScenario hostTempo = noTempo;
+            hostTempo.tempoAvailable = true;
+            hostTempo.initialBpm = 120.0;
+
+            const auto hostOns = noteOnPositions (renderScenario (hostTempo));
+            require (hostOns.size() == 3 && hostOns[0] == 0 && hostOns[1] == 6000
+                         && hostOns[2] == 12000,
+                     "Host tempo did not override the fallback");
+        }
+
+        // --- Free mode ignores the host tempo and keeps the released mapping.
+        {
+            TempoScenario free;
+            free.totalSamples = 10000;
+            free.sync = false;
+            free.strumPercent = 100.0f;
+            free.initialBpm = 60.0;
+            free.input = { { 0, noteOn (1, 60) }, { 9000, noteOff (1, 60) } };
+
+            const auto ons = noteOnPositions (renderScenario (free));
+            require (ons.size() == 3 && ons[0] == 0 && ons[1] == 2880 && ons[2] == 5760,
+                     "Free mode changed or used the host tempo");
+        }
+
+        // --- Rapid release cancels future synced tones.
+        {
+            TempoScenario rapid;
+            rapid.blockSize = 512;
+            rapid.totalSamples = 2048;
+            rapid.sync = true;
+            rapid.division = 3;
+            rapid.initialBpm = 120.0;
+            rapid.input = { { 0, noteOn (1, 60) }, { 100, noteOff (1, 60) } };
+
+            const auto events = renderScenario (rapid);
+            require (hasNoteOn (events, 0, 60) && hasNoteOff (events, 0, 60),
+                     "Rapid synced release lost the first tone");
+            require (! hasNoteOn (events, 0, 64) && ! hasNoteOn (events, 0, 67),
+                     "Rapid synced release played a future tone");
+            require (countNoteOns (events) == 1, "Rapid synced release played extra tones");
+        }
+
+        // --- Staggered release uses the synced step and stays block-independent.
+        const auto renderStagger = [&] (int blockSize)
+        {
+            TempoScenario scenario;
+            scenario.blockSize = blockSize;
+            scenario.totalSamples = 40000;
+            scenario.sync = true;
+            scenario.division = 3;
+            scenario.initialBpm = 120.0;
+            scenario.noteOffMode = 1;
+            scenario.input = { { 0, noteOn (1, 60) }, { 20000, noteOff (1, 60) } };
+            return renderScenario (scenario);
+        };
+
+        const auto staggered = renderStagger (64);
+        require (hasNoteOff (staggered, 0, 60) && hasNoteOff (staggered, 0, 64)
+                     && hasNoteOff (staggered, 0, 67),
+                 "Synced staggered release lost a note");
+
+        const auto staggerOffs = noteOffPositions (staggered);
+        require (staggerOffs.size() == 3 && staggerOffs[0] == 20000
+                     && staggerOffs[1] == 26000 && staggerOffs[2] == 32000,
+                 "Synced staggered release timing is wrong");
+
+        for (const auto blockSize : { 512, 4096 })
+            require (sameTimeline (renderStagger (blockSize), staggered),
+                     "Synced staggered release depends on host block size");
+
+        // --- Bypass and power flush generated notes in Sync mode.
+        for (const auto* switchID : { power, bypass })
+        {
+            TestPlayHead playHead;
+            PluginProcessor processor;
+            processor.setPlayHead (&playHead);
+            processor.setRateAndBufferSizeDetails (48000.0, 64);
+            processor.prepareToPlay (48000.0, 64);
+            setChordMatrix (processor, 0, 0, 1, 0);
+            setParameter (processor, strumTimingMode, 1.0f);
+            setParameter (processor, strumDivision, 3.0f);
+            setParameter (processor, strumFallbackBpm, 120.0f);
+
+            const auto first = processMessages (processor, { noteOn (1, 60) });
+            require (hasNoteOn (first, 0, 60) && ! hasNoteOn (first, 0, 64),
+                     "Synced first block emitted a future tone");
+
+            setParameter (processor, switchID, switchID == power ? 0.0f : 1.0f);
+
+            const auto switched = processMessages (processor, { noteOn (1, 62) });
+            require (hasNoteOff (switched, 0, 60),
+                     "Bypass/power did not flush the generated tone");
+            require (hasNoteOn (switched, 0, 62),
+                     "Bypass/power did not pass the input through");
+            require (! hasNoteOn (switched, 0, 64) && ! hasNoteOn (switched, 0, 67),
+                     "Bypass/power still generated a synced chord");
+
+            for (int block = 0; block < 120; ++block)
+            {
+                const auto pending = processMessages (processor, {});
+                require (pending.empty(), "Bypass/power left a future synced tone pending");
+            }
+
+            setParameter (processor, switchID, switchID == power ? 1.0f : 0.0f);
+            processMessages (processor, { noteOff (1, 62) });
+        }
+
+        // --- Pending-queue exhaustion: extra tones fall back to the current
+        // block instead of being swallowed, and every tone still releases.
+        {
+            TempoScenario pressure;
+            pressure.blockSize = 4096;
+            pressure.totalSamples = 720000;
+            pressure.complexity = 6; // Major 11th: six tones per chord.
+            pressure.sync = true;
+            pressure.division = 1;   // Dotted eighth: 2.25 s at 20 BPM.
+            pressure.initialBpm = 20.0;
+            pressure.fallbackBpm = 20;
+            pressure.input.clear();
+
+            for (int channel = 0; channel < 16; ++channel)
+                for (const int root : { 0, 18, 36, 54, 72, 90, 108 })
+                    pressure.input.push_back ({ 0, noteOn (channel + 1, root) });
+
+            const auto totalChords = 16 * 7;
+
+            for (int channel = 0; channel < 16; ++channel)
+                for (const int root : { 0, 18, 36, 54, 72, 90, 108 })
+                    pressure.input.push_back ({ 700000, noteOff (channel + 1, root) });
+
+            std::vector<CapturedEvent> firstBlock;
+            const auto events = renderScenario (pressure, &firstBlock);
+
+            require (countNoteOns (firstBlock) > totalChords,
+                     "Pending-queue pressure did not exercise the immediate fallback");
+            require (countNoteOns (events) == totalChords * 6,
+                     "Pending-queue exhaustion swallowed a note-on");
+            require (static_cast<int> (noteOffPositions (events).size()) == totalChords * 6,
+                     "Pending-queue exhaustion swallowed a note-off");
+        }
+    }
+
+    void testGlobalSettingsPanel()
+    {
+        using namespace boilerplate::parameters;
+
+        TestPlayHead playHead;
+        playHead.tempoBpm = 120.0;
+
+        PluginProcessor processor;
+        processor.setPlayHead (&playHead);
+        processor.setRateAndBufferSizeDetails (48000.0, 64);
+        processor.prepareToPlay (48000.0, 64);
+
+        setParameter (processor, strumTimingMode, 1.0f); // Sync
+        setParameter (processor, strumDivision, 4.0f);   // Dotted sixteenth
+        setParameter (processor, strumFallbackBpm, 90.0f);
+        setParameter (processor, strumPattern, 3.0f);    // Outside-In
+
+        wicky::ui::GlobalSettingsPanel panel (processor);
+        panel.setSize (420, 340);
+
+        auto* strum = findComponentByName (panel, "Strum");
+        auto* fallback = findComponentByName (panel, "Fallback BPM");
+        auto* timing = findComponentByName (panel, "Strum Timing");
+        auto* division = findComponentByName (panel, "Division");
+        auto* pattern = findComponentByName (panel, "Strum Pattern");
+        auto* strumMode = findComponentByName (panel, "Strum Mode");
+        auto* status = findComponentByName (panel, "Timing Status");
+
+        require (strum != nullptr && fallback != nullptr && timing != nullptr
+                     && division != nullptr && pattern != nullptr
+                     && strumMode != nullptr && status != nullptr,
+                 "Global Settings timing controls are missing");
+
+        auto* strumSlider = dynamic_cast<juce::Slider*> (strum);
+        auto* fallbackSlider = dynamic_cast<juce::Slider*> (fallback);
+        auto* timingChoice = dynamic_cast<juce::ComboBox*> (timing);
+        auto* divisionChoice = dynamic_cast<juce::ComboBox*> (division);
+        auto* patternChoice = dynamic_cast<juce::ComboBox*> (pattern);
+        auto* strumModeChoice = dynamic_cast<juce::ComboBox*> (strumMode);
+        auto* statusLabel = dynamic_cast<juce::Label*> (status);
+
+        require (strumSlider != nullptr && fallbackSlider != nullptr
+                     && timingChoice != nullptr && divisionChoice != nullptr
+                     && patternChoice != nullptr && strumModeChoice != nullptr
+                     && statusLabel != nullptr,
+                 "Timing controls have the wrong component types");
+
+        // Sync mode disables the free-time knob and explains why in its tooltip.
+        panel.refreshTimingControls();
+        require (! strumSlider->isEnabled(), "Strum knob was not disabled in Sync mode");
+        require (strumSlider->getTooltip().containsIgnoreCase ("sync"),
+                 "Sync tooltip does not explain the disabled knob");
+        require (timingChoice->getSelectedId() == 2, "Timing selector did not show Sync");
+        require (divisionChoice->getSelectedId() == 5,
+                 "Division selector did not show dotted sixteenth");
+        require (patternChoice->getSelectedId() == 4,
+                 "Pattern selector did not show Outside-In");
+        require (std::abs (fallbackSlider->getValue() - 90.0) < 0.01,
+                 "Fallback BPM control did not show the parameter value");
+
+        // A non-legacy pattern disables the Up/Down selector and explains why.
+        require (! strumModeChoice->isEnabled(),
+                 "Up/Down selector was not disabled for a non-legacy pattern");
+        require (strumModeChoice->getTooltip().containsIgnoreCase ("pattern"),
+                 "Up/Down tooltip does not explain the pattern override");
+
+        // Before a host block, Sync reports the fallback and the chosen BPM.
+        require (statusLabel->getText().contains ("FALLBACK"),
+                 "Status did not show the fallback before a host block");
+        require (statusLabel->getText().contains ("90"),
+                 "Status did not show the fallback BPM");
+        require (statusLabel->getText().contains ("NO HOST TEMPO"),
+                 "Status did not explain why the fallback applies");
+
+        // A valid host tempo flips the readout to HOST.
+        {
+            juce::AudioBuffer<float> audio (2, 64);
+            juce::MidiBuffer midi;
+            processor.processBlock (audio, midi);
+        }
+
+        panel.refreshTimingControls();
+        require (statusLabel->getText().contains ("HOST"),
+                 "Status did not switch to the host tempo");
+        require (! statusLabel->getText().contains ("FALLBACK"),
+                 "Status still reported the fallback with a host tempo");
+        require (statusLabel->getText().contains ("120"),
+                 "Status did not show the host BPM");
+
+        // Free mode re-enables the Strum knob and restores its tooltip.
+        setParameter (processor, strumTimingMode, 0.0f);
+        panel.refreshTimingControls();
+        require (strumSlider->isEnabled(), "Strum knob stayed disabled in Free mode");
+        require (strumSlider->getTooltip().containsIgnoreCase ("free"),
+                 "Free tooltip was not restored");
+        require (statusLabel->getText() == "STRUM: FREE", "Free status text is wrong");
+
+        // Losing host tempo while Sync is selected returns to the fallback.
+        setParameter (processor, strumTimingMode, 1.0f);
+        playHead.tempoAvailable = false;
+
+        {
+            juce::AudioBuffer<float> audio (2, 64);
+            juce::MidiBuffer midi;
+            processor.processBlock (audio, midi);
+        }
+
+        panel.refreshTimingControls();
+        require (! strumSlider->isEnabled(), "Strum knob was not disabled after tempo loss");
+        require (statusLabel->getText().contains ("FALLBACK"),
+                 "Status did not return to the fallback after tempo loss");
+        require (statusLabel->getText().contains ("90"),
+                 "Status did not show the selected fallback BPM");
+
+        // Returning to Legacy Direction re-enables Up/Down.
+        setParameter (processor, strumPattern, 0.0f);
+        panel.refreshTimingControls();
+        require (strumModeChoice->isEnabled(),
+                 "Up/Down selector did not re-enable for Legacy Direction");
+        require (strumModeChoice->getTooltip().containsIgnoreCase ("low-to-high"),
+                 "Legacy Up/Down tooltip was not restored");
+
+        // The minimum editor column still contains every control.
+        panel.setSize (319, 258);
+
+        for (const auto* name : { "Strum", "Fallback BPM", "Timing Status",
+                                  "Spread Mode", "Note Off", "Strum Mode",
+                                  "Strum Timing", "Division", "Strum Pattern",
+                                  "Voicing", "Scale Root", "Scale Mode" })
+        {
+            auto* control = findComponentByName (panel, name);
+            require (control != nullptr, "Timing control disappeared at minimum size");
+            require (control->getWidth() > 0 && control->getHeight() > 0,
+                     "Timing control has no visible bounds at minimum size");
+
+            const auto area = panel.getLocalArea (control, control->getLocalBounds());
+            require (panel.getLocalBounds().contains (area),
+                     "Timing control was clipped at minimum size");
+        }
+    }
+
     void testEditor()
     {
         PluginProcessor processor;
@@ -1198,6 +3576,66 @@ namespace
             juce::Image image (juce::Image::ARGB, 780, 510, true);
             juce::Graphics graphics (image);
             editor->paintEntireComponent (graphics, true);
+
+            // Minimum-size pass: every timing control must remain visible and
+            // inside the editor surface.
+            editor->setSize (760, 441);
+            juce::Image minImage (juce::Image::ARGB, editor->getWidth(),
+                                  editor->getHeight(), true);
+            juce::Graphics minGraphics (minImage);
+            editor->paintEntireComponent (minGraphics, true);
+
+            for (const auto* name : { "Strum Timing", "Division", "Strum Pattern",
+                                      "Strum Mode", "Fallback BPM", "Timing Status" })
+            {
+                auto* control = findComponentByName (*editor, name);
+                require (control != nullptr, "Timing control is missing from the editor");
+                require (control->isVisible() && control->getWidth() > 0
+                             && control->getHeight() > 0,
+                         "Timing control has no visible bounds at minimum size");
+
+                const auto area = editor->getLocalArea (control, control->getLocalBounds());
+                require (editor->getLocalBounds().contains (area),
+                         "Timing control was clipped at minimum editor size");
+            }
+
+            auto* strum = findComponentByName (*editor, "Strum");
+            require (strum != nullptr && strum->isEnabled(),
+                     "Strum knob did not start enabled in Free mode");
+
+            auto* strumMode = findComponentByName (*editor, "Strum Mode");
+            require (strumMode != nullptr && strumMode->isEnabled(),
+                     "Up/Down selector did not start enabled for Legacy Direction");
+
+            auto* status = dynamic_cast<juce::Label*> (
+                findComponentByName (*editor, "Timing Status"));
+            require (status != nullptr && status->getText() == "STRUM: FREE",
+                     "Editor timing status did not start in Free mode");
+
+            auto* panel = dynamic_cast<wicky::ui::GlobalSettingsPanel*> (
+                findComponentByName (*editor, "Global Settings"));
+            require (panel != nullptr, "Global Settings panel was not found");
+
+            setParameter (processor, boilerplate::parameters::strumTimingMode, 1.0f);
+            panel->refreshTimingControls();
+            require (! strum->isEnabled(),
+                     "Strum knob did not disable after switching to Sync");
+
+            setParameter (processor, boilerplate::parameters::strumTimingMode, 0.0f);
+            panel->refreshTimingControls();
+            require (strum->isEnabled(),
+                     "Strum knob did not re-enable after switching to Free");
+
+            setParameter (processor, boilerplate::parameters::strumPattern, 3.0f);
+            panel->refreshTimingControls();
+            require (! strumMode->isEnabled(),
+                     "Up/Down selector did not disable for a non-legacy pattern");
+
+            setParameter (processor, boilerplate::parameters::strumPattern, 0.0f);
+            panel->refreshTimingControls();
+            require (strumMode->isEnabled(),
+                     "Up/Down selector did not re-enable for Legacy Direction");
+
             processor.editorBeingDeleted (editor.get());
             editor.reset();
             require (processor.getActiveEditor() == nullptr, "Editor lifetime was not cleared");
@@ -1210,6 +3648,8 @@ int main (int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI juceInitialiser;
     try
     {
+        if (argc > 1 && juce::String (argv[1]).startsWith ("--virtual-midi"))
+            return runVirtualMidiProbe (argc, argv);
         if (argc > 1 && std::string (argv[1]) == "--editor")
             testEditor();
         else
@@ -1224,6 +3664,22 @@ int main (int argc, char** argv)
             testPresetManager();
             testReviewRegressions();
             testExpandedFeatures();
+            testStrumTiming();
+            testStrumTimingParameters();
+            testStrumOrder();
+            testStrumPatternParameters();
+            testStrumPatternEngine();
+            testMidiRoutingSettings();
+            testMidiChannelRemapper();
+            testMidiRoutingRoute();
+            testMidiRouteSwitcher();
+            testMidiRoutingProcessorProxy();
+            testMidiRoutingPanel();
+            testHostTempoScheduling();
+            testMidiOnlyTimeline();
+            testRoutingRegressions();
+            testVirtualOutputSettings();
+            testGlobalSettingsPanel();
             testStateAndProcessing();
         }
         std::cout << "Passed\n";

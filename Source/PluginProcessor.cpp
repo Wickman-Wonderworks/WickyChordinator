@@ -1,10 +1,13 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "DSP/StrumOrder.h"
+#include "DSP/StrumTiming.h"
 #include "State/ParameterIDs.h"
 #include "State/ParameterLayout.h"
 
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace
@@ -12,7 +15,6 @@ namespace
     constexpr int kMaxChordTones = 8; // Matches PluginProcessor::maxChordTones.
     constexpr int chordTypeCount = 4;
     constexpr int complexityCount = 11;
-    constexpr float maxStrumSecondsPerStep = 0.060f;
     constexpr float minStaggerSecondsPerStep = 0.020f;
     constexpr int maxHumanizeVelocityDeviation = 15;
 
@@ -127,6 +129,33 @@ namespace
     const juce::Identifier keyRecipesStateTag ("KeyRecipes");
     const juce::Identifier keyRecipeStateTag ("Key");
 
+    /**
+        Reads the host tempo once for the current block.
+
+        The AudioPlayHead pointer must come from getPlayHead() inside
+        processBlock. This function neither stores the pointer nor the position
+        object. Absent or unusable tempo data returns zero so the caller can
+        substitute the manual fallback.
+    */
+    double readHostTempoBpm (juce::AudioPlayHead* playHead) noexcept
+    {
+        if (playHead == nullptr)
+            return 0.0;
+
+        const auto position = playHead->getPosition();
+
+        if (! position.hasValue())
+            return 0.0;
+
+        const auto bpm = position->getBpm();
+
+        if (! bpm.hasValue())
+            return 0.0;
+
+        const auto value = *bpm;
+        return std::isfinite (value) && value > 0.0 ? value : 0.0;
+    }
+
     static_assert (boilerplate::parameters::pitchOffsetMax
                        - boilerplate::parameters::pitchOffsetMin <= 31,
                    "Pitch offset no longer fits in the packed key recipe");
@@ -135,10 +164,13 @@ namespace
 
 PluginProcessor::PluginProcessor()
     : AudioProcessor (BusesProperties()
+         #if ! JucePlugin_IsMidiEffect
          #if ! JucePlugin_IsSynth
           .withInput ("Input", juce::AudioChannelSet::stereo(), true)
          #endif
-          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
+         #endif
+          ),
       apvts (*this, nullptr, "Parameters", boilerplate::parameters::createLayout())
 {
     gainDbParameter = apvts.getRawParameterValue (boilerplate::parameters::gain);
@@ -159,6 +191,10 @@ PluginProcessor::PluginProcessor()
     noteOffModeParam = apvts.getRawParameterValue (boilerplate::parameters::noteOffMode);
     strumParam = apvts.getRawParameterValue (boilerplate::parameters::strum);
     strumModeParam = apvts.getRawParameterValue (boilerplate::parameters::strumMode);
+    strumTimingModeParam = apvts.getRawParameterValue (boilerplate::parameters::strumTimingMode);
+    strumDivisionParam = apvts.getRawParameterValue (boilerplate::parameters::strumDivision);
+    strumFallbackBpmParam = apvts.getRawParameterValue (boilerplate::parameters::strumFallbackBpm);
+    strumPatternParam = apvts.getRawParameterValue (boilerplate::parameters::strumPattern);
     voicingStyleParam = apvts.getRawParameterValue (boilerplate::parameters::voicingStyle);
     humanizeTimingParam = apvts.getRawParameterValue (boilerplate::parameters::humanizeTiming);
     scaleRootParam = apvts.getRawParameterValue (boilerplate::parameters::scaleRoot);
@@ -178,6 +214,10 @@ PluginProcessor::PluginProcessor()
     jassert (noteOffModeParam != nullptr);
     jassert (strumParam != nullptr);
     jassert (strumModeParam != nullptr);
+    jassert (strumTimingModeParam != nullptr);
+    jassert (strumDivisionParam != nullptr);
+    jassert (strumFallbackBpmParam != nullptr);
+    jassert (strumPatternParam != nullptr);
 
     for (auto& recipe : keyRecipes)
         recipe.store (0, std::memory_order_relaxed);
@@ -216,7 +256,9 @@ bool PluginProcessor::isMidiEffect() const
 
 double PluginProcessor::getTailLengthSeconds() const
 {
-    return 1.0; // Covers the maximum strum plus staggered MIDI release.
+    // Covers seven bounded synced intervals plus optional 10 ms humanization.
+    // Constant across automation so hosts need no tail-property notification.
+    return (maxChordTones - 1) * boilerplate::dsp::strum::maxStepSeconds + 0.010;
 }
 
 juce::AudioProcessorParameter* PluginProcessor::getBypassParameter() const
@@ -254,6 +296,16 @@ PluginProcessor::ChordRecipe PluginProcessor::getLastTriggeredChordRecipe() cons
 int PluginProcessor::getNumSoundingChords() const noexcept
 {
     return soundingChordCount.load (std::memory_order_relaxed);
+}
+
+bool PluginProcessor::isUsingHostTempo() const noexcept
+{
+    return hostTempoActive.load (std::memory_order_relaxed);
+}
+
+float PluginProcessor::getEffectiveStrumTempo() const noexcept
+{
+    return effectiveStrumTempoBpm.load (std::memory_order_relaxed);
 }
 
 void PluginProcessor::queueKeyboardNote (const bool noteOn, const int midiNote,
@@ -407,6 +459,13 @@ void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     totalSamplesProcessed = 0;
     resetChordState();
     wasBypassed = bypassParameter != nullptr && bypassParameter->load() > 0.5f;
+
+    // The UI status reflects the last processed block. Until one runs, report
+    // the fallback rather than a stale host tempo from a previous session.
+    hostTempoActive.store (false, std::memory_order_relaxed);
+    effectiveStrumTempoBpm.store (
+        static_cast<float> (boilerplate::parameters::strumFallbackBpmDefault),
+        std::memory_order_relaxed);
 }
 
 void PluginProcessor::releaseResources()
@@ -432,6 +491,7 @@ void PluginProcessor::resetChordState() noexcept
     std::memset (noteRefCounts, 0, sizeof (noteRefCounts));
     std::memset (passThroughNotes, 0, sizeof (passThroughNotes));
     std::memset (previousVoicingCount, 0, sizeof (previousVoicingCount));
+    std::memset (alternateDown, 0, sizeof (alternateDown));
     clearInputNotes();
     clearOutputNotes();
 
@@ -443,6 +503,9 @@ void PluginProcessor::resetChordState() noexcept
 
 bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
+   #if JucePlugin_IsMidiEffect
+    return layouts.inputBuses.isEmpty() && layouts.outputBuses.isEmpty();
+   #else
     const auto outputChannels = layouts.getMainOutputChannelSet();
 
     if (outputChannels != juce::AudioChannelSet::mono()
@@ -453,6 +516,7 @@ bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
     return layouts.inputBuses.isEmpty();
    #else
     return outputChannels == layouts.getMainInputChannelSet();
+   #endif
    #endif
 }
 
@@ -979,16 +1043,23 @@ bool PluginProcessor::startChord (int triggerNote, int channel, juce::uint8 velo
     lastTriggeredRecipe.store (packKeyRecipe (evaluatedRecipe),
                                std::memory_order_relaxed);
 
-    // Strum Up plays low-to-high; Strum Down plays high-to-low. The per-step
-    // distance is derived from the current sample rate inside processBlock.
-    const auto down = currentStrumMode == 1;
+    // The ordering strategy is snapshotted for this chord, just like the step.
+    // Legacy Direction follows Up/Down; the other patterns override it. The
+    // helper allocates nothing and uses the engine PRNG for Random only.
+    const auto strumStepSamples = currentStrumStepSamples;
+    int noteOrder[maxChordTones] {};
+    auto randomState = humanizeSeed.load (std::memory_order_relaxed);
+    boilerplate::dsp::strum::buildOrder (noteOrder, numNotes, currentStrumPattern,
+                                         currentStrumMode == 1,
+                                         alternateDown[channel], randomState);
+    humanizeSeed.store (randomState, std::memory_order_relaxed);
 
-    for (int order = 0; order < numNotes; ++order)
+    for (int step = 0; step < numNotes; ++step)
     {
-        const auto noteIndex = down ? (numNotes - 1 - order) : order;
+        const auto noteIndex = noteOrder[step];
         const auto jitter = currentHumanizeMaxSamples > 0
             ? static_cast<int> (nextRandom() % static_cast<juce::uint32> (currentHumanizeMaxSamples + 1)) : 0;
-        const auto delaySamples = currentStrumStepSamples * order + jitter;
+        const auto delaySamples = strumStepSamples * step + jitter;
 
         scheduleNoteOn (chordIndex, noteIndex, notes[noteIndex], channel,
                         humanizedVelocity (velocity),
@@ -1102,6 +1173,18 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         strumParam->load (std::memory_order_relaxed));
     const auto strumModeIndex = juce::jlimit (0, 1,
         juce::roundToInt (strumModeParam->load (std::memory_order_relaxed)));
+    const auto strumTimingModeIndex = juce::jlimit (0, 1,
+        juce::roundToInt (strumTimingModeParam->load (std::memory_order_relaxed)));
+    const auto strumDivisionIndex = juce::jlimit (
+        0, boilerplate::dsp::strum::numDivisions - 1,
+        juce::roundToInt (strumDivisionParam->load (std::memory_order_relaxed)));
+    const auto strumFallbackBpm = static_cast<double> (juce::jlimit (
+        boilerplate::parameters::strumFallbackBpmMin,
+        boilerplate::parameters::strumFallbackBpmMax,
+        juce::roundToInt (strumFallbackBpmParam->load (std::memory_order_relaxed))));
+    const auto strumPatternIndex = juce::jlimit (
+        0, boilerplate::dsp::strum::numPatterns - 1,
+        juce::roundToInt (strumPatternParam->load (std::memory_order_relaxed)));
 
     const auto gainDecibels = gainDbParameter->load (std::memory_order_relaxed);
     const auto bypassed = bypassParameter->load (std::memory_order_relaxed) > 0.5f
@@ -1120,6 +1203,7 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     currentNoteOffMode = noteOffModeIndex;
     currentSpreadMode = spreadModeIndex;
     currentStrumMode = strumModeIndex;
+    currentStrumPattern = strumPatternIndex;
     currentSpreadAmount = spreadValue / 100.0f;
     currentHumanizeAmount = humanizeValue / 100.0f;
     currentBypassState = bypassed;
@@ -1129,8 +1213,21 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     currentHumanizeMaxSamples = humanizeTimingParam->load() > 0.5f
         ? juce::roundToInt (currentHumanizeAmount * 0.010 * sampleRate) : 0;
 
-    currentStrumStepSamples = juce::roundToInt (
-        (strumValue / 100.0f) * maxStrumSecondsPerStep * sampleRate);
+    // Read the host playhead once for this block when synced timing needs it.
+    // The pointer and position object are deliberately not retained: JUCE only
+    // guarantees their validity inside processBlock. A stopped transport is
+    // fine; manual notes still play.
+    const auto hostBpm = strumTimingModeIndex == 1
+        ? readHostTempoBpm (getPlayHead()) : 0.0;
+    const auto effectiveBpm = hostBpm > 0.0 ? hostBpm : strumFallbackBpm;
+
+    hostTempoActive.store (hostBpm > 0.0, std::memory_order_relaxed);
+    effectiveStrumTempoBpm.store (static_cast<float> (effectiveBpm),
+                                  std::memory_order_relaxed);
+
+    currentStrumStepSamples = boilerplate::dsp::strum::stepSamples (
+        strumTimingModeIndex == 1, sampleRate, strumValue,
+        effectiveBpm, strumDivisionIndex);
     currentStaggerStepSamples = currentStrumStepSamples > 0
         ? currentStrumStepSamples
         : juce::roundToInt (minStaggerSecondsPerStep * sampleRate);
@@ -1139,7 +1236,10 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const auto totalNumOutputChannels = getTotalNumOutputChannels();
 
     // Outputs without a matching input may contain garbage; clear them.
-    for (auto channel = totalNumInputChannels; channel < totalNumOutputChannels; ++channel)
+    // MIDI-only renders may provide frames without channel storage. Never
+    // address a nominal output that is absent from this callback's buffer.
+    for (auto channel = totalNumInputChannels;
+         channel < juce::jmin (totalNumOutputChannels, buffer.getNumChannels()); ++channel)
         buffer.clear (channel, 0, buffer.getNumSamples());
 
    #if JucePlugin_IsSynth
@@ -1390,24 +1490,33 @@ void PluginProcessor::setStateInformation (const void* data, int sizeInBytes)
 
     if (state.isValid() && state.hasType (apvts.state.getType()))
     {
-        // Missing new controls identify pre-v2 sessions. Explicit child values
-        // preserve the released register-only/velocity-only interpretation.
-        for (const auto* id : { boilerplate::parameters::voicingStyle,
-                                boilerplate::parameters::humanizeTiming,
-                                boilerplate::parameters::scaleRoot,
-                                boilerplate::parameters::scaleMode })
+        // Missing new controls identify older sessions or presets. Explicit
+        // child values preserve the released interpretation for the v2 controls
+        // and give tempo-synced strum its Free/sixteenth/120 defaults so old
+        // sessions sound exactly as they did before the timing controls existed.
+        const auto addMissingValue = [&state] (const char* id, float value)
         {
-            bool found = false;
             for (const auto& child : state)
-                found = found || child.getProperty ("id").toString() == id;
-            if (! found)
-            {
-                juce::ValueTree child ("PARAM");
-                child.setProperty ("id", id, nullptr);
-                child.setProperty ("value", 0.0f, nullptr);
-                state.appendChild (child, nullptr);
-            }
-        }
+                if (child.getProperty ("id").toString() == id)
+                    return;
+
+            juce::ValueTree child ("PARAM");
+            child.setProperty ("id", id, nullptr);
+            child.setProperty ("value", value, nullptr);
+            state.appendChild (child, nullptr);
+        };
+
+        addMissingValue (boilerplate::parameters::voicingStyle, 0.0f);
+        addMissingValue (boilerplate::parameters::humanizeTiming, 0.0f);
+        addMissingValue (boilerplate::parameters::scaleRoot, 0.0f);
+        addMissingValue (boilerplate::parameters::scaleMode, 0.0f);
+        addMissingValue (boilerplate::parameters::strumTimingMode, 0.0f);
+        addMissingValue (boilerplate::parameters::strumDivision,
+                         static_cast<float> (boilerplate::dsp::strum::defaultDivisionIndex));
+        addMissingValue (boilerplate::parameters::strumFallbackBpm,
+                         static_cast<float> (boilerplate::parameters::strumFallbackBpmDefault));
+        addMissingValue (boilerplate::parameters::strumPattern, 0.0f);
+
         apvts.replaceState (state);
         restoreKeyRecipeState (state);
     }

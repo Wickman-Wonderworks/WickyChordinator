@@ -81,6 +81,12 @@ public:
     /** Number of currently held/generated chords (message-thread safe). */
     int getNumSoundingChords() const noexcept;
 
+    /** True when the most recent processed block used a host-provided tempo. */
+    bool isUsingHostTempo() const noexcept;
+
+    /** Effective BPM used by the most recent processed block's timing. */
+    float getEffectiveStrumTempo() const noexcept;
+
     //==========================================================================
     /** One chord assignment for a single MIDI note. */
     struct ChordRecipe
@@ -176,6 +182,10 @@ private:
     std::atomic<float>* noteOffModeParam = nullptr;
     std::atomic<float>* strumParam = nullptr;
     std::atomic<float>* strumModeParam = nullptr;
+    std::atomic<float>* strumTimingModeParam = nullptr;
+    std::atomic<float>* strumDivisionParam = nullptr;
+    std::atomic<float>* strumFallbackBpmParam = nullptr;
+    std::atomic<float>* strumPatternParam = nullptr;
     std::atomic<float>* voicingStyleParam = nullptr;
     std::atomic<float>* humanizeTimingParam = nullptr;
     std::atomic<float>* scaleRootParam = nullptr;
@@ -242,6 +252,7 @@ private:
     ActiveChord activeChords[maxActiveChords];
     PendingNote pendingNotes[maxPendingNotes] {};
     juce::uint16 noteRefCounts[midiChannels][128] {};
+    bool alternateDown[midiChannels] {};
     bool wasBypassed = false;
 
     // Snapshot of the block-local engine settings, refreshed at the start of
@@ -252,6 +263,7 @@ private:
     int currentNoteOffMode = 0;
     int currentSpreadMode = 0;
     int currentStrumMode = 0;
+    int currentStrumPattern = 0;
     float currentSpreadAmount = 0.0f;
     float currentHumanizeAmount = 0.0f;
     bool currentBypassState = false;
@@ -275,6 +287,11 @@ private:
     std::atomic<int> lastTriggeredChordNote { -1 };
     std::atomic<juce::uint32> lastTriggeredRecipe { 0 };
     std::atomic<int> soundingChordCount { 0 };
+
+    // Timing status for the editor. Written once per processBlock; read by the
+    // message-thread timer that updates the Global Settings readout.
+    std::atomic<bool> hostTempoActive { false };
+    std::atomic<float> effectiveStrumTempoBpm { 120.0f };
 
     void resetChordState() noexcept;
 

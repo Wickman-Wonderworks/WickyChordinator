@@ -274,6 +274,7 @@ void PluginEditor::selectPreset (int index)
     updatingPresetSelector = false;
 
     refreshChordReadout();
+    globalPanel.refreshTimingControls();
 }
 
 //==============================================================================
@@ -398,7 +399,7 @@ void PluginEditor::layoutStatusBar (juce::Rectangle<int> area)
 
     auto left = bar.removeFromLeft (scaled (445));
 
-    presetCaption.setBounds (left.removeFromLeft (scaled (50))
+    presetCaption.setBounds (left.removeFromLeft (scaled (60))
                                  .reduced (0, scaled (11)));
     presetSelector.setBounds (left.removeFromLeft (scaled (190))
                                   .reduced (0, scaled (11)));
@@ -446,6 +447,7 @@ void PluginEditor::timerCallback()
                             juce::roundToInt (parameters.getRawParameterValue (boilerplate::parameters::scaleMode)->load()));
     refreshChordReadout();
     syncKeyboardDisplay();
+    globalPanel.refreshTimingControls();
 }
 
 void PluginEditor::syncKeyboardDisplay()

@@ -1,5 +1,64 @@
 # Remaining feature plan for Wicky Chordinator
 
+## Implementation status (2026-11-02)
+
+The current branch implements Phases 1–3, native macOS/Linux virtual-output
+selection with Windows loopback fallback (Phase 4), and the dedicated macOS
+MIDI FX build and zero-channel scheduler path (Phase 5). Phase 6 is **not release
+qualified**: Logic, real hardware, Linux delivery, Windows loopback, Intel runtime,
+updated cross-platform CI and distribution-signed package checks remain pending.
+App-created Windows output remains explicitly deferred under Unit 4B.
+See [the evidence and handoff](../release-qualification.md) for actual checks,
+backend constraints and review fixes. The unit-by-unit instructions below remain
+useful for future scoped work; they do not override a user's request to complete
+multiple units together.
+
+## Start here — instructions for DeepSeek
+
+This document is the full context for DeepSeek v4.1 Flash. It is not an instruction
+to implement every phase at once. If the user pastes this document without naming
+a unit, **implement only Unit 1A, then stop**. Phase 0 is already complete.
+
+Before editing:
+
+1. Read AGENTS.md and the baseline below. Inspect the current repository and any
+   uncommitted changes; preserve work that is unrelated to the selected unit.
+2. Identify the requested unit, its dependencies, allowed files, and acceptance
+   checks. Verify dependencies in the code rather than assuming they are complete.
+3. State the unit you will implement and a short list of intended changes.
+
+During implementation:
+
+- Complete the selected unit, including its tests; do not stop at a proposal.
+- Do not implement controls, scheduler integration, or other work assigned to a
+  later unit. For Unit 1A, the knob's disabled state described below is a contract
+  for Unit 1C, not permission to change the UI now.
+- Verify JUCE methods against the pinned local source/documentation. Do not
+  invent APIs, placeholder implementations, or successful test results.
+- Resolve routine choices within the unit. Ask a focused question only when
+  missing information materially blocks a correct implementation; continue any
+  independent work while awaiting the answer.
+- If a necessary check cannot run, state why and leave its validation pending.
+  Do not treat unavailable hardware, hosts, tools, or CI as successful checks.
+
+At the end, provide this handoff and **wait for the user to request the next unit**:
+
+```text
+Unit: <identifier and title>
+Implementation: <complete or incomplete, with reason>
+Changes: <files and observable behavior>
+Validation: <commands/checks actually run and their results>
+Pending checks: <platform, hardware, DAW, or other unverified behavior>
+Compatibility: <how existing sessions and parameter contracts were preserved>
+Next unit: <identifier, dependencies, and any important handoff notes>
+```
+
+Keep implementation completion separate from release qualification. A completed
+code change with pending manual checks is not a fully qualified release. Do not
+start another unit, install plugins, commit changes, or publish artifacts merely
+because this document describes later steps; follow the user's authorization and
+the repository's applicable validation instructions.
+
 ## Purpose and baseline
 
 This is an implementation handoff for a smaller coding model. Work on one numbered
@@ -294,14 +353,29 @@ an incidental consequence of implementation.
 Record a compact feature/platform matrix with pass/fail/not-tested and evidence.
 Update USER_GUIDE limitations only when each feature meets its acceptance gate.
 
-## Suggested prompt for each smaller-model task
+## Copy-ready prompts
 
-> Implement only Unit <number> in docs/plans/remaining-features.md. Read the
-> baseline and rules in that plan and AGENTS.md. Inspect the named files before
-> editing. Preserve released contracts and existing behavior. Add the specified
-> behavioral tests, run the applicable checks, and report evidence and unresolved
-> platform validation. Do not begin the next unit or claim untested device/DAW
-> behavior works. If the pinned JUCE API cannot support the design, document the
-> concrete blocker and the smallest alternative rather than inventing an API.
+### First task
 
-Ask me if you have any questions or need further guidance.
+> Follow AGENTS.md and docs/plans/remaining-features.md. Implement only Unit 1A.
+> Read the current files before editing. Preserve existing behavior and released
+> parameter contracts. Implement the timing helper, parameters, and specified
+> tests; leave scheduler integration and UI changes for Units 1B and 1C. Run the
+> applicable checks, report actual results and pending validation, provide the
+> handoff defined at the top of the plan, and stop. Do not begin Unit 1B.
+
+### Continuing after review
+
+> Follow AGENTS.md and docs/plans/remaining-features.md. Implement only Unit
+> <identifier>. Read the previous handoff and verify its dependencies in the
+> current code. Complete this unit's implementation and checks without expanding
+> into later units. Preserve unrelated changes. Finish with the required handoff
+> and stop for review.
+
+### Resuming in a fresh conversation
+
+> Read AGENTS.md and docs/plans/remaining-features.md, then inspect the current
+> code and this handoff: <paste previous handoff>. The requested unit is
+> <identifier>. Verify what already exists; do not repeat completed work. Implement
+> only the requested unit, run its checks, report pending validation, and stop
+> with a new handoff.

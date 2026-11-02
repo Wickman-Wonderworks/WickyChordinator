@@ -106,6 +106,24 @@ and [custom notarization workflow](https://developer.apple.com/documentation/sec
   executable permissions. Install VST3 to `~/.vst3` for a user install. Check
   runtime library dependencies with `ldd` and test on a clean target system.
 
+## Dedicated MIDI FX product
+
+On macOS, `midi-fx-debug` and `midi-fx-release` build only
+`AU/Wicky Chordinator MIDI FX.component`, using `com.wickyaudio.wickychordinator.midifx`,
+`aumi Wcmf Wckm`. The effect (`aumf Jbpl Wckm`) and instrument (`aumu Jbpi Wckm`)
+identities are unchanged. Include this separate component in staging only when
+qualified for that release. Apply the same inside-out Developer ID signing and
+package checks above; the development validation script's ad-hoc signature does
+not qualify a distribution package.
+
+`bash scripts/validate-au.sh <preset>` signs with the ad-hoc development identity,
+installs the selected AU in the user Components directory and validates it. It
+replaces the installed copy of the same product. It is used by CI for all six
+macOS presets; signed release bundles must also be validated separately.
+
+See [release qualification](release-qualification.md) for current evidence and
+manual Logic/standalone/platform checks still required.
+
 ## Release validation
 
 1. Build all formats and run CTest for effect/instrument, Debug/Release. Review

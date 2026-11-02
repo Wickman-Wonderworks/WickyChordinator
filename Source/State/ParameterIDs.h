@@ -22,6 +22,20 @@ namespace boilerplate::parameters
     inline constexpr auto strum = "strum";
     inline constexpr auto strumMode = "strum_mode";
 
+    // Tempo-synced strum (Phase 1). Free keeps the released percentage mapping;
+    // Sync uses a musical division of the host tempo (or the manual fallback).
+    inline constexpr auto strumTimingMode = "strum_timing_mode";
+    inline constexpr auto strumDivision = "strum_division";
+    inline constexpr auto strumFallbackBpm = "strum_fallback_bpm";
+
+    // Phase 2 finite chord-ordering strategies. Legacy Direction obeys the
+    // released Up/Down Strum Mode; the other patterns override it.
+    inline constexpr auto strumPattern = "strum_pattern";
+
+    inline constexpr int strumFallbackBpmMin = 20;
+    inline constexpr int strumFallbackBpmMax = 300;
+    inline constexpr int strumFallbackBpmDefault = 120;
+
     inline constexpr auto voicingStyle = "voicing_style";
     inline constexpr auto humanizeTiming = "humanize_timing";
     inline constexpr auto scaleRoot = "scale_root";
@@ -30,6 +44,15 @@ namespace boilerplate::parameters
     inline constexpr int humanizeTimingVersionHint = 14;
     inline constexpr int scaleRootVersionHint = 15;
     inline constexpr int scaleModeVersionHint = 16;
+
+    // Phase 1 tempo-synced strum. Hints 17-19 are the first values above the
+    // released contract (which ends at 16); keep them unique and ascending.
+    inline constexpr int strumTimingModeVersionHint = 17;
+    inline constexpr int strumDivisionVersionHint = 18;
+    inline constexpr int strumFallbackBpmVersionHint = 19;
+
+    // Phase 2 strum patterns. Hint 20 is the next unused value after Phase 1.
+    inline constexpr int strumPatternVersionHint = 20;
 
     inline constexpr int pitchOffsetMin = -12;
     inline constexpr int pitchOffsetMax = 12;
